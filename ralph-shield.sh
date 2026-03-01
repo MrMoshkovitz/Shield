@@ -121,32 +121,39 @@ trap shutdown_handler SIGINT SIGTERM
 # STATE PARSING
 # ──────────────────────────────────────────────────────────────────────
 
+# macOS grep has no -P flag. Use sed to extract values from markdown.
+extract_state() {
+  local key="$1"
+  sed -n "s/.*\*\*${key}\*\*: *//p" "$STATE_FILE" 2>/dev/null | head -1
+}
+
 get_current_phase() {
-  grep -oP '(?<=\*\*Current Phase\*\*: ).*' "$STATE_FILE" 2>/dev/null || echo "UNKNOWN"
+  extract_state "Current Phase" || echo "UNKNOWN"
 }
 
 get_current_task() {
-  grep -oP '(?<=\*\*Current Task\*\*: ).*' "$STATE_FILE" 2>/dev/null || echo "NONE"
+  extract_state "Current Task" || echo "NONE"
 }
 
 get_total_iterations() {
-  grep -oP '(?<=\*\*Total Iterations\*\*: )\d+' "$STATE_FILE" 2>/dev/null || echo "0"
+  extract_state "Total Iterations" || echo "0"
 }
 
 get_findings_total() {
-  grep -oP '(?<=\*\*Findings Total\*\*: )\d+' "$STATE_FILE" 2>/dev/null || echo "0"
+  extract_state "Findings Total" || echo "0"
 }
 
 get_resume_point() {
-  grep -oP '(?<=\*\*Resume Point\*\*: ).*' "$STATE_FILE" 2>/dev/null || echo "UNKNOWN"
+  extract_state "Resume Point" || echo "UNKNOWN"
 }
 
 count_tasks_done() {
-  grep -c '\[x\] DONE' "$TASKS_FILE" 2>/dev/null || echo "0"
+  # Only count in the TASK sections, not the coverage checklist at the bottom
+  sed -n '/^## PHASE/,/^## COVERAGE/p' "$TASKS_FILE" 2>/dev/null | grep -c '\[x\] DONE' || echo "0"
 }
 
 count_tasks_total() {
-  grep -cE '^\- \*\*Status\*\*:' "$TASKS_FILE" 2>/dev/null || echo "66"
+  sed -n '/^## PHASE/,/^## COVERAGE/p' "$TASKS_FILE" 2>/dev/null | grep -c '^\- \*\*Status\*\*:' || echo "66"
 }
 
 is_assessment_complete() {
@@ -210,9 +217,52 @@ is_limit_hit() {
 # COOLDOWN (wait for credits to free up)
 # ──────────────────────────────────────────────────────────────────────
 
+parse_wait_seconds() {
+  # Parse wait/retry duration from Claude's error output.
+  # Looks for patterns like "retry after 3600 seconds", "wait 4 hours",
+  # "retry in 30 minutes", "Retry-After: 1800", etc.
+  local output="$1"
+  local seconds=0
+
+  # "retry after N seconds" / "wait N seconds" / "N seconds"
+  seconds=$(echo "$output" | sed -n 's/.*[Rr]etry.*[Aa]fter[: ]*\([0-9]*\) *[Ss]ec.*/\1/p' | head -1)
+  [[ -n "$seconds" && "$seconds" -gt 0 ]] 2>/dev/null && echo "$seconds" && return
+
+  # "N minutes"
+  local minutes
+  minutes=$(echo "$output" | sed -n 's/.*[Rr]etry.*[Aa]fter[: ]*\([0-9]*\) *[Mm]in.*/\1/p' | head -1)
+  [[ -n "$minutes" && "$minutes" -gt 0 ]] 2>/dev/null && echo "$((minutes * 60))" && return
+
+  # "N hours"
+  local hours
+  hours=$(echo "$output" | sed -n 's/.*[Ww]ait[: ]*\([0-9]*\) *[Hh]our.*/\1/p' | head -1)
+  [[ -n "$hours" && "$hours" -gt 0 ]] 2>/dev/null && echo "$((hours * 3600))" && return
+
+  # "Retry-After: N" header (raw seconds)
+  seconds=$(echo "$output" | sed -n 's/.*[Rr]etry-[Aa]fter[: ]*\([0-9]*\).*/\1/p' | head -1)
+  [[ -n "$seconds" && "$seconds" -gt 0 ]] 2>/dev/null && echo "$seconds" && return
+
+  # Fallback: no parseable duration found
+  echo "0"
+}
+
 wait_for_credits() {
+  local last_output="$1"
   local attempt=0
-  log "COOLDOWN: Credit/rate limit hit. Polling every ${COOLDOWN_INTERVAL}s until free..."
+
+  # Try to parse how long to wait from the error output
+  local parsed_wait
+  parsed_wait=$(parse_wait_seconds "$last_output")
+
+  local wait_time="$COOLDOWN_INTERVAL"
+  if [[ "$parsed_wait" -gt 0 ]] 2>/dev/null; then
+    wait_time="$parsed_wait"
+    log "COOLDOWN: API says wait ${wait_time}s ($(( wait_time / 60 ))m). Honoring it."
+  else
+    log "COOLDOWN: No wait duration in response. Using default ${wait_time}s."
+  fi
+
+  log "COOLDOWN: Credit/rate limit hit. Will retry after ${wait_time}s..."
 
   while true; do
     if [[ "$SHUTDOWN_REQUESTED" == true ]]; then
@@ -221,14 +271,15 @@ wait_for_credits() {
     fi
 
     attempt=$((attempt + 1))
-    log "COOLDOWN: Attempt $attempt — sleeping ${COOLDOWN_INTERVAL}s..."
-    sleep "$COOLDOWN_INTERVAL"
+    log "COOLDOWN: Attempt $attempt — sleeping ${wait_time}s ($(( wait_time / 60 ))m)..."
+    sleep "$wait_time"
 
     # Probe with a minimal request
     local probe_output probe_exit
-    probe_output=$(claude -p --model "$MODEL" --output-format text \
+    probe_exit=0
+    probe_output=$(claude -p --model "$MODEL" --dangerously-skip-permissions \
+      --output-format text \
       "Reply with exactly: READY" 2>&1) || probe_exit=$?
-    probe_exit=${probe_exit:-0}
 
     if [[ "$probe_exit" -eq 0 ]] && echo "$probe_output" | grep -qi "READY"; then
       log "COOLDOWN: Credits available. Resuming assessment."
@@ -236,12 +287,21 @@ wait_for_credits() {
     fi
 
     if ! is_limit_hit "$probe_output" "$probe_exit"; then
-      # Not a limit issue anymore — might be a different error
       log "COOLDOWN: Non-limit response (exit=$probe_exit). Attempting resume."
       return 0
     fi
 
-    log "COOLDOWN: Still limited. Waiting..."
+    # Re-parse wait time from new response (might have changed)
+    parsed_wait=$(parse_wait_seconds "$probe_output")
+    if [[ "$parsed_wait" -gt 0 ]] 2>/dev/null; then
+      wait_time="$parsed_wait"
+      log "COOLDOWN: Updated wait to ${wait_time}s ($(( wait_time / 60 ))m) from response."
+    else
+      # Exponential backoff: double each attempt, cap at 1 hour
+      wait_time=$(( wait_time * 2 ))
+      [[ "$wait_time" -gt 3600 ]] && wait_time=3600
+      log "COOLDOWN: Still limited. Backing off to ${wait_time}s ($(( wait_time / 60 ))m)."
+    fi
   done
 }
 
@@ -471,6 +531,9 @@ main() {
     log "Next task: $current_task"
     log "Tasks done: $(count_tasks_done)/$(count_tasks_total)"
 
+    # ── Heartbeat: write timestamp so you can check if stuck ──
+    echo "$(timestamp) | iter=$iter_num | task=$current_task | pid=$$" > .GM/ralph-heartbeat
+
     # ── Build and execute ──
     local prompt
     prompt=$(build_prompt)
@@ -497,7 +560,7 @@ main() {
         # Save partial output for debugging
         echo "$output" >> "$LOG_FILE"
 
-        wait_for_credits
+        wait_for_credits "$output"
 
         if [[ "$SHUTDOWN_REQUESTED" == true ]]; then
           break
