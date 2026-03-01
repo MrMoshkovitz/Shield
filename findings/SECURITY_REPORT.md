@@ -2,9 +2,9 @@
 
 **Status**: IN-PROGRESS
 **Assessment Start**: 2026-03-01
-**Last Updated**: 2026-03-02T11:00:00+03:00
-**Tasks Completed**: 33/66
-**Findings**: 226 total (0 CRITICAL, 26 HIGH, 103 MEDIUM, 63 LOW, 34 INFO)
+**Last Updated**: 2026-03-02T13:00:00+03:00
+**Tasks Completed**: 34/66
+**Findings**: 233 total (0 CRITICAL, 26 HIGH, 108 MEDIUM, 65 LOW, 34 INFO)
 
 **Project**: Shield — 12-language symmetric encryption library
 **Crypto Stack**: PBKDF2-SHA256 (100k iterations) → SHA256-CTR → HMAC-SHA256 (128-bit truncated)
@@ -24,10 +24,10 @@
 |----------|-------|
 | CRITICAL findings | 0 |
 | HIGH findings | 26 |
-| MEDIUM findings | 103 |
-| LOW findings | 63 |
+| MEDIUM findings | 108 |
+| LOW findings | 65 |
 | INFO findings | 34 |
-| **Total** | **226** |
+| **Total** | **233** |
 
 ---
 
@@ -439,7 +439,7 @@ See `findings/agents/A05-docker-container.md` for full details.
 | SHIELD-A08-014 | Ratchet Forward Secrecy Verified Correct | INFO | N/A | `ratchet.rs:23-109` |
 
 ### A09 — Browser & WASM
-**14 findings** (1 HIGH, 6 MEDIUM, 5 LOW, 1 INFO) + 7 cross-referenced from A03
+**29 findings** (1 HIGH, 16 MEDIUM, 11 LOW, 1 INFO) + 7 cross-referenced from A03
 
 | Finding ID | Title | Severity | CWE | Location |
 |-----------|-------|----------|-----|----------|
@@ -457,6 +457,21 @@ See `findings/agents/A05-docker-container.md` for full details.
 | SHIELD-A09-012 | No CSP Documentation | LOW | CWE-1021 | `browser/README.md` |
 | SHIELD-A09-013 | WASM Exports Crypto Primitives to JS | INFO | CWE-200 | `shield-core/src/wasm.rs:327-362` |
 | SHIELD-A09-014 | XSS via Decrypted Content (UN-VERIFIED) | MEDIUM | CWE-79 | `browser/js/fetch-hook.ts:79-84` |
+| SHIELD-A09-015 | Attacker Response Triggers Decrypt → Fail-Open Returns Malicious Payload | MEDIUM | CWE-345 | `browser/js/fetch-hook.ts:53-93` |
+| SHIELD-A09-016 | decryptEnvelope Passes Non-Encrypted JSON Without Validation | MEDIUM | CWE-345 | `browser/src/lib.rs:152-166` |
+| SHIELD-A09-017 | refreshKey() Uses Intercepted fetch() — Self-Decrypt Loop | MEDIUM | CWE-696 | `browser/js/index.ts:84-131` |
+| SHIELD-A09-018 | Decrypted Plaintext Exposed on JS Heap — Cacheable | MEDIUM | CWE-316 | `browser/js/fetch-hook.ts:77-84` |
+| SHIELD-A09-019 | encryptedIndicator Configurable — Detection Bypass | LOW | CWE-330 | `browser/js/fetch-hook.ts:17-131` |
+| SHIELD-A09-020 | No Scheme Validation on keyEndpoint — HTTP Downgrade | MEDIUM | CWE-319 | `browser/js/index.ts:66-124` |
+| SHIELD-A09-021 | Fetch Hook Processes Error Responses (4xx/5xx) | LOW | CWE-754 | `browser/js/fetch-hook.ts:42-67` |
+| SHIELD-A09-022 | Key Response Has No Server Signature — No Authenticity | MEDIUM | CWE-345 | `browser.py:90-101`, `index.ts:130-138` |
+| SHIELD-A09-023 | Session Key Derivation Predictable — No Nonce | MEDIUM | CWE-330 | `browser.py:103-111` |
+| SHIELD-A09-024 | Session Keys Accumulate Without Auto-Cleanup | LOW | CWE-401 | `browser.py:69,88,135-144` |
+| SHIELD-A09-025 | revoke_session No Key Zeroization | LOW | CWE-226 | `browser.py:130-133` |
+| SHIELD-A09-026 | TTL Not Enforced on encrypt/decrypt_for_client | MEDIUM | CWE-613 | `browser.py:113-121` |
+| SHIELD-A09-027 | WASM init() Failure No CSP Error Guidance | LOW | CWE-754 | `index.ts:70-74` |
+| SHIELD-A09-028 | Build Pipeline No WASM Integrity Hashes | LOW | CWE-353 | `package.json:22-26` |
+| SHIELD-A09-029 | SDK Exports WasmClient + Fetch Hook Utilities | LOW | CWE-200 | `index.ts:243-247` |
 
 ### A10 — CI/CD & Supply Chain
 *Phase 2 — Pending*
