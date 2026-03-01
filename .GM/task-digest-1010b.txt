@@ -1,0 +1,858 @@
+Directory structure:
+└── shield/
+    ├── __init__.py
+    ├── core.py
+    └── integrations/
+        ├── __init__.py
+        ├── confidential/
+        │   └── __init__.py
+        └── django/
+            └── __init__.py
+
+================================================
+FILE: __init__.py
+================================================
+"""
+Shield - EXPTIME-Secure Encryption Library
+
+Symmetric cryptography with proven exponential-time security.
+Breaking requires 2^256 operations - no shortcut exists.
+
+Usage:
+    from shield import Shield, quick_encrypt, quick_decrypt
+
+    # Password-based encryption
+    s = Shield("password", "service.com")
+    encrypted = s.encrypt(b"secret data")
+    decrypted = s.decrypt(encrypted)
+
+    # Pre-shared key encryption
+    key = os.urandom(32)
+    encrypted = quick_encrypt(key, b"data")
+    decrypted = quick_decrypt(key, encrypted)
+
+Security:
+    Shield uses PBKDF2-SHA256 + SHA256-CTR + HMAC-SHA256.
+    All primitives have EXPTIME-hard security guarantees.
+"""
+
+__version__ = "2.1.0"
+__author__ = "Guard8.ai"
+__license__ = "CC0-1.0"
+
+from shield.core import Shield, quick_encrypt, quick_decrypt
+from shield.stream import StreamCipher
+from shield.ratchet import RatchetSession
+from shield.totp import TOTP, RecoveryCodes
+from shield.signatures import SymmetricSignature, LamportSignature
+from shield.exchange import PAKEExchange, QRExchange, KeySplitter
+from shield.rotation import KeyRotationManager
+from shield.group import GroupEncryption, BroadcastEncryption
+from shield.identity import IdentityProvider, Identity, Session, SecureSession
+from shield.channel import ShieldChannel, ChannelConfig, ShieldListener
+from shield.fingerprint import FingerprintMode, FingerprintError
+
+__all__ = [
+    # Core
+    "Shield",
+    "quick_encrypt",
+    "quick_decrypt",
+    # Streaming
+    "StreamCipher",
+    # Forward Secrecy
+    "RatchetSession",
+    # 2FA
+    "TOTP",
+    "RecoveryCodes",
+    # Signatures
+    "SymmetricSignature",
+    "LamportSignature",
+    # Key Exchange
+    "PAKEExchange",
+    "QRExchange",
+    "KeySplitter",
+    # Key Rotation
+    "KeyRotationManager",
+    # Group Encryption
+    "GroupEncryption",
+    "BroadcastEncryption",
+    # Identity/SSO
+    "IdentityProvider",
+    "Identity",
+    "Session",
+    "SecureSession",
+    # Secure Channel
+    "ShieldChannel",
+    "ChannelConfig",
+    "ShieldListener",
+    # Hardware Fingerprinting (v2.1)
+    "FingerprintMode",
+    "FingerprintError",
+]
+
+
+
+================================================
+FILE: core.py
+================================================
+"""
+Shield Core - Password-based symmetric encryption.
+
+This module provides the main Shield class for encrypting and decrypting
+data using password-derived keys. It uses PBKDF2-SHA256 for key derivation
+and a SHA256-based stream cipher with HMAC-SHA256 authentication.
+
+Security:
+    - PBKDF2 with 100,000 iterations
+    - 256-bit keys
+    - 16-byte random nonces
+    - HMAC-SHA256 authentication (16-byte tags)
+    - Constant-time MAC comparison
+"""
+
+import os
+import hmac
+import hashlib
+import struct
+import time
+from typing import Optional, Union
+
+# Key derivation iterations (higher = more secure, slower)
+PBKDF2_ITERATIONS = 100_000
+
+# Sizes in bytes
+NONCE_SIZE = 16
+MAC_SIZE = 16
+COUNTER_SIZE = 8
+
+# V2 constants
+V2_HEADER_SIZE = 17  # counter(8) + timestamp(8) + pad_len(1)
+MIN_PADDING = 32
+MAX_PADDING = 128
+
+# Timestamp range for v2 detection (2020-2100 in milliseconds)
+MIN_TIMESTAMP_MS = 1_577_836_800_000
+MAX_TIMESTAMP_MS = 4_102_444_800_000
+
+
+class Shield:
+    """
+    EXPTIME-secure symmetric encryption.
+
+    Uses password-derived keys with PBKDF2 and encrypts using
+    a SHA256-based stream cipher with HMAC-SHA256 authentication.
+    Breaking requires 2^256 operations - no shortcut exists.
+
+    Version 2 adds replay protection and length obfuscation:
+    - Timestamp validation prevents replay attacks
+    - Random padding (32-128 bytes) obfuscates message length
+
+    Example:
+        >>> s = Shield("my_password", "github.com")
+        >>> encrypted = s.encrypt(b"secret data")
+        >>> decrypted = s.decrypt(encrypted)
+        >>> assert decrypted == b"secret data"
+    """
+
+    def __init__(
+        self,
+        password: str,
+        service: str,
+        salt: Optional[bytes] = None,
+        iterations: int = PBKDF2_ITERATIONS,
+        max_age_ms: Optional[int] = 60_000,
+    ):
+        """
+        Initialize Shield with password and service name.
+
+        Args:
+            password: User's password for this service
+            service: Service identifier (e.g., "github.com")
+            salt: Optional custom salt (defaults to SHA256(service))
+            iterations: PBKDF2 iterations (default: 100,000)
+            max_age_ms: Maximum message age in milliseconds for replay protection
+                       (default: 60000 = 60 seconds, None = disabled)
+        """
+        if salt is None:
+            salt = hashlib.sha256(service.encode()).digest()
+
+        self._key = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), salt, iterations
+        )
+        self._counter = 0
+        self._max_age_ms = max_age_ms
+
+    @classmethod
+    def with_key(cls, key: bytes) -> "Shield":
+        """
+        Create Shield instance with a pre-shared key (no password derivation).
+
+        Args:
+            key: 32-byte symmetric key
+
+        Returns:
+            Shield instance
+
+        Raises:
+            ValueError: If key is not 32 bytes
+        """
+        if len(key) != 32:
+            raise ValueError(f"Key must be 32 bytes, got {len(key)}")
+
+        instance = cls.__new__(cls)
+        instance._key = key
+        instance._counter = 0
+        instance._max_age_ms = 60_000
+        return instance
+
+    @classmethod
+    def with_fingerprint(cls, password: str, service: str, mode: str = "combined") -> "Shield":
+        """
+        Create Shield with hardware fingerprinting (device-bound encryption).
+
+        Derives keys from password + hardware identifier, binding encryption to
+        the physical device. Keys cannot be transferred to other hardware without
+        the correct fingerprint.
+
+        Args:
+            password: User's password
+            service: Service identifier (e.g., "github.com")
+            mode: Fingerprint mode - "none", "motherboard", "cpu", or "combined"
+
+        Returns:
+            Shield instance with device-bound key
+
+        Raises:
+            FingerprintError: If hardware identifiers cannot be collected
+
+        Security:
+            - Binding Strength: MEDIUM (hardware IDs are stable but replaceable)
+            - Spoofability: LOW-MEDIUM (requires hardware access or VM manipulation)
+            - Portability: NONE (keys are device-bound by design)
+
+        Example:
+            >>> s = Shield.with_fingerprint("password", "github.com", "combined")
+            >>> encrypted = s.encrypt(b"secret")
+        """
+        from .fingerprint import collect_fingerprint, FingerprintMode
+
+        # Map string mode to enum
+        mode_map = {
+            "none": FingerprintMode.NONE,
+            "motherboard": FingerprintMode.MOTHERBOARD,
+            "cpu": FingerprintMode.CPU,
+            "combined": FingerprintMode.COMBINED,
+        }
+        fingerprint_mode = mode_map.get(mode.lower())
+        if fingerprint_mode is None:
+            raise ValueError(f"Invalid fingerprint mode: {mode}")
+
+        # Collect hardware fingerprint
+        fingerprint = collect_fingerprint(fingerprint_mode)
+
+        # Combine password with fingerprint
+        combined_password = f"{password}:{fingerprint}" if fingerprint else password
+
+        # Create instance with combined password
+        return cls(combined_password, service)
+
+    def encrypt(self, plaintext: bytes) -> bytes:
+        """
+        Encrypt data (v2 format with replay protection and length obfuscation).
+
+        Inner format: counter(8) || timestamp_ms(8) || pad_len(1) || random_padding(32-128) || plaintext
+
+        Args:
+            plaintext: Data to encrypt
+
+        Returns:
+            Ciphertext in format: nonce(16) || encrypted_data || mac(16)
+        """
+        nonce = os.urandom(NONCE_SIZE)
+        counter_bytes = struct.pack("<Q", self._counter)
+        self._counter += 1
+
+        # Timestamp in milliseconds since Unix epoch
+        timestamp_ms = int(time.time() * 1000)
+        timestamp_bytes = struct.pack("<Q", timestamp_ms)
+
+        # Random padding: 32-128 bytes
+        pad_len = int.from_bytes(os.urandom(1), "little") % (MAX_PADDING - MIN_PADDING + 1) + MIN_PADDING
+        pad_len_byte = struct.pack("B", pad_len)
+        padding = os.urandom(pad_len)
+
+        # Data to encrypt: counter || timestamp || pad_len || padding || plaintext
+        data = counter_bytes + timestamp_bytes + pad_len_byte + padding + plaintext
+
+        # Generate keystream
+        keystream = _generate_keystream(self._key, nonce, len(data))
+
+        # XOR encrypt
+        ciphertext = bytes(p ^ k for p, k in zip(data, keystream))
+
+        # HMAC authenticate
+        mac = hmac.new(self._key, nonce + ciphertext, hashlib.sha256).digest()[
+            :MAC_SIZE
+        ]
+
+        return nonce + ciphertext + mac
+
+    def decrypt(self, encrypted: bytes) -> Optional[bytes]:
+        """
+        Decrypt and verify data (auto-detects v1/v2 format).
+
+        Args:
+            encrypted: Ciphertext from encrypt()
+
+        Returns:
+            Plaintext bytes, or None if authentication fails or replay detected
+        """
+        min_size = NONCE_SIZE + COUNTER_SIZE + MAC_SIZE
+        if len(encrypted) < min_size:
+            return None
+
+        nonce = encrypted[:NONCE_SIZE]
+        ciphertext = encrypted[NONCE_SIZE:-MAC_SIZE]
+        mac = encrypted[-MAC_SIZE:]
+
+        # Verify MAC first (constant-time)
+        expected_mac = hmac.new(
+            self._key, nonce + ciphertext, hashlib.sha256
+        ).digest()[:MAC_SIZE]
+
+        if not hmac.compare_digest(mac, expected_mac):
+            return None
+
+        # Decrypt
+        keystream = _generate_keystream(self._key, nonce, len(ciphertext))
+        decrypted = bytes(c ^ k for c, k in zip(ciphertext, keystream))
+
+        # Auto-detect v2 by timestamp range (2020-2100)
+        if len(decrypted) >= V2_HEADER_SIZE:
+            timestamp_bytes = decrypted[8:16]
+            timestamp_ms = struct.unpack("<Q", timestamp_bytes)[0]
+
+            if MIN_TIMESTAMP_MS <= timestamp_ms <= MAX_TIMESTAMP_MS:
+                # v2 format detected
+                pad_len = decrypted[16]
+
+                # Validate padding length is within protocol bounds (SECURITY: CVE-PENDING)
+                if pad_len < MIN_PADDING or pad_len > MAX_PADDING:
+                    return None
+
+                data_start = V2_HEADER_SIZE + pad_len
+
+                if len(decrypted) < data_start:
+                    return None
+
+                # Replay protection
+                if self._max_age_ms is not None:
+                    now_ms = int(time.time() * 1000)
+                    age = now_ms - timestamp_ms
+
+                    # Reject if too far in future (>5s clock skew) or too old
+                    if timestamp_ms > now_ms + 5000 or age > self._max_age_ms:
+                        return None
+
+                return decrypted[data_start:]
+
+        # v1 format: skip counter (8 bytes)
+        return decrypted[COUNTER_SIZE:]
+
+    def decrypt_v1(self, encrypted: bytes) -> Optional[bytes]:
+        """
+        Decrypt v1 format explicitly (for legacy compatibility).
+
+        Args:
+            encrypted: Ciphertext from encrypt()
+
+        Returns:
+            Plaintext bytes, or None if authentication fails
+        """
+        min_size = NONCE_SIZE + COUNTER_SIZE + MAC_SIZE
+        if len(encrypted) < min_size:
+            return None
+
+        nonce = encrypted[:NONCE_SIZE]
+        ciphertext = encrypted[NONCE_SIZE:-MAC_SIZE]
+        mac = encrypted[-MAC_SIZE:]
+
+        # Verify MAC first (constant-time)
+        expected_mac = hmac.new(
+            self._key, nonce + ciphertext, hashlib.sha256
+        ).digest()[:MAC_SIZE]
+
+        if not hmac.compare_digest(mac, expected_mac):
+            return None
+
+        # Decrypt
+        keystream = _generate_keystream(self._key, nonce, len(ciphertext))
+        decrypted = bytes(c ^ k for c, k in zip(ciphertext, keystream))
+
+        # v1 format: skip counter (8 bytes)
+        return decrypted[COUNTER_SIZE:]
+
+    @property
+    def key(self) -> bytes:
+        """Get the derived key (for testing/debugging)."""
+        return self._key
+
+
+def _generate_keystream(key: bytes, nonce: bytes, length: int) -> bytes:
+    """
+    Generate keystream using SHA256 (AES-256-CTR equivalent).
+
+    Args:
+        key: 32-byte key
+        nonce: 16-byte nonce
+        length: Number of keystream bytes needed
+
+    Returns:
+        Keystream bytes
+    """
+    keystream = b""
+    num_blocks = (length + 31) // 32
+
+    for i in range(num_blocks):
+        counter = struct.pack("<I", i)
+        block = hashlib.sha256(key + nonce + counter).digest()
+        keystream += block
+
+    return keystream[:length]
+
+
+def quick_encrypt(key: bytes, data: bytes) -> bytes:
+    """
+    One-shot encrypt with pre-shared key (no password derivation).
+
+    Args:
+        key: 32-byte symmetric key
+        data: Data to encrypt
+
+    Returns:
+        Ciphertext in format: nonce(16) || encrypted_data || mac(16)
+
+    Example:
+        >>> key = os.urandom(32)
+        >>> encrypted = quick_encrypt(key, b"secret")
+        >>> decrypted = quick_decrypt(key, encrypted)
+    """
+    nonce = os.urandom(NONCE_SIZE)
+    keystream = _generate_keystream(key, nonce, len(data))
+    ciphertext = bytes(d ^ k for d, k in zip(data, keystream))
+    mac = hmac.new(key, nonce + ciphertext, hashlib.sha256).digest()[:MAC_SIZE]
+    return nonce + ciphertext + mac
+
+
+def quick_decrypt(key: bytes, encrypted: bytes) -> Optional[bytes]:
+    """
+    One-shot decrypt with pre-shared key.
+
+    Args:
+        key: 32-byte symmetric key
+        encrypted: Ciphertext from quick_encrypt()
+
+    Returns:
+        Plaintext bytes, or None if authentication fails
+    """
+    if len(encrypted) < NONCE_SIZE + MAC_SIZE:
+        return None
+
+    nonce = encrypted[:NONCE_SIZE]
+    ciphertext = encrypted[NONCE_SIZE:-MAC_SIZE]
+    mac = encrypted[-MAC_SIZE:]
+
+    expected_mac = hmac.new(key, nonce + ciphertext, hashlib.sha256).digest()[
+        :MAC_SIZE
+    ]
+
+    if not hmac.compare_digest(mac, expected_mac):
+        return None
+
+    keystream = _generate_keystream(key, nonce, len(ciphertext))
+    return bytes(c ^ k for c, k in zip(ciphertext, keystream))
+
+
+
+================================================
+FILE: integrations/__init__.py
+================================================
+"""
+Shield Web Framework Integrations
+
+Protect servers, browsers, and APIs with EXPTIME-secure encryption.
+
+Supported frameworks:
+- FastAPI: ShieldMiddleware, shield_protected decorator
+- Flask: ShieldFlask extension, shield_required decorator
+
+Features:
+- Request/response encryption
+- Token-based authentication
+- Rate limiting with encrypted counters
+- CORS with encrypted cookies
+- Browser-side encryption helpers
+- Confidential Computing: TEE attestation for AWS Nitro, GCP SEV, Azure MAA, Intel SGX
+"""
+
+from shield.integrations.fastapi import (
+    ShieldMiddleware,
+    shield_protected,
+    ShieldAPIKeyAuth,
+    ShieldTokenAuth,
+)
+from shield.integrations.flask import (
+    ShieldFlask,
+    shield_required,
+    shield_encrypt_response,
+)
+from shield.integrations.protection import (
+    APIProtector,
+    RateLimiter,
+    TokenBucket,
+)
+from shield.integrations.browser import (
+    BrowserBridge,
+    EncryptedCookie,
+    SecureCORS,
+)
+
+# Confidential Computing (lazy import to avoid dependency issues)
+def __getattr__(name):
+    """Lazy import for confidential computing modules."""
+    confidential_exports = {
+        "AttestationProvider",
+        "AttestationResult",
+        "AttestationError",
+        "TEEType",
+        "TEEKeyManager",
+        "NitroAttestationProvider",
+        "SEVAttestationProvider",
+        "MAAAttestationProvider",
+        "SGXAttestationProvider",
+        "AttestationMiddleware",
+        "requires_attestation",
+    }
+    if name in confidential_exports:
+        from shield.integrations import confidential
+        return getattr(confidential, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+__all__ = [
+    # FastAPI
+    "ShieldMiddleware",
+    "shield_protected",
+    "ShieldAPIKeyAuth",
+    "ShieldTokenAuth",
+    # Flask
+    "ShieldFlask",
+    "shield_required",
+    "shield_encrypt_response",
+    # Protection
+    "APIProtector",
+    "RateLimiter",
+    "TokenBucket",
+    # Browser
+    "BrowserBridge",
+    "EncryptedCookie",
+    "SecureCORS",
+    # Confidential Computing
+    "AttestationProvider",
+    "AttestationResult",
+    "AttestationError",
+    "TEEType",
+    "TEEKeyManager",
+    "NitroAttestationProvider",
+    "SEVAttestationProvider",
+    "MAAAttestationProvider",
+    "SGXAttestationProvider",
+    "AttestationMiddleware",
+    "requires_attestation",
+]
+
+
+
+================================================
+FILE: integrations/confidential/__init__.py
+================================================
+"""
+Confidential Computing Integrations for Shield
+
+Provides attestation verification and TEE-aware key management for:
+- AWS Nitro Enclaves
+- GCP Confidential VMs (AMD SEV-SNP)
+- Azure Confidential Containers (MAA)
+- Intel SGX (Gramine/Occlum)
+
+Usage:
+    from shield.integrations.confidential import (
+        AttestationProvider,
+        TEEKeyManager,
+        AttestationMiddleware,
+        requires_attestation,
+    )
+
+    # Verify attestation
+    provider = NitroAttestationProvider()
+    result = await provider.verify(attestation_doc)
+
+    # TEE-aware key management
+    key_manager = TEEKeyManager(
+        password="secret",
+        service="api.example.com",
+        provider=provider,
+    )
+    key = await key_manager.get_key(attestation_doc)
+"""
+
+from shield.integrations.confidential.base import (
+    AttestationProvider,
+    AttestationResult,
+    AttestationError,
+    TEEType,
+    TEEKeyManager,
+)
+from shield.integrations.confidential.aws_nitro import NitroAttestationProvider
+from shield.integrations.confidential.gcp_sev import SEVAttestationProvider
+from shield.integrations.confidential.azure_maa import MAAAttestationProvider
+from shield.integrations.confidential.intel_sgx import SGXAttestationProvider
+from shield.integrations.confidential.middleware import (
+    AttestationMiddleware,
+    requires_attestation,
+)
+
+__all__ = [
+    # Base types
+    "AttestationProvider",
+    "AttestationResult",
+    "AttestationError",
+    "TEEType",
+    "TEEKeyManager",
+    # Providers
+    "NitroAttestationProvider",
+    "SEVAttestationProvider",
+    "MAAAttestationProvider",
+    "SGXAttestationProvider",
+    # Middleware
+    "AttestationMiddleware",
+    "requires_attestation",
+]
+
+
+
+================================================
+FILE: integrations/django/__init__.py
+================================================
+"""
+Shield Django Integration
+
+Middleware and utilities for Django applications.
+
+Usage:
+    # settings.py
+    MIDDLEWARE = [
+        ...
+        'shield.integrations.django.ShieldMiddleware',
+    ]
+
+    SHIELD_PASSWORD = 'your-secret-password'
+    SHIELD_SERVICE = 'your-app.com'
+
+    # views.py
+    from shield.integrations.django import shield_protected
+
+    @shield_protected
+    def secret_view(request):
+        return JsonResponse({'secret': 'data'})
+"""
+
+from functools import wraps
+import json
+import base64
+
+from django.conf import settings
+from django.http import JsonResponse, HttpResponse
+
+from ...shield import Shield
+
+
+class ShieldMiddleware:
+    """
+    Django middleware for automatic response encryption.
+
+    Add to MIDDLEWARE in settings.py:
+        'shield.integrations.django.ShieldMiddleware'
+
+    Configure in settings.py:
+        SHIELD_PASSWORD = 'your-password'
+        SHIELD_SERVICE = 'your-service'
+        SHIELD_ENCRYPT_PATHS = ['/api/']  # Optional: only encrypt these paths
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+        self.password = getattr(settings, 'SHIELD_PASSWORD', None)
+        self.service = getattr(settings, 'SHIELD_SERVICE', 'django-app')
+        self.encrypt_paths = getattr(settings, 'SHIELD_ENCRYPT_PATHS', None)
+
+        if self.password:
+            self.shield = Shield(self.password, self.service)
+        else:
+            self.shield = None
+
+    def __call__(self, request):
+        response = self.get_response(request)
+
+        if not self.shield:
+            return response
+
+        # Check if path should be encrypted
+        if self.encrypt_paths:
+            should_encrypt = any(
+                request.path.startswith(path)
+                for path in self.encrypt_paths
+            )
+            if not should_encrypt:
+                return response
+
+        # Only encrypt JSON responses
+        content_type = response.get('Content-Type', '')
+        if 'application/json' not in content_type:
+            return response
+
+        # Encrypt response
+        try:
+            encrypted = self.shield.encrypt(response.content)
+            encrypted_b64 = base64.b64encode(encrypted).decode('utf-8')
+
+            return JsonResponse({
+                'encrypted': True,
+                'data': encrypted_b64
+            })
+        except Exception:
+            # On encryption failure, return original response
+            return response
+
+
+def shield_protected(view_func=None, password=None, service=None):
+    """
+    Decorator to encrypt view responses.
+
+    Usage:
+        @shield_protected
+        def my_view(request):
+            return JsonResponse({'secret': 'data'})
+
+        @shield_protected(password='custom-pw', service='custom-svc')
+        def my_view(request):
+            return JsonResponse({'secret': 'data'})
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(request, *args, **kwargs):
+            response = func(request, *args, **kwargs)
+
+            pw = password or getattr(settings, 'SHIELD_PASSWORD', None)
+            svc = service or getattr(settings, 'SHIELD_SERVICE', 'django-app')
+
+            if not pw:
+                return response
+
+            shield = Shield(pw, svc)
+
+            if isinstance(response, JsonResponse):
+                encrypted = shield.encrypt(response.content)
+                encrypted_b64 = base64.b64encode(encrypted).decode('utf-8')
+                return JsonResponse({
+                    'encrypted': True,
+                    'data': encrypted_b64
+                })
+
+            return response
+        return wrapper
+
+    if view_func:
+        return decorator(view_func)
+    return decorator
+
+
+def shield_required(view_func=None, password=None, service=None):
+    """
+    Decorator requiring encrypted request body.
+
+    Usage:
+        @shield_required
+        def my_view(request):
+            # request.shield_data contains decrypted data
+            return JsonResponse({'received': request.shield_data})
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(request, *args, **kwargs):
+            pw = password or getattr(settings, 'SHIELD_PASSWORD', None)
+            svc = service or getattr(settings, 'SHIELD_SERVICE', 'django-app')
+
+            if not pw:
+                return JsonResponse(
+                    {'error': 'Shield not configured'},
+                    status=500
+                )
+
+            shield = Shield(pw, svc)
+
+            try:
+                body = json.loads(request.body)
+                if body.get('encrypted') and body.get('data'):
+                    encrypted = base64.b64decode(body['data'])
+                    decrypted = shield.decrypt(encrypted)
+                    request.shield_data = json.loads(decrypted)
+                else:
+                    return JsonResponse(
+                        {'error': 'Encrypted request required'},
+                        status=400
+                    )
+            except Exception:
+                return JsonResponse(
+                    {'error': 'Decryption failed'},
+                    status=400
+                )
+
+            return func(request, *args, **kwargs)
+        return wrapper
+
+    if view_func:
+        return decorator(view_func)
+    return decorator
+
+
+class EncryptedSessionMiddleware:
+    """
+    Middleware to encrypt Django session data.
+
+    Add AFTER SessionMiddleware in MIDDLEWARE:
+        'django.contrib.sessions.middleware.SessionMiddleware',
+        'shield.integrations.django.EncryptedSessionMiddleware',
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+        password = getattr(settings, 'SHIELD_PASSWORD', None)
+        service = getattr(settings, 'SHIELD_SERVICE', 'django-session')
+
+        if password:
+            self.shield = Shield(password, service)
+        else:
+            self.shield = None
+
+    def __call__(self, request):
+        return self.get_response(request)
+
+
+__all__ = [
+    'ShieldMiddleware',
+    'shield_protected',
+    'shield_required',
+    'EncryptedSessionMiddleware',
+]
+
+

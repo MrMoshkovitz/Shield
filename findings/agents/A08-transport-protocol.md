@@ -47,3 +47,11 @@
 ---
 
 **TASK-2-014 COMPLETE** — 4 MEDIUM findings
+TASK-2-015 FINDINGS DOCUMENTED - 3 MEDIUM, 1 LOW on RatchetSession key zeroization issues
+TASK-2-016 FINDINGS: Counter overflow handling missing (MEDIUM), V2 timestamp protection not implemented (LOW). 2 additional findings documented.
+
+---
+
+## PHASE 2 PROGRESS UPDATE
+
+**ITERATION 28 SUMMARY**: Completed TASK-2-015 (RatchetSession, 4 findings) + TASK-2-016 (Counter Replay, 2 findings)

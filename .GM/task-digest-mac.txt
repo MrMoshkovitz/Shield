@@ -1,0 +1,4167 @@
+Directory structure:
+└── Shield/
+    ├── c/
+    │   └── src/
+    │       └── shield.c
+    ├── csharp/
+    │   └── Shield/
+    │       └── Shield.cs
+    ├── go/
+    │   └── shield/
+    │       └── shield.go
+    ├── java/
+    │   └── src/
+    │       └── main/
+    │           └── java/
+    │               └── ai/
+    │                   └── guard8/
+    │                       └── shield/
+    │                           └── Shield.java
+    ├── javascript/
+    │   └── src/
+    │       └── shield.js
+    ├── kotlin/
+    │   └── src/
+    │       └── main/
+    │           └── kotlin/
+    │               └── ai/
+    │                   └── guard8/
+    │                       └── shield/
+    │                           └── Shield.kt
+    ├── python/
+    │   └── shield/
+    │       └── core.py
+    ├── shield-core/
+    │   └── src/
+    │       └── shield.rs
+    └── swift/
+        └── Sources/
+            └── Shield/
+                └── Shield.swift
+
+================================================
+FILE: c/src/shield.c
+================================================
+/**
+ * Shield - EXPTIME-Secure Symmetric Encryption Library
+ * Pure C implementation with no external dependencies except standard library.
+ */
+
+#include "shield.h"
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <stdio.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <wincrypt.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+/* ============== SHA256 Implementation ============== */
+
+static const uint32_t sha256_k[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+static inline uint32_t rotr32(uint32_t x, int n) {
+    return (x >> n) | (x << (32 - n));
+}
+
+static inline uint32_t ch(uint32_t x, uint32_t y, uint32_t z) {
+    return (x & y) ^ (~x & z);
+}
+
+static inline uint32_t maj(uint32_t x, uint32_t y, uint32_t z) {
+    return (x & y) ^ (x & z) ^ (y & z);
+}
+
+static inline uint32_t sig0(uint32_t x) {
+    return rotr32(x, 2) ^ rotr32(x, 13) ^ rotr32(x, 22);
+}
+
+static inline uint32_t sig1(uint32_t x) {
+    return rotr32(x, 6) ^ rotr32(x, 11) ^ rotr32(x, 25);
+}
+
+static inline uint32_t gamma0(uint32_t x) {
+    return rotr32(x, 7) ^ rotr32(x, 18) ^ (x >> 3);
+}
+
+static inline uint32_t gamma1(uint32_t x) {
+    return rotr32(x, 17) ^ rotr32(x, 19) ^ (x >> 10);
+}
+
+typedef struct {
+    uint32_t state[8];
+    uint8_t buffer[64];
+    uint64_t total;
+} sha256_ctx;
+
+static void sha256_init(sha256_ctx *ctx) {
+    ctx->state[0] = 0x6a09e667;
+    ctx->state[1] = 0xbb67ae85;
+    ctx->state[2] = 0x3c6ef372;
+    ctx->state[3] = 0xa54ff53a;
+    ctx->state[4] = 0x510e527f;
+    ctx->state[5] = 0x9b05688c;
+    ctx->state[6] = 0x1f83d9ab;
+    ctx->state[7] = 0x5be0cd19;
+    ctx->total = 0;
+}
+
+static void sha256_transform(sha256_ctx *ctx, const uint8_t *data) {
+    uint32_t w[64];
+    uint32_t a, b, c, d, e, f, g, h;
+    int i;
+
+    for (i = 0; i < 16; i++) {
+        w[i] = ((uint32_t)data[i*4] << 24) |
+               ((uint32_t)data[i*4+1] << 16) |
+               ((uint32_t)data[i*4+2] << 8) |
+               ((uint32_t)data[i*4+3]);
+    }
+    for (i = 16; i < 64; i++) {
+        w[i] = gamma1(w[i-2]) + w[i-7] + gamma0(w[i-15]) + w[i-16];
+    }
+
+    a = ctx->state[0]; b = ctx->state[1]; c = ctx->state[2]; d = ctx->state[3];
+    e = ctx->state[4]; f = ctx->state[5]; g = ctx->state[6]; h = ctx->state[7];
+
+    for (i = 0; i < 64; i++) {
+        uint32_t t1 = h + sig1(e) + ch(e, f, g) + sha256_k[i] + w[i];
+        uint32_t t2 = sig0(a) + maj(a, b, c);
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+
+    ctx->state[0] += a; ctx->state[1] += b; ctx->state[2] += c; ctx->state[3] += d;
+    ctx->state[4] += e; ctx->state[5] += f; ctx->state[6] += g; ctx->state[7] += h;
+}
+
+static void sha256_update(sha256_ctx *ctx, const uint8_t *data, size_t len) {
+    size_t fill = ctx->total & 63;
+    size_t left = len;
+
+    ctx->total += len;
+
+    if (fill && fill + len >= 64) {
+        memcpy(ctx->buffer + fill, data, 64 - fill);
+        sha256_transform(ctx, ctx->buffer);
+        data += 64 - fill;
+        left -= 64 - fill;
+        fill = 0;
+    }
+
+    while (left >= 64) {
+        sha256_transform(ctx, data);
+        data += 64;
+        left -= 64;
+    }
+
+    if (left) {
+        memcpy(ctx->buffer + fill, data, left);
+    }
+}
+
+static void sha256_final(sha256_ctx *ctx, uint8_t *hash) {
+    uint8_t pad[64];
+    uint64_t bits = ctx->total * 8;
+    size_t fill = ctx->total & 63;
+    size_t pad_len = (fill < 56) ? (56 - fill) : (120 - fill);
+    int i;
+
+    memset(pad, 0, pad_len);
+    pad[0] = 0x80;
+    sha256_update(ctx, pad, pad_len);
+
+    pad[0] = (uint8_t)(bits >> 56);
+    pad[1] = (uint8_t)(bits >> 48);
+    pad[2] = (uint8_t)(bits >> 40);
+    pad[3] = (uint8_t)(bits >> 32);
+    pad[4] = (uint8_t)(bits >> 24);
+    pad[5] = (uint8_t)(bits >> 16);
+    pad[6] = (uint8_t)(bits >> 8);
+    pad[7] = (uint8_t)(bits);
+    sha256_update(ctx, pad, 8);
+
+    for (i = 0; i < 8; i++) {
+        hash[i*4] = (uint8_t)(ctx->state[i] >> 24);
+        hash[i*4+1] = (uint8_t)(ctx->state[i] >> 16);
+        hash[i*4+2] = (uint8_t)(ctx->state[i] >> 8);
+        hash[i*4+3] = (uint8_t)(ctx->state[i]);
+    }
+}
+
+void shield_sha256(const uint8_t *data, size_t len, uint8_t *hash) {
+    sha256_ctx ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, data, len);
+    sha256_final(&ctx, hash);
+}
+
+/* ============== HMAC-SHA256 Implementation ============== */
+
+void shield_hmac_sha256(const uint8_t *key, size_t key_len, const uint8_t *data, size_t data_len, uint8_t *mac) {
+    uint8_t k_ipad[64], k_opad[64];
+    uint8_t tk[32];
+    sha256_ctx ctx;
+    size_t i;
+
+    if (key_len > 64) {
+        shield_sha256(key, key_len, tk);
+        key = tk;
+        key_len = 32;
+    }
+
+    memset(k_ipad, 0x36, 64);
+    memset(k_opad, 0x5c, 64);
+
+    for (i = 0; i < key_len; i++) {
+        k_ipad[i] ^= key[i];
+        k_opad[i] ^= key[i];
+    }
+
+    sha256_init(&ctx);
+    sha256_update(&ctx, k_ipad, 64);
+    sha256_update(&ctx, data, data_len);
+    sha256_final(&ctx, mac);
+
+    sha256_init(&ctx);
+    sha256_update(&ctx, k_opad, 64);
+    sha256_update(&ctx, mac, 32);
+    sha256_final(&ctx, mac);
+}
+
+/* ============== PBKDF2-SHA256 Implementation ============== */
+
+void shield_pbkdf2(const char *password, const uint8_t *salt, size_t salt_len, int iterations, uint8_t *key, size_t key_len) {
+    uint8_t U[32], T[32];
+    uint8_t *salt_ext;
+    size_t password_len = strlen(password);
+    size_t blocks = (key_len + 31) / 32;
+    size_t i, j, k;
+
+    salt_ext = (uint8_t *)malloc(salt_len + 4);
+    memcpy(salt_ext, salt, salt_len);
+
+    for (i = 0; i < blocks; i++) {
+        salt_ext[salt_len] = (uint8_t)((i + 1) >> 24);
+        salt_ext[salt_len + 1] = (uint8_t)((i + 1) >> 16);
+        salt_ext[salt_len + 2] = (uint8_t)((i + 1) >> 8);
+        salt_ext[salt_len + 3] = (uint8_t)(i + 1);
+
+        shield_hmac_sha256((const uint8_t *)password, password_len, salt_ext, salt_len + 4, U);
+        memcpy(T, U, 32);
+
+        for (j = 1; j < (size_t)iterations; j++) {
+            shield_hmac_sha256((const uint8_t *)password, password_len, U, 32, U);
+            for (k = 0; k < 32; k++) {
+                T[k] ^= U[k];
+            }
+        }
+
+        size_t copy_len = (key_len - i * 32 < 32) ? (key_len - i * 32) : 32;
+        memcpy(key + i * 32, T, copy_len);
+    }
+
+    free(salt_ext);
+    shield_secure_wipe(U, 32);
+    shield_secure_wipe(T, 32);
+}
+
+/* ============== Utility Functions ============== */
+
+int shield_secure_compare(const uint8_t *a, const uint8_t *b, size_t len) {
+    volatile uint8_t result = 0;
+    size_t i;
+    for (i = 0; i < len; i++) {
+        result |= a[i] ^ b[i];
+    }
+    return result == 0;
+}
+
+void shield_secure_wipe(void *ptr, size_t len) {
+    volatile uint8_t *p = (volatile uint8_t *)ptr;
+    while (len--) {
+        *p++ = 0;
+    }
+}
+
+shield_error_t shield_random_bytes(uint8_t *buf, size_t len) {
+#ifdef _WIN32
+    HCRYPTPROV hProv;
+    if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        return SHIELD_ERR_RANDOM_FAILED;
+    }
+    if (!CryptGenRandom(hProv, (DWORD)len, buf)) {
+        CryptReleaseContext(hProv, 0);
+        return SHIELD_ERR_RANDOM_FAILED;
+    }
+    CryptReleaseContext(hProv, 0);
+#else
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) {
+        return SHIELD_ERR_RANDOM_FAILED;
+    }
+    ssize_t n = read(fd, buf, len);
+    close(fd);
+    if (n != (ssize_t)len) {
+        return SHIELD_ERR_RANDOM_FAILED;
+    }
+#endif
+    return SHIELD_OK;
+}
+
+/* ============== Keystream Generation ============== */
+
+static void generate_keystream(const uint8_t *key, const uint8_t *nonce, size_t length, uint8_t *keystream) {
+    size_t num_blocks = (length + 31) / 32;
+    uint8_t block[32 + SHIELD_NONCE_SIZE + 4];
+    uint8_t hash[32];
+    size_t i, j;
+
+    for (i = 0; i < num_blocks; i++) {
+        memcpy(block, key, SHIELD_KEY_SIZE);
+        memcpy(block + SHIELD_KEY_SIZE, nonce, SHIELD_NONCE_SIZE);
+        block[SHIELD_KEY_SIZE + SHIELD_NONCE_SIZE] = (uint8_t)(i);
+        block[SHIELD_KEY_SIZE + SHIELD_NONCE_SIZE + 1] = (uint8_t)(i >> 8);
+        block[SHIELD_KEY_SIZE + SHIELD_NONCE_SIZE + 2] = (uint8_t)(i >> 16);
+        block[SHIELD_KEY_SIZE + SHIELD_NONCE_SIZE + 3] = (uint8_t)(i >> 24);
+
+        shield_sha256(block, SHIELD_KEY_SIZE + SHIELD_NONCE_SIZE + 4, hash);
+
+        size_t copy_len = (length - i * 32 < 32) ? (length - i * 32) : 32;
+        for (j = 0; j < copy_len; j++) {
+            keystream[i * 32 + j] = hash[j];
+        }
+    }
+}
+
+/* ============== Core Shield Functions ============== */
+
+void shield_init(shield_t *ctx, const char *password, const char *service, int64_t max_age_ms) {
+    uint8_t salt[32];
+    shield_sha256((const uint8_t *)service, strlen(service), salt);
+    shield_pbkdf2(password, salt, 32, SHIELD_ITERATIONS, ctx->key, SHIELD_KEY_SIZE);
+    ctx->max_age_ms = max_age_ms;
+}
+
+shield_error_t shield_init_with_key(shield_t *ctx, const uint8_t *key, size_t key_len, int64_t max_age_ms) {
+    if (key_len != SHIELD_KEY_SIZE) {
+        return SHIELD_ERR_INVALID_KEY_SIZE;
+    }
+    memcpy(ctx->key, key, SHIELD_KEY_SIZE);
+    ctx->max_age_ms = max_age_ms;
+    return SHIELD_OK;
+}
+
+uint8_t *shield_encrypt(const shield_t *ctx, const uint8_t *plaintext, size_t plaintext_len, size_t *out_len) {
+    uint8_t nonce[SHIELD_NONCE_SIZE];
+    uint8_t counter[8] = {0};
+    uint8_t timestamp[8];
+    uint8_t pad_len_byte;
+    uint8_t *padding;
+    uint8_t *data_to_encrypt;
+    uint8_t *keystream;
+    uint8_t *result;
+    uint8_t mac[32];
+    int64_t timestamp_ms;
+    size_t pad_len;
+    size_t data_len;
+    size_t ciphertext_len;
+    size_t pos;
+    size_t i;
+
+    if (shield_random_bytes(nonce, SHIELD_NONCE_SIZE) != SHIELD_OK) {
+        return NULL;
+    }
+
+    /* Timestamp in milliseconds since Unix epoch */
+    timestamp_ms = (int64_t)(time(NULL)) * 1000;
+    memcpy(timestamp, &timestamp_ms, 8);
+
+    /* Random padding: 32-128 bytes */
+    if (shield_random_bytes(&pad_len_byte, 1) != SHIELD_OK) {
+        return NULL;
+    }
+    pad_len = (pad_len_byte % (SHIELD_MAX_PADDING - SHIELD_MIN_PADDING + 1)) + SHIELD_MIN_PADDING;
+    padding = (uint8_t *)malloc(pad_len);
+    if (!padding) return NULL;
+    if (shield_random_bytes(padding, pad_len) != SHIELD_OK) {
+        free(padding);
+        return NULL;
+    }
+
+    /* Data to encrypt: counter || timestamp || pad_len || padding || plaintext */
+    data_len = 8 + 8 + 1 + pad_len + plaintext_len;
+    data_to_encrypt = (uint8_t *)malloc(data_len);
+    if (!data_to_encrypt) {
+        free(padding);
+        return NULL;
+    }
+
+    pos = 0;
+    memcpy(data_to_encrypt + pos, counter, 8);
+    pos += 8;
+    memcpy(data_to_encrypt + pos, timestamp, 8);
+    pos += 8;
+    data_to_encrypt[pos] = (uint8_t)pad_len;
+    pos += 1;
+    memcpy(data_to_encrypt + pos, padding, pad_len);
+    pos += pad_len;
+    memcpy(data_to_encrypt + pos, plaintext, plaintext_len);
+    free(padding);
+
+    /* Allocate result */
+    ciphertext_len = SHIELD_NONCE_SIZE + data_len + SHIELD_MAC_SIZE;
+    result = (uint8_t *)malloc(ciphertext_len);
+    if (!result) {
+        free(data_to_encrypt);
+        return NULL;
+    }
+
+    memcpy(result, nonce, SHIELD_NONCE_SIZE);
+
+    /* Generate keystream and XOR */
+    keystream = (uint8_t *)malloc(data_len);
+    if (!keystream) {
+        free(data_to_encrypt);
+        free(result);
+        return NULL;
+    }
+    generate_keystream(ctx->key, nonce, data_len, keystream);
+
+    for (i = 0; i < data_len; i++) {
+        result[SHIELD_NONCE_SIZE + i] = data_to_encrypt[i] ^ keystream[i];
+    }
+
+    free(keystream);
+    free(data_to_encrypt);
+
+    /* Compute HMAC over nonce || ciphertext */
+    uint8_t *mac_data = (uint8_t *)malloc(SHIELD_NONCE_SIZE + data_len);
+    if (!mac_data) {
+        free(result);
+        return NULL;
+    }
+    memcpy(mac_data, nonce, SHIELD_NONCE_SIZE);
+    memcpy(mac_data + SHIELD_NONCE_SIZE, result + SHIELD_NONCE_SIZE, data_len);
+    shield_hmac_sha256(ctx->key, SHIELD_KEY_SIZE, mac_data, SHIELD_NONCE_SIZE + data_len, mac);
+    free(mac_data);
+
+    memcpy(result + SHIELD_NONCE_SIZE + data_len, mac, SHIELD_MAC_SIZE);
+
+    *out_len = ciphertext_len;
+    return result;
+}
+
+uint8_t *shield_decrypt(const shield_t *ctx, const uint8_t *ciphertext, size_t ciphertext_len, size_t *out_len, shield_error_t *err) {
+    size_t data_len;
+    uint8_t *nonce;
+    uint8_t *encrypted;
+    uint8_t *received_mac;
+    uint8_t mac[32];
+    uint8_t *keystream;
+    uint8_t *decrypted;
+    uint8_t *result;
+    int64_t timestamp_ms;
+    size_t pad_len;
+    size_t data_start;
+    size_t i;
+
+    if (ciphertext_len < SHIELD_MIN_CIPHERTEXT_SIZE) {
+        if (err) *err = SHIELD_ERR_CIPHERTEXT_TOO_SHORT;
+        return NULL;
+    }
+
+    nonce = (uint8_t *)ciphertext;
+    data_len = ciphertext_len - SHIELD_NONCE_SIZE - SHIELD_MAC_SIZE;
+    encrypted = (uint8_t *)ciphertext + SHIELD_NONCE_SIZE;
+    received_mac = (uint8_t *)ciphertext + ciphertext_len - SHIELD_MAC_SIZE;
+
+    /* Verify MAC */
+    uint8_t *mac_data = (uint8_t *)malloc(SHIELD_NONCE_SIZE + data_len);
+    if (!mac_data) {
+        if (err) *err = SHIELD_ERR_ALLOC_FAILED;
+        return NULL;
+    }
+    memcpy(mac_data, nonce, SHIELD_NONCE_SIZE);
+    memcpy(mac_data + SHIELD_NONCE_SIZE, encrypted, data_len);
+    shield_hmac_sha256(ctx->key, SHIELD_KEY_SIZE, mac_data, SHIELD_NONCE_SIZE + data_len, mac);
+    free(mac_data);
+
+    if (!shield_secure_compare(received_mac, mac, SHIELD_MAC_SIZE)) {
+        if (err) *err = SHIELD_ERR_AUTHENTICATION_FAILED;
+        return NULL;
+    }
+
+    /* Decrypt */
+    keystream = (uint8_t *)malloc(data_len);
+    if (!keystream) {
+        if (err) *err = SHIELD_ERR_ALLOC_FAILED;
+        return NULL;
+    }
+    generate_keystream(ctx->key, nonce, data_len, keystream);
+
+    decrypted = (uint8_t *)malloc(data_len);
+    if (!decrypted) {
+        free(keystream);
+        if (err) *err = SHIELD_ERR_ALLOC_FAILED;
+        return NULL;
+    }
+    for (i = 0; i < data_len; i++) {
+        decrypted[i] = encrypted[i] ^ keystream[i];
+    }
+    free(keystream);
+
+    /* Auto-detect v2 by timestamp range (2020-2100) */
+    if (data_len >= SHIELD_V2_HEADER_SIZE) {
+        memcpy(&timestamp_ms, decrypted + 8, 8);
+
+        if (timestamp_ms >= SHIELD_MIN_TIMESTAMP_MS && timestamp_ms <= SHIELD_MAX_TIMESTAMP_MS) {
+            /* v2 format detected */
+            pad_len = decrypted[16];
+
+            /* Validate padding length is within protocol bounds (SECURITY: CVE-PENDING) */
+            if (pad_len < SHIELD_MIN_PADDING || pad_len > SHIELD_MAX_PADDING) {
+                free(decrypted);
+                if (err) *err = SHIELD_ERR_AUTHENTICATION_FAILED;
+                return NULL;
+            }
+
+            data_start = SHIELD_V2_HEADER_SIZE + pad_len;
+
+            if (data_len < data_start) {
+                free(decrypted);
+                if (err) *err = SHIELD_ERR_CIPHERTEXT_TOO_SHORT;
+                return NULL;
+            }
+
+            /* Replay protection */
+            if (ctx->max_age_ms >= 0) {
+                int64_t now_ms = (int64_t)(time(NULL)) * 1000;
+                int64_t age = now_ms - timestamp_ms;
+
+                /* Reject if too far in future (>5s clock skew) or too old */
+                if (timestamp_ms > now_ms + 5000 || age > ctx->max_age_ms) {
+                    free(decrypted);
+                    if (err) *err = SHIELD_ERR_AUTHENTICATION_FAILED;
+                    return NULL;
+                }
+            }
+
+            *out_len = data_len - data_start;
+            result = (uint8_t *)malloc(*out_len);
+            if (!result) {
+                free(decrypted);
+                if (err) *err = SHIELD_ERR_ALLOC_FAILED;
+                return NULL;
+            }
+            memcpy(result, decrypted + data_start, *out_len);
+            free(decrypted);
+
+            if (err) *err = SHIELD_OK;
+            return result;
+        }
+    }
+
+    /* v1 format: skip counter (8 bytes) */
+    *out_len = data_len - 8;
+    result = (uint8_t *)malloc(*out_len);
+    if (!result) {
+        free(decrypted);
+        if (err) *err = SHIELD_ERR_ALLOC_FAILED;
+        return NULL;
+    }
+    memcpy(result, decrypted + 8, *out_len);
+    free(decrypted);
+
+    if (err) *err = SHIELD_OK;
+    return result;
+}
+
+uint8_t *shield_decrypt_v1(const shield_t *ctx, const uint8_t *ciphertext, size_t ciphertext_len, size_t *out_len, shield_error_t *err) {
+    size_t data_len;
+    uint8_t *nonce;
+    uint8_t *encrypted;
+    uint8_t *received_mac;
+    uint8_t mac[32];
+    uint8_t *keystream;
+    uint8_t *decrypted;
+    uint8_t *result;
+    size_t i;
+
+    if (ciphertext_len < SHIELD_MIN_CIPHERTEXT_SIZE) {
+        if (err) *err = SHIELD_ERR_CIPHERTEXT_TOO_SHORT;
+        return NULL;
+    }
+
+    nonce = (uint8_t *)ciphertext;
+    data_len = ciphertext_len - SHIELD_NONCE_SIZE - SHIELD_MAC_SIZE;
+    encrypted = (uint8_t *)ciphertext + SHIELD_NONCE_SIZE;
+    received_mac = (uint8_t *)ciphertext + ciphertext_len - SHIELD_MAC_SIZE;
+
+    /* Verify MAC */
+    uint8_t *mac_data = (uint8_t *)malloc(SHIELD_NONCE_SIZE + data_len);
+    if (!mac_data) {
+        if (err) *err = SHIELD_ERR_ALLOC_FAILED;
+        return NULL;
+    }
+    memcpy(mac_data, nonce, SHIELD_NONCE_SIZE);
+    memcpy(mac_data + SHIELD_NONCE_SIZE, encrypted, data_len);
+    shield_hmac_sha256(ctx->key, SHIELD_KEY_SIZE, mac_data, SHIELD_NONCE_SIZE + data_len, mac);
+    free(mac_data);
+
+    if (!shield_secure_compare(received_mac, mac, SHIELD_MAC_SIZE)) {
+        if (err) *err = SHIELD_ERR_AUTHENTICATION_FAILED;
+        return NULL;
+    }
+
+    /* Decrypt */
+    keystream = (uint8_t *)malloc(data_len);
+    if (!keystream) {
+        if (err) *err = SHIELD_ERR_ALLOC_FAILED;
+        return NULL;
+    }
+    generate_keystream(ctx->key, nonce, data_len, keystream);
+
+    decrypted = (uint8_t *)malloc(data_len);
+    if (!decrypted) {
+        free(keystream);
+        if (err) *err = SHIELD_ERR_ALLOC_FAILED;
+        return NULL;
+    }
+    for (i = 0; i < data_len; i++) {
+        decrypted[i] = encrypted[i] ^ keystream[i];
+    }
+    free(keystream);
+
+    /* v1 format: skip counter (8 bytes) */
+    *out_len = data_len - 8;
+    result = (uint8_t *)malloc(*out_len);
+    if (!result) {
+        free(decrypted);
+        if (err) *err = SHIELD_ERR_ALLOC_FAILED;
+        return NULL;
+    }
+    memcpy(result, decrypted + 8, *out_len);
+    free(decrypted);
+
+    if (err) *err = SHIELD_OK;
+    return result;
+}
+
+uint8_t *shield_quick_encrypt(const uint8_t *key, size_t key_len, const uint8_t *plaintext, size_t plaintext_len, size_t *out_len, shield_error_t *err) {
+    shield_t ctx;
+    if (key_len != SHIELD_KEY_SIZE) {
+        if (err) *err = SHIELD_ERR_INVALID_KEY_SIZE;
+        return NULL;
+    }
+    memcpy(ctx.key, key, SHIELD_KEY_SIZE);
+    ctx.max_age_ms = -1;  /* No replay protection for quick functions */
+    uint8_t *result = shield_encrypt(&ctx, plaintext, plaintext_len, out_len);
+    shield_secure_wipe(ctx.key, SHIELD_KEY_SIZE);
+    if (err) *err = result ? SHIELD_OK : SHIELD_ERR_RANDOM_FAILED;
+    return result;
+}
+
+uint8_t *shield_quick_decrypt(const uint8_t *key, size_t key_len, const uint8_t *ciphertext, size_t ciphertext_len, size_t *out_len, shield_error_t *err) {
+    shield_t ctx;
+    if (key_len != SHIELD_KEY_SIZE) {
+        if (err) *err = SHIELD_ERR_INVALID_KEY_SIZE;
+        return NULL;
+    }
+    memcpy(ctx.key, key, SHIELD_KEY_SIZE);
+    ctx.max_age_ms = -1;  /* No replay protection for quick functions */
+    uint8_t *result = shield_decrypt(&ctx, ciphertext, ciphertext_len, out_len, err);
+    shield_secure_wipe(ctx.key, SHIELD_KEY_SIZE);
+    return result;
+}
+
+const uint8_t *shield_get_key(const shield_t *ctx) {
+    return ctx->key;
+}
+
+void shield_wipe(shield_t *ctx) {
+    shield_secure_wipe(ctx->key, SHIELD_KEY_SIZE);
+}
+
+/* ============== Stream Cipher Functions ============== */
+
+shield_error_t shield_stream_init(shield_stream_t *ctx, const uint8_t *key, size_t key_len, size_t chunk_size) {
+    if (key_len != SHIELD_KEY_SIZE) {
+        return SHIELD_ERR_INVALID_KEY_SIZE;
+    }
+    memcpy(ctx->key, key, SHIELD_KEY_SIZE);
+    ctx->chunk_size = chunk_size > 0 ? chunk_size : 65536;
+    return SHIELD_OK;
+}
+
+void shield_stream_init_password(shield_stream_t *ctx, const char *password, const uint8_t *salt, size_t salt_len, size_t chunk_size) {
+    shield_pbkdf2(password, salt, salt_len, SHIELD_ITERATIONS, ctx->key, SHIELD_KEY_SIZE);
+    ctx->chunk_size = chunk_size > 0 ? chunk_size : 65536;
+}
+
+void shield_stream_wipe(shield_stream_t *ctx) {
+    shield_secure_wipe(ctx->key, SHIELD_KEY_SIZE);
+}
+
+/* ============== Ratchet Session Functions ============== */
+
+static void derive_chain_key(const uint8_t *key, const char *info, uint8_t *out) {
+    sha256_ctx ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, key, SHIELD_KEY_SIZE);
+    sha256_update(&ctx, (const uint8_t *)info, strlen(info));
+    sha256_final(&ctx, out);
+}
+
+shield_error_t shield_ratchet_init(shield_ratchet_t *ctx, const uint8_t *root_key, size_t key_len, bool is_initiator) {
+    if (key_len != SHIELD_KEY_SIZE) {
+        return SHIELD_ERR_INVALID_KEY_SIZE;
+    }
+
+    ctx->is_initiator = is_initiator;
+    ctx->send_counter = 0;
+    ctx->recv_counter = 0;
+
+    if (is_initiator) {
+        derive_chain_key(root_key, "init_send", ctx->send_key);
+        derive_chain_key(root_key, "init_recv", ctx->recv_key);
+    } else {
+        derive_chain_key(root_key, "init_recv", ctx->send_key);
+        derive_chain_key(root_key, "init_send", ctx->recv_key);
+    }
+
+    return SHIELD_OK;
+}
+
+uint8_t *shield_ratchet_encrypt(shield_ratchet_t *ctx, const uint8_t *plaintext, size_t plaintext_len, size_t *out_len, shield_error_t *err) {
+    uint8_t message_key[SHIELD_KEY_SIZE];
+    uint8_t nonce[SHIELD_NONCE_SIZE];
+    uint8_t *keystream;
+    uint8_t *ciphertext;
+    uint8_t mac[32];
+    uint8_t counter_bytes[8];
+    size_t result_len;
+    uint8_t *result;
+    size_t i;
+
+    derive_chain_key(ctx->send_key, "message", message_key);
+
+    if (shield_random_bytes(nonce, SHIELD_NONCE_SIZE) != SHIELD_OK) {
+        if (err) *err = SHIELD_ERR_RANDOM_FAILED;
+        return NULL;
+    }
+
+    keystream = (uint8_t *)malloc(plaintext_len);
+    generate_keystream(message_key, nonce, plaintext_len, keystream);
+
+    ciphertext = (uint8_t *)malloc(plaintext_len);
+    for (i = 0; i < plaintext_len; i++) {
+        ciphertext[i] = plaintext[i] ^ keystream[i];
+    }
+    free(keystream);
+
+    /* Counter */
+    for (i = 0; i < 8; i++) {
+        counter_bytes[i] = (uint8_t)(ctx->send_counter >> (i * 8));
+    }
+
+    /* MAC over counter || nonce || ciphertext */
+    uint8_t *mac_data = (uint8_t *)malloc(8 + SHIELD_NONCE_SIZE + plaintext_len);
+    memcpy(mac_data, counter_bytes, 8);
+    memcpy(mac_data + 8, nonce, SHIELD_NONCE_SIZE);
+    memcpy(mac_data + 8 + SHIELD_NONCE_SIZE, ciphertext, plaintext_len);
+    shield_hmac_sha256(message_key, SHIELD_KEY_SIZE, mac_data, 8 + SHIELD_NONCE_SIZE + plaintext_len, mac);
+    free(mac_data);
+
+    /* Ratchet */
+    derive_chain_key(ctx->send_key, "ratchet", ctx->send_key);
+    ctx->send_counter++;
+
+    /* Format: counter(8) || nonce(16) || ciphertext || mac(16) */
+    result_len = 8 + SHIELD_NONCE_SIZE + plaintext_len + SHIELD_MAC_SIZE;
+    result = (uint8_t *)malloc(result_len);
+    memcpy(result, counter_bytes, 8);
+    memcpy(result + 8, nonce, SHIELD_NONCE_SIZE);
+    memcpy(result + 8 + SHIELD_NONCE_SIZE, ciphertext, plaintext_len);
+    memcpy(result + 8 + SHIELD_NONCE_SIZE + plaintext_len, mac, SHIELD_MAC_SIZE);
+
+    free(ciphertext);
+    shield_secure_wipe(message_key, SHIELD_KEY_SIZE);
+
+    *out_len = result_len;
+    if (err) *err = SHIELD_OK;
+    return result;
+}
+
+uint8_t *shield_ratchet_decrypt(shield_ratchet_t *ctx, const uint8_t *encrypted, size_t encrypted_len, size_t *out_len, shield_error_t *err) {
+    uint64_t counter;
+    uint8_t *nonce;
+    uint8_t *ciphertext;
+    size_t ciphertext_len;
+    uint8_t *received_mac;
+    uint8_t message_key[SHIELD_KEY_SIZE];
+    uint8_t mac[32];
+    uint8_t *keystream;
+    uint8_t *plaintext;
+    size_t i;
+
+    if (encrypted_len < 8 + SHIELD_NONCE_SIZE + SHIELD_MAC_SIZE) {
+        if (err) *err = SHIELD_ERR_CIPHERTEXT_TOO_SHORT;
+        return NULL;
+    }
+
+    counter = 0;
+    for (i = 0; i < 8; i++) {
+        counter |= ((uint64_t)encrypted[i]) << (i * 8);
+    }
+
+    if (counter < ctx->recv_counter) {
+        if (err) *err = SHIELD_ERR_REPLAY_DETECTED;
+        return NULL;
+    }
+    if (counter > ctx->recv_counter) {
+        if (err) *err = SHIELD_ERR_OUT_OF_ORDER;
+        return NULL;
+    }
+
+    nonce = (uint8_t *)encrypted + 8;
+    ciphertext_len = encrypted_len - 8 - SHIELD_NONCE_SIZE - SHIELD_MAC_SIZE;
+    ciphertext = (uint8_t *)encrypted + 8 + SHIELD_NONCE_SIZE;
+    received_mac = (uint8_t *)encrypted + encrypted_len - SHIELD_MAC_SIZE;
+
+    derive_chain_key(ctx->recv_key, "message", message_key);
+
+    /* Verify MAC */
+    uint8_t *mac_data = (uint8_t *)malloc(8 + SHIELD_NONCE_SIZE + ciphertext_len);
+    memcpy(mac_data, encrypted, 8);
+    memcpy(mac_data + 8, nonce, SHIELD_NONCE_SIZE);
+    memcpy(mac_data + 8 + SHIELD_NONCE_SIZE, ciphertext, ciphertext_len);
+    shield_hmac_sha256(message_key, SHIELD_KEY_SIZE, mac_data, 8 + SHIELD_NONCE_SIZE + ciphertext_len, mac);
+    free(mac_data);
+
+    if (!shield_secure_compare(received_mac, mac, SHIELD_MAC_SIZE)) {
+        shield_secure_wipe(message_key, SHIELD_KEY_SIZE);
+        if (err) *err = SHIELD_ERR_AUTHENTICATION_FAILED;
+        return NULL;
+    }
+
+    /* Decrypt */
+    keystream = (uint8_t *)malloc(ciphertext_len);
+    generate_keystream(message_key, nonce, ciphertext_len, keystream);
+
+    plaintext = (uint8_t *)malloc(ciphertext_len);
+    for (i = 0; i < ciphertext_len; i++) {
+        plaintext[i] = ciphertext[i] ^ keystream[i];
+    }
+    free(keystream);
+
+    /* Ratchet */
+    derive_chain_key(ctx->recv_key, "ratchet", ctx->recv_key);
+    ctx->recv_counter++;
+
+    shield_secure_wipe(message_key, SHIELD_KEY_SIZE);
+
+    *out_len = ciphertext_len;
+    if (err) *err = SHIELD_OK;
+    return plaintext;
+}
+
+uint64_t shield_ratchet_send_counter(const shield_ratchet_t *ctx) {
+    return ctx->send_counter;
+}
+
+uint64_t shield_ratchet_recv_counter(const shield_ratchet_t *ctx) {
+    return ctx->recv_counter;
+}
+
+void shield_ratchet_wipe(shield_ratchet_t *ctx) {
+    shield_secure_wipe(ctx->send_key, SHIELD_KEY_SIZE);
+    shield_secure_wipe(ctx->recv_key, SHIELD_KEY_SIZE);
+}
+
+/* ============== TOTP Functions ============== */
+
+void shield_totp_init(shield_totp_t *ctx, const uint8_t *secret, size_t secret_len, int digits, int interval) {
+    ctx->secret = (uint8_t *)malloc(secret_len);
+    memcpy(ctx->secret, secret, secret_len);
+    ctx->secret_len = secret_len;
+    ctx->digits = digits > 0 ? digits : 6;
+    ctx->interval = interval > 0 ? interval : 30;
+}
+
+shield_error_t shield_totp_generate_secret(uint8_t *secret, size_t secret_len) {
+    return shield_random_bytes(secret, secret_len);
+}
+
+/* SHA1 for TOTP compatibility */
+static const uint32_t sha1_k[4] = {0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xCA62C1D6};
+
+static inline uint32_t rotl32(uint32_t x, int n) {
+    return (x << n) | (x >> (32 - n));
+}
+
+static void sha1_hash(const uint8_t *data, size_t len, uint8_t *hash) {
+    uint32_t h[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
+    uint8_t *padded;
+    size_t padded_len;
+    size_t i;
+
+    padded_len = ((len + 8) / 64 + 1) * 64;
+    padded = (uint8_t *)calloc(padded_len, 1);
+    memcpy(padded, data, len);
+    padded[len] = 0x80;
+    uint64_t bits = len * 8;
+    for (i = 0; i < 8; i++) {
+        padded[padded_len - 1 - i] = (uint8_t)(bits >> (i * 8));
+    }
+
+    for (size_t block = 0; block < padded_len / 64; block++) {
+        uint32_t w[80];
+        for (i = 0; i < 16; i++) {
+            w[i] = ((uint32_t)padded[block*64 + i*4] << 24) |
+                   ((uint32_t)padded[block*64 + i*4+1] << 16) |
+                   ((uint32_t)padded[block*64 + i*4+2] << 8) |
+                   ((uint32_t)padded[block*64 + i*4+3]);
+        }
+        for (i = 16; i < 80; i++) {
+            w[i] = rotl32(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
+        }
+
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+        for (i = 0; i < 80; i++) {
+            uint32_t f, k;
+            if (i < 20) { f = (b & c) | ((~b) & d); k = sha1_k[0]; }
+            else if (i < 40) { f = b ^ c ^ d; k = sha1_k[1]; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = sha1_k[2]; }
+            else { f = b ^ c ^ d; k = sha1_k[3]; }
+
+            uint32_t temp = rotl32(a, 5) + f + e + k + w[i];
+            e = d; d = c; c = rotl32(b, 30); b = a; a = temp;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+    }
+
+    for (i = 0; i < 5; i++) {
+        hash[i*4] = (uint8_t)(h[i] >> 24);
+        hash[i*4+1] = (uint8_t)(h[i] >> 16);
+        hash[i*4+2] = (uint8_t)(h[i] >> 8);
+        hash[i*4+3] = (uint8_t)(h[i]);
+    }
+
+    free(padded);
+}
+
+static void hmac_sha1(const uint8_t *key, size_t key_len, const uint8_t *data, size_t data_len, uint8_t *mac) {
+    uint8_t k_ipad[64], k_opad[64];
+    uint8_t tk[20];
+    uint8_t *tmp;
+    size_t i;
+
+    if (key_len > 64) {
+        sha1_hash(key, key_len, tk);
+        key = tk;
+        key_len = 20;
+    }
+
+    memset(k_ipad, 0x36, 64);
+    memset(k_opad, 0x5c, 64);
+
+    for (i = 0; i < key_len; i++) {
+        k_ipad[i] ^= key[i];
+        k_opad[i] ^= key[i];
+    }
+
+    tmp = (uint8_t *)malloc(64 + data_len);
+    memcpy(tmp, k_ipad, 64);
+    memcpy(tmp + 64, data, data_len);
+    sha1_hash(tmp, 64 + data_len, mac);
+    free(tmp);
+
+    tmp = (uint8_t *)malloc(64 + 20);
+    memcpy(tmp, k_opad, 64);
+    memcpy(tmp + 64, mac, 20);
+    sha1_hash(tmp, 64 + 20, mac);
+    free(tmp);
+}
+
+void shield_totp_generate(const shield_totp_t *ctx, int64_t timestamp, char *code, size_t code_len) {
+    uint8_t counter_bytes[8];
+    uint8_t hash[20];
+    uint32_t truncated;
+    uint32_t modulo;
+    int64_t counter;
+    int i;
+
+    if (timestamp == 0) {
+        timestamp = (int64_t)time(NULL);
+    }
+    counter = timestamp / ctx->interval;
+
+    for (i = 7; i >= 0; i--) {
+        counter_bytes[i] = (uint8_t)(counter);
+        counter >>= 8;
+    }
+
+    hmac_sha1(ctx->secret, ctx->secret_len, counter_bytes, 8, hash);
+
+    int offset = hash[19] & 0x0f;
+    truncated = ((uint32_t)(hash[offset] & 0x7f) << 24) |
+                ((uint32_t)(hash[offset+1]) << 16) |
+                ((uint32_t)(hash[offset+2]) << 8) |
+                ((uint32_t)(hash[offset+3]));
+
+    modulo = 1;
+    for (i = 0; i < ctx->digits; i++) {
+        modulo *= 10;
+    }
+
+    snprintf(code, code_len, "%0*u", ctx->digits, truncated % modulo);
+}
+
+bool shield_totp_verify(const shield_totp_t *ctx, const char *code, int64_t timestamp, int window) {
+    char generated[16];
+    int i;
+
+    if (timestamp == 0) {
+        timestamp = (int64_t)time(NULL);
+    }
+    if (window <= 0) {
+        window = 1;
+    }
+
+    for (i = 0; i <= window; i++) {
+        shield_totp_generate(ctx, timestamp - i * ctx->interval, generated, sizeof(generated));
+        if (strcmp(generated, code) == 0) {
+            return true;
+        }
+        if (i > 0) {
+            shield_totp_generate(ctx, timestamp + i * ctx->interval, generated, sizeof(generated));
+            if (strcmp(generated, code) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void shield_totp_free(shield_totp_t *ctx) {
+    if (ctx->secret) {
+        shield_secure_wipe(ctx->secret, ctx->secret_len);
+        free(ctx->secret);
+        ctx->secret = NULL;
+    }
+}
+
+/* ============== Signature Functions ============== */
+
+shield_error_t shield_signature_generate(shield_signature_t *ctx) {
+    if (shield_random_bytes(ctx->signing_key, SHIELD_KEY_SIZE) != SHIELD_OK) {
+        return SHIELD_ERR_RANDOM_FAILED;
+    }
+
+    sha256_ctx hash;
+    sha256_init(&hash);
+    sha256_update(&hash, (const uint8_t *)"verify:", 7);
+    sha256_update(&hash, ctx->signing_key, SHIELD_KEY_SIZE);
+    sha256_final(&hash, ctx->verification_key);
+
+    return SHIELD_OK;
+}
+
+void shield_signature_from_password(shield_signature_t *ctx, const char *password, const char *identity) {
+    uint8_t salt[32];
+    char salt_input[256];
+    snprintf(salt_input, sizeof(salt_input), "sign:%s", identity);
+    shield_sha256((const uint8_t *)salt_input, strlen(salt_input), salt);
+    shield_pbkdf2(password, salt, 32, SHIELD_ITERATIONS, ctx->signing_key, SHIELD_KEY_SIZE);
+
+    sha256_ctx hash;
+    sha256_init(&hash);
+    sha256_update(&hash, (const uint8_t *)"verify:", 7);
+    sha256_update(&hash, ctx->signing_key, SHIELD_KEY_SIZE);
+    sha256_final(&hash, ctx->verification_key);
+}
+
+void shield_signature_sign(const shield_signature_t *ctx, const uint8_t *message, size_t message_len, uint8_t *signature) {
+    shield_hmac_sha256(ctx->signing_key, SHIELD_KEY_SIZE, message, message_len, signature);
+}
+
+void shield_signature_sign_timestamped(const shield_signature_t *ctx, const uint8_t *message, size_t message_len, uint8_t *signature) {
+    int64_t timestamp = (int64_t)time(NULL);
+    uint8_t *sig_data;
+    size_t i;
+
+    for (i = 0; i < 8; i++) {
+        signature[i] = (uint8_t)(timestamp >> (i * 8));
+    }
+
+    sig_data = (uint8_t *)malloc(8 + message_len);
+    memcpy(sig_data, signature, 8);
+    memcpy(sig_data + 8, message, message_len);
+
+    shield_hmac_sha256(ctx->signing_key, SHIELD_KEY_SIZE, sig_data, 8 + message_len, signature + 8);
+    free(sig_data);
+}
+
+bool shield_signature_verify(const shield_signature_t *ctx, const uint8_t *message, size_t message_len, const uint8_t *signature, size_t sig_len, const uint8_t *verification_key, int64_t max_age) {
+    uint8_t expected[32];
+
+    if (!shield_secure_compare(verification_key, ctx->verification_key, SHIELD_KEY_SIZE)) {
+        return false;
+    }
+
+    if (sig_len == 40) {
+        int64_t timestamp = 0;
+        size_t i;
+        for (i = 0; i < 8; i++) {
+            timestamp |= ((int64_t)signature[i]) << (i * 8);
+        }
+
+        if (max_age > 0) {
+            int64_t now = (int64_t)time(NULL);
+            int64_t diff = now - timestamp;
+            if (diff < 0) diff = -diff;
+            if (diff > max_age) {
+                return false;
+            }
+        }
+
+        uint8_t *sig_data = (uint8_t *)malloc(8 + message_len);
+        memcpy(sig_data, signature, 8);
+        memcpy(sig_data + 8, message, message_len);
+        shield_hmac_sha256(ctx->signing_key, SHIELD_KEY_SIZE, sig_data, 8 + message_len, expected);
+        free(sig_data);
+
+        return shield_secure_compare(signature + 8, expected, 32);
+    }
+
+    if (sig_len == 32) {
+        shield_hmac_sha256(ctx->signing_key, SHIELD_KEY_SIZE, message, message_len, expected);
+        return shield_secure_compare(signature, expected, 32);
+    }
+
+    return false;
+}
+
+const uint8_t *shield_signature_verification_key(const shield_signature_t *ctx) {
+    return ctx->verification_key;
+}
+
+void shield_signature_wipe(shield_signature_t *ctx) {
+    shield_secure_wipe(ctx->signing_key, SHIELD_KEY_SIZE);
+    shield_secure_wipe(ctx->verification_key, SHIELD_KEY_SIZE);
+}
+
+/* ============== Lamport Signature Functions ============== */
+
+shield_error_t shield_lamport_generate(shield_lamport_t *ctx) {
+    int i;
+
+    ctx->public_key = (uint8_t *)malloc(256 * 64);
+    if (!ctx->public_key) {
+        return SHIELD_ERR_ALLOC_FAILED;
+    }
+    ctx->used = false;
+
+    for (i = 0; i < 256; i++) {
+        if (shield_random_bytes(ctx->private_key[i][0], SHIELD_KEY_SIZE) != SHIELD_OK ||
+            shield_random_bytes(ctx->private_key[i][1], SHIELD_KEY_SIZE) != SHIELD_OK) {
+            free(ctx->public_key);
+            return SHIELD_ERR_RANDOM_FAILED;
+        }
+
+        uint8_t h0[32], h1[32];
+        shield_sha256(ctx->private_key[i][0], SHIELD_KEY_SIZE, h0);
+        shield_sha256(ctx->private_key[i][1], SHIELD_KEY_SIZE, h1);
+
+        memcpy(ctx->public_key + i * 64, h0, 32);
+        memcpy(ctx->public_key + i * 64 + 32, h1, 32);
+    }
+
+    return SHIELD_OK;
+}
+
+shield_error_t shield_lamport_sign(shield_lamport_t *ctx, const uint8_t *message, size_t message_len, uint8_t *signature) {
+    uint8_t msg_hash[32];
+    int i;
+
+    if (ctx->used) {
+        return SHIELD_ERR_LAMPORT_KEY_USED;
+    }
+    ctx->used = true;
+
+    shield_sha256(message, message_len, msg_hash);
+
+    for (i = 0; i < 256; i++) {
+        int byte_idx = i / 8;
+        int bit_idx = i % 8;
+        int bit = (msg_hash[byte_idx] >> bit_idx) & 1;
+
+        memcpy(signature + i * 32, ctx->private_key[i][bit], 32);
+    }
+
+    return SHIELD_OK;
+}
+
+bool shield_lamport_verify(const uint8_t *message, size_t message_len, const uint8_t *signature, const uint8_t *public_key) {
+    uint8_t msg_hash[32];
+    uint8_t hashed[32];
+    int i;
+
+    shield_sha256(message, message_len, msg_hash);
+
+    for (i = 0; i < 256; i++) {
+        int byte_idx = i / 8;
+        int bit_idx = i % 8;
+        int bit = (msg_hash[byte_idx] >> bit_idx) & 1;
+
+        shield_sha256(signature + i * 32, 32, hashed);
+
+        const uint8_t *expected;
+        if (bit == 1) {
+            expected = public_key + i * 64 + 32;
+        } else {
+            expected = public_key + i * 64;
+        }
+
+        if (!shield_secure_compare(hashed, expected, 32)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool shield_lamport_is_used(const shield_lamport_t *ctx) {
+    return ctx->used;
+}
+
+const uint8_t *shield_lamport_public_key(const shield_lamport_t *ctx) {
+    return ctx->public_key;
+}
+
+void shield_lamport_free(shield_lamport_t *ctx) {
+    if (ctx->public_key) {
+        free(ctx->public_key);
+        ctx->public_key = NULL;
+    }
+    shield_secure_wipe(ctx->private_key, sizeof(ctx->private_key));
+}
+
+/* ============== Recovery Codes Functions ============== */
+
+static const char HEX_CHARS[] = "0123456789ABCDEF";
+
+shield_error_t shield_recovery_init(shield_recovery_t *ctx, int count, int length) {
+    int i, j;
+    uint8_t *bytes;
+    int byte_len;
+
+    if (count <= 0) count = 10;
+    if (count > SHIELD_MAX_RECOVERY_CODES) count = SHIELD_MAX_RECOVERY_CODES;
+    if (length <= 0) length = 8;
+    if (length % 2 != 0) length++;
+
+    byte_len = length / 2;
+    bytes = (uint8_t *)malloc(byte_len);
+    if (!bytes) return SHIELD_ERR_ALLOC_FAILED;
+
+    ctx->count = count;
+    memset(ctx->used, false, sizeof(ctx->used));
+
+    for (i = 0; i < count; i++) {
+        if (shield_random_bytes(bytes, byte_len) != SHIELD_OK) {
+            free(bytes);
+            return SHIELD_ERR_RANDOM_FAILED;
+        }
+
+        /* Convert to hex: first half, dash, second half */
+        int half = byte_len / 2;
+        int pos = 0;
+
+        /* First half */
+        for (j = 0; j < half; j++) {
+            ctx->codes[i][pos++] = HEX_CHARS[(bytes[j] >> 4) & 0x0F];
+            ctx->codes[i][pos++] = HEX_CHARS[bytes[j] & 0x0F];
+        }
+
+        /* Dash */
+        ctx->codes[i][pos++] = '-';
+
+        /* Second half */
+        for (j = half; j < byte_len; j++) {
+            ctx->codes[i][pos++] = HEX_CHARS[(bytes[j] >> 4) & 0x0F];
+            ctx->codes[i][pos++] = HEX_CHARS[bytes[j] & 0x0F];
+        }
+
+        ctx->codes[i][pos] = '\0';
+    }
+
+    free(bytes);
+    return SHIELD_OK;
+}
+
+void shield_recovery_init_from(shield_recovery_t *ctx, const char **codes, int count) {
+    int i;
+
+    if (count > SHIELD_MAX_RECOVERY_CODES) count = SHIELD_MAX_RECOVERY_CODES;
+
+    ctx->count = count;
+    memset(ctx->used, false, sizeof(ctx->used));
+
+    for (i = 0; i < count; i++) {
+        strncpy(ctx->codes[i], codes[i], SHIELD_RECOVERY_CODE_LEN - 1);
+        ctx->codes[i][SHIELD_RECOVERY_CODE_LEN - 1] = '\0';
+    }
+}
+
+static void normalize_code(const char *code, char *out) {
+    char normalized[16];
+    int j = 0;
+
+    /* Remove dashes and uppercase */
+    for (int i = 0; code[i] && j < 15; i++) {
+        if (code[i] != '-') {
+            char c = code[i];
+            if (c >= 'a' && c <= 'z') c = c - 'a' + 'A';
+            normalized[j++] = c;
+        }
+    }
+    normalized[j] = '\0';
+
+    /* Format as XXXX-XXXX */
+    if (j >= 8) {
+        out[0] = normalized[0];
+        out[1] = normalized[1];
+        out[2] = normalized[2];
+        out[3] = normalized[3];
+        out[4] = '-';
+        out[5] = normalized[4];
+        out[6] = normalized[5];
+        out[7] = normalized[6];
+        out[8] = normalized[7];
+        out[9] = '\0';
+    } else {
+        out[0] = '\0';
+    }
+}
+
+bool shield_recovery_verify(shield_recovery_t *ctx, const char *code) {
+    char formatted[16];
+    int i;
+
+    normalize_code(code, formatted);
+    if (formatted[0] == '\0') return false;
+
+    for (i = 0; i < ctx->count; i++) {
+        if (!ctx->used[i] && strcmp(ctx->codes[i], formatted) == 0) {
+            ctx->used[i] = true;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+int shield_recovery_remaining(const shield_recovery_t *ctx) {
+    int count = 0;
+    for (int i = 0; i < ctx->count; i++) {
+        if (!ctx->used[i]) count++;
+    }
+    return count;
+}
+
+bool shield_recovery_get_code(const shield_recovery_t *ctx, int index, char *out) {
+    int remaining_index = 0;
+    for (int i = 0; i < ctx->count; i++) {
+        if (!ctx->used[i]) {
+            if (remaining_index == index) {
+                strcpy(out, ctx->codes[i]);
+                return true;
+            }
+            remaining_index++;
+        }
+    }
+    return false;
+}
+
+void shield_recovery_wipe(shield_recovery_t *ctx) {
+    shield_secure_wipe(ctx->codes, sizeof(ctx->codes));
+    memset(ctx->used, false, sizeof(ctx->used));
+    ctx->count = 0;
+}
+
+
+
+================================================
+FILE: csharp/Shield/Shield.cs
+================================================
+using System;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace Guard8.Shield
+{
+    /// <summary>
+    /// Shield - EXPTIME-Secure Symmetric Encryption Library
+    ///
+    /// Uses only symmetric cryptographic primitives with proven exponential-time security:
+    /// PBKDF2-SHA256, HMAC-SHA256, and SHA256-based stream cipher.
+    /// Breaking requires 2^256 operations - no shortcut exists.
+    /// </summary>
+    public class Shield : IDisposable
+    {
+        public const int KeySize = 32;
+        public const int NonceSize = 16;
+        public const int MacSize = 16;
+        public const int Iterations = 100000;
+        public const int MinCiphertextSize = NonceSize + 8 + MacSize;
+
+        private readonly byte[] _key;
+        private bool _disposed;
+
+        /// <summary>
+        /// Create Shield from password and service name.
+        /// </summary>
+        public Shield(string password, string service)
+        {
+            byte[] salt = Sha256(Encoding.UTF8.GetBytes(service));
+            _key = Pbkdf2(password, salt, Iterations, KeySize);
+        }
+
+        /// <summary>
+        /// Create Shield with pre-shared key.
+        /// </summary>
+        public Shield(byte[] key)
+        {
+            if (key.Length != KeySize)
+                throw new ArgumentException("Invalid key size", nameof(key));
+
+            _key = new byte[KeySize];
+            Array.Copy(key, _key, KeySize);
+        }
+
+        /// <summary>
+        /// Encrypt plaintext.
+        /// </summary>
+        public byte[] Encrypt(byte[] plaintext)
+        {
+            return EncryptWithKey(_key, plaintext);
+        }
+
+        /// <summary>
+        /// Decrypt ciphertext.
+        /// </summary>
+        public byte[] Decrypt(byte[] ciphertext)
+        {
+            return DecryptWithKey(_key, ciphertext);
+        }
+
+        /// <summary>
+        /// Get the derived key.
+        /// </summary>
+        public byte[] GetKey()
+        {
+            byte[] copy = new byte[KeySize];
+            Array.Copy(_key, copy, KeySize);
+            return copy;
+        }
+
+        /// <summary>
+        /// Quick encrypt with explicit key.
+        /// </summary>
+        public static byte[] QuickEncrypt(byte[] key, byte[] plaintext)
+        {
+            if (key.Length != KeySize)
+                throw new ArgumentException("Invalid key size", nameof(key));
+            return EncryptWithKey(key, plaintext);
+        }
+
+        /// <summary>
+        /// Quick decrypt with explicit key.
+        /// </summary>
+        public static byte[] QuickDecrypt(byte[] key, byte[] ciphertext)
+        {
+            if (key.Length != KeySize)
+                throw new ArgumentException("Invalid key size", nameof(key));
+            return DecryptWithKey(key, ciphertext);
+        }
+
+        private static byte[] EncryptWithKey(byte[] key, byte[] plaintext)
+        {
+            // Generate random nonce
+            byte[] nonce = RandomBytes(NonceSize);
+
+            // Counter prefix (8 bytes of zeros)
+            byte[] dataToEncrypt = new byte[8 + plaintext.Length];
+            Array.Copy(plaintext, 0, dataToEncrypt, 8, plaintext.Length);
+
+            // Generate keystream and XOR
+            byte[] keystream = GenerateKeystream(key, nonce, dataToEncrypt.Length);
+            byte[] ciphertext = new byte[dataToEncrypt.Length];
+            for (int i = 0; i < dataToEncrypt.Length; i++)
+                ciphertext[i] = (byte)(dataToEncrypt[i] ^ keystream[i]);
+
+            // Compute HMAC over nonce || ciphertext
+            byte[] macData = new byte[NonceSize + ciphertext.Length];
+            Array.Copy(nonce, 0, macData, 0, NonceSize);
+            Array.Copy(ciphertext, 0, macData, NonceSize, ciphertext.Length);
+            byte[] mac = HmacSha256(key, macData);
+
+            // Format: nonce || ciphertext || mac
+            byte[] result = new byte[NonceSize + ciphertext.Length + MacSize];
+            Array.Copy(nonce, 0, result, 0, NonceSize);
+            Array.Copy(ciphertext, 0, result, NonceSize, ciphertext.Length);
+            Array.Copy(mac, 0, result, NonceSize + ciphertext.Length, MacSize);
+
+            return result;
+        }
+
+        private static byte[] DecryptWithKey(byte[] key, byte[] encrypted)
+        {
+            if (encrypted.Length < MinCiphertextSize)
+                throw new ArgumentException("Ciphertext too short");
+
+            // Parse components
+            byte[] nonce = new byte[NonceSize];
+            Array.Copy(encrypted, 0, nonce, 0, NonceSize);
+
+            int ciphertextLen = encrypted.Length - NonceSize - MacSize;
+            byte[] ciphertext = new byte[ciphertextLen];
+            Array.Copy(encrypted, NonceSize, ciphertext, 0, ciphertextLen);
+
+            byte[] receivedMac = new byte[MacSize];
+            Array.Copy(encrypted, encrypted.Length - MacSize, receivedMac, 0, MacSize);
+
+            // Verify MAC
+            byte[] macData = new byte[NonceSize + ciphertextLen];
+            Array.Copy(nonce, 0, macData, 0, NonceSize);
+            Array.Copy(ciphertext, 0, macData, NonceSize, ciphertextLen);
+            byte[] expectedMac = HmacSha256(key, macData);
+
+            if (!ConstantTimeEquals(receivedMac, expectedMac, MacSize))
+                throw new CryptographicException("Authentication failed");
+
+            // Decrypt
+            byte[] keystream = GenerateKeystream(key, nonce, ciphertextLen);
+            byte[] decrypted = new byte[ciphertextLen];
+            for (int i = 0; i < ciphertextLen; i++)
+                decrypted[i] = (byte)(ciphertext[i] ^ keystream[i]);
+
+            // Skip 8-byte counter prefix
+            byte[] result = new byte[ciphertextLen - 8];
+            Array.Copy(decrypted, 8, result, 0, ciphertextLen - 8);
+            return result;
+        }
+
+        private static byte[] GenerateKeystream(byte[] key, byte[] nonce, int length)
+        {
+            int numBlocks = (length + 31) / 32;
+            byte[] keystream = new byte[numBlocks * 32];
+
+            for (int i = 0; i < numBlocks; i++)
+            {
+                byte[] block = new byte[KeySize + NonceSize + 4];
+                Array.Copy(key, 0, block, 0, KeySize);
+                Array.Copy(nonce, 0, block, KeySize, NonceSize);
+                BitConverter.GetBytes(i).CopyTo(block, KeySize + NonceSize);
+
+                byte[] hash = Sha256(block);
+                Array.Copy(hash, 0, keystream, i * 32, 32);
+            }
+
+            byte[] result = new byte[length];
+            Array.Copy(keystream, result, length);
+            return result;
+        }
+
+        // ============== Crypto Utilities ==============
+
+        public static byte[] Sha256(byte[] data)
+        {
+            using var sha = SHA256.Create();
+            return sha.ComputeHash(data);
+        }
+
+        public static byte[] HmacSha256(byte[] key, byte[] data)
+        {
+            using var hmac = new HMACSHA256(key);
+            return hmac.ComputeHash(data);
+        }
+
+        public static byte[] Pbkdf2(string password, byte[] salt, int iterations, int keyLength)
+        {
+            using var pbkdf2 = new Rfc2898DeriveBytes(password, salt, iterations, HashAlgorithmName.SHA256);
+            return pbkdf2.GetBytes(keyLength);
+        }
+
+        public static bool ConstantTimeEquals(byte[] a, byte[] b, int length)
+        {
+            if (a.Length < length || b.Length < length)
+                return false;
+
+            int result = 0;
+            for (int i = 0; i < length; i++)
+                result |= a[i] ^ b[i];
+
+            return result == 0;
+        }
+
+        public static byte[] RandomBytes(int length)
+        {
+            byte[] bytes = new byte[length];
+            using var rng = RandomNumberGenerator.Create();
+            rng.GetBytes(bytes);
+            return bytes;
+        }
+
+        public static void SecureWipe(byte[] data)
+        {
+            Array.Clear(data, 0, data.Length);
+        }
+
+        public void Dispose()
+        {
+            if (!_disposed)
+            {
+                SecureWipe(_key);
+                _disposed = true;
+            }
+        }
+    }
+}
+
+
+
+================================================
+FILE: go/shield/shield.go
+================================================
+// Package shield provides EXPTIME-secure symmetric encryption.
+//
+// Shield uses only symmetric cryptographic primitives with proven
+// exponential-time security: PBKDF2-SHA256, HMAC-SHA256, and SHA256-based
+// stream cipher. Breaking requires 2^256 operations - no shortcut exists.
+package shield
+
+import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/binary"
+	"errors"
+	"time"
+
+	"golang.org/x/crypto/pbkdf2"
+)
+
+const (
+	// KeySize is the size of encryption keys in bytes.
+	KeySize = 32
+	// NonceSize is the size of nonces in bytes.
+	NonceSize = 16
+	// MACSize is the size of authentication tags in bytes.
+	MACSize = 16
+	// CounterSize is the size of the counter prefix in bytes.
+	CounterSize = 8
+	// Iterations is the PBKDF2 iteration count.
+	Iterations = 100000
+	// MinCiphertextSize is the minimum valid ciphertext size (Shield with counter).
+	MinCiphertextSize = NonceSize + CounterSize + MACSize
+	// MinQuickCiphertextSize is the minimum valid ciphertext size (QuickEncrypt without counter).
+	MinQuickCiphertextSize = NonceSize + MACSize
+
+	// V2 constants
+	// V2HeaderSize is the size of v2 header (counter + timestamp + pad_len).
+	V2HeaderSize = 17 // counter(8) + timestamp(8) + pad_len(1)
+	// MinPadding is the minimum padding size in v2 format.
+	MinPadding = 32
+	// MaxPadding is the maximum padding size in v2 format.
+	MaxPadding = 128
+	// MinTimestampMs is the minimum valid timestamp for v2 detection (2020-01-01 in ms).
+	MinTimestampMs = 1577836800000
+	// MaxTimestampMs is the maximum valid timestamp for v2 detection (2100-01-01 in ms).
+	MaxTimestampMs = 4102444800000
+	// DefaultMaxAgeMs is the default maximum message age in milliseconds.
+	DefaultMaxAgeMs = 60000
+)
+
+var (
+	// ErrCiphertextTooShort indicates the ciphertext is malformed.
+	ErrCiphertextTooShort = errors.New("shield: ciphertext too short")
+	// ErrAuthenticationFailed indicates MAC verification failed.
+	ErrAuthenticationFailed = errors.New("shield: authentication failed")
+	// ErrInvalidKeySize indicates wrong key size.
+	ErrInvalidKeySize = errors.New("shield: invalid key size")
+)
+
+// Shield provides password-based encryption.
+type Shield struct {
+	key      [KeySize]byte
+	maxAgeMs *int64 // nil = disabled, otherwise maximum age in milliseconds
+}
+
+// New creates a Shield instance from password and service name.
+// maxAgeMs: maximum message age in milliseconds (use nil to disable replay protection).
+func New(password, service string, maxAgeMs *int64) *Shield {
+	salt := sha256.Sum256([]byte(service))
+	key := pbkdf2.Key([]byte(password), salt[:], Iterations, KeySize, sha256.New)
+
+	s := &Shield{maxAgeMs: maxAgeMs}
+	copy(s.key[:], key)
+	return s
+}
+
+// WithKey creates a Shield instance with a pre-shared key.
+func WithKey(key []byte) (*Shield, error) {
+	if len(key) != KeySize {
+		return nil, ErrInvalidKeySize
+	}
+	defaultMaxAge := int64(DefaultMaxAgeMs)
+	s := &Shield{maxAgeMs: &defaultMaxAge}
+	copy(s.key[:], key)
+	return s, nil
+}
+
+// Encrypt encrypts plaintext and returns authenticated ciphertext (v2 format).
+// Format: nonce(16) || encrypted(counter(8) || timestamp(8) || pad_len(1) || padding(32-128) || plaintext) || mac(16)
+func (s *Shield) Encrypt(plaintext []byte) ([]byte, error) {
+	return EncryptWithKey(s.key[:], plaintext)
+}
+
+// Decrypt decrypts and verifies ciphertext (auto-detects v1/v2).
+func (s *Shield) Decrypt(ciphertext []byte) ([]byte, error) {
+	return DecryptWithKey(s.key[:], ciphertext, s.maxAgeMs)
+}
+
+// DecryptV1 explicitly decrypts v1 format (for legacy compatibility).
+func (s *Shield) DecryptV1(ciphertext []byte) ([]byte, error) {
+	return DecryptV1WithKey(s.key[:], ciphertext)
+}
+
+// Key returns the derived key.
+func (s *Shield) Key() []byte {
+	return s.key[:]
+}
+
+// QuickEncrypt encrypts with a pre-shared key (no counter prefix).
+// Format: nonce(16) || ciphertext || mac(16)
+// This is interoperable with Python/JavaScript quick_encrypt.
+func QuickEncrypt(key, plaintext []byte) ([]byte, error) {
+	if len(key) != KeySize {
+		return nil, ErrInvalidKeySize
+	}
+
+	// Generate random nonce
+	nonce := make([]byte, NonceSize)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+
+	// Generate keystream and XOR (no counter prefix)
+	keystream := generateKeystream(key, nonce, len(plaintext))
+	ciphertext := make([]byte, len(plaintext))
+	for i := range plaintext {
+		ciphertext[i] = plaintext[i] ^ keystream[i]
+	}
+
+	// Compute HMAC over nonce || ciphertext
+	mac := hmac.New(sha256.New, key)
+	mac.Write(nonce)
+	mac.Write(ciphertext)
+	tag := mac.Sum(nil)[:MACSize]
+
+	// Format: nonce || ciphertext || mac
+	result := make([]byte, NonceSize+len(ciphertext)+MACSize)
+	copy(result[:NonceSize], nonce)
+	copy(result[NonceSize:NonceSize+len(ciphertext)], ciphertext)
+	copy(result[NonceSize+len(ciphertext):], tag)
+
+	return result, nil
+}
+
+// QuickDecrypt decrypts with a pre-shared key (no counter prefix).
+// This is interoperable with Python/JavaScript quick_decrypt.
+func QuickDecrypt(key, encrypted []byte) ([]byte, error) {
+	if len(key) != KeySize {
+		return nil, ErrInvalidKeySize
+	}
+	if len(encrypted) < MinQuickCiphertextSize {
+		return nil, ErrCiphertextTooShort
+	}
+
+	// Parse components
+	nonce := encrypted[:NonceSize]
+	ciphertext := encrypted[NonceSize : len(encrypted)-MACSize]
+	receivedMAC := encrypted[len(encrypted)-MACSize:]
+
+	// Verify MAC
+	mac := hmac.New(sha256.New, key)
+	mac.Write(nonce)
+	mac.Write(ciphertext)
+	expectedMAC := mac.Sum(nil)[:MACSize]
+
+	if subtle.ConstantTimeCompare(receivedMAC, expectedMAC) != 1 {
+		return nil, ErrAuthenticationFailed
+	}
+
+	// Decrypt (no counter prefix to skip)
+	keystream := generateKeystream(key, nonce, len(ciphertext))
+	decrypted := make([]byte, len(ciphertext))
+	for i := range ciphertext {
+		decrypted[i] = ciphertext[i] ^ keystream[i]
+	}
+
+	return decrypted, nil
+}
+
+// EncryptWithKey encrypts using an explicit key (v2 format).
+// Inner format: counter(8) || timestamp_ms(8) || pad_len(1) || random_padding(32-128) || plaintext
+func EncryptWithKey(key, plaintext []byte) ([]byte, error) {
+	// Generate random nonce
+	nonce := make([]byte, NonceSize)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+
+	// Counter prefix
+	counter := make([]byte, 8)
+	binary.LittleEndian.PutUint64(counter, 0)
+
+	// Timestamp in milliseconds since Unix epoch
+	timestampMs := time.Now().UnixMilli()
+	timestamp := make([]byte, 8)
+	binary.LittleEndian.PutUint64(timestamp, uint64(timestampMs))
+
+	// Random padding: 32-128 bytes
+	randomByte := make([]byte, 1)
+	if _, err := rand.Read(randomByte); err != nil {
+		return nil, err
+	}
+	padLen := int(randomByte[0])%(MaxPadding-MinPadding+1) + MinPadding
+	padLenByte := []byte{byte(padLen)}
+	padding := make([]byte, padLen)
+	if _, err := rand.Read(padding); err != nil {
+		return nil, err
+	}
+
+	// Data to encrypt: counter || timestamp || pad_len || padding || plaintext
+	dataToEncrypt := make([]byte, 8+8+1+padLen+len(plaintext))
+	pos := 0
+	copy(dataToEncrypt[pos:], counter)
+	pos += 8
+	copy(dataToEncrypt[pos:], timestamp)
+	pos += 8
+	copy(dataToEncrypt[pos:], padLenByte)
+	pos += 1
+	copy(dataToEncrypt[pos:], padding)
+	pos += padLen
+	copy(dataToEncrypt[pos:], plaintext)
+
+	// Generate keystream and XOR
+	keystream := generateKeystream(key, nonce, len(dataToEncrypt))
+	ciphertext := make([]byte, len(dataToEncrypt))
+	for i := range dataToEncrypt {
+		ciphertext[i] = dataToEncrypt[i] ^ keystream[i]
+	}
+
+	// Compute HMAC over nonce || ciphertext
+	mac := hmac.New(sha256.New, key)
+	mac.Write(nonce)
+	mac.Write(ciphertext)
+	tag := mac.Sum(nil)[:MACSize]
+
+	// Format: nonce || ciphertext || mac
+	result := make([]byte, NonceSize+len(ciphertext)+MACSize)
+	copy(result[:NonceSize], nonce)
+	copy(result[NonceSize:NonceSize+len(ciphertext)], ciphertext)
+	copy(result[NonceSize+len(ciphertext):], tag)
+
+	return result, nil
+}
+
+// DecryptWithKey decrypts using an explicit key (auto-detects v1/v2).
+func DecryptWithKey(key, encrypted []byte, maxAgeMs *int64) ([]byte, error) {
+	if len(encrypted) < MinCiphertextSize {
+		return nil, ErrCiphertextTooShort
+	}
+
+	// Parse components
+	nonce := encrypted[:NonceSize]
+	ciphertext := encrypted[NonceSize : len(encrypted)-MACSize]
+	receivedMAC := encrypted[len(encrypted)-MACSize:]
+
+	// Verify MAC
+	mac := hmac.New(sha256.New, key)
+	mac.Write(nonce)
+	mac.Write(ciphertext)
+	expectedMAC := mac.Sum(nil)[:MACSize]
+
+	if subtle.ConstantTimeCompare(receivedMAC, expectedMAC) != 1 {
+		return nil, ErrAuthenticationFailed
+	}
+
+	// Decrypt
+	keystream := generateKeystream(key, nonce, len(ciphertext))
+	decrypted := make([]byte, len(ciphertext))
+	for i := range ciphertext {
+		decrypted[i] = ciphertext[i] ^ keystream[i]
+	}
+
+	// Auto-detect v2 by timestamp range (2020-2100)
+	if len(decrypted) >= V2HeaderSize {
+		timestampBytes := decrypted[8:16]
+		timestampMs := binary.LittleEndian.Uint64(timestampBytes)
+
+		if timestampMs >= MinTimestampMs && timestampMs <= MaxTimestampMs {
+			// v2 format detected
+			padLen := int(decrypted[16])
+
+			// Validate padding length is within protocol bounds (SECURITY: CVE-PENDING)
+			if padLen < MinPadding || padLen > MaxPadding {
+				return nil, ErrAuthenticationFailed
+			}
+
+			dataStart := V2HeaderSize + padLen
+
+			if len(decrypted) < dataStart {
+				return nil, ErrCiphertextTooShort
+			}
+
+			// Replay protection
+			if maxAgeMs != nil {
+				nowMs := time.Now().UnixMilli()
+				age := nowMs - int64(timestampMs)
+
+				// Reject if too far in future (>5s clock skew) or too old
+				if int64(timestampMs) > nowMs+5000 || age > *maxAgeMs {
+					return nil, ErrAuthenticationFailed
+				}
+			}
+
+			return decrypted[dataStart:], nil
+		}
+	}
+
+	// v1 format: skip counter (8 bytes)
+	return decrypted[8:], nil
+}
+
+// DecryptV1WithKey explicitly decrypts v1 format (for legacy compatibility).
+func DecryptV1WithKey(key, encrypted []byte) ([]byte, error) {
+	if len(encrypted) < MinCiphertextSize {
+		return nil, ErrCiphertextTooShort
+	}
+
+	// Parse components
+	nonce := encrypted[:NonceSize]
+	ciphertext := encrypted[NonceSize : len(encrypted)-MACSize]
+	receivedMAC := encrypted[len(encrypted)-MACSize:]
+
+	// Verify MAC
+	mac := hmac.New(sha256.New, key)
+	mac.Write(nonce)
+	mac.Write(ciphertext)
+	expectedMAC := mac.Sum(nil)[:MACSize]
+
+	if subtle.ConstantTimeCompare(receivedMAC, expectedMAC) != 1 {
+		return nil, ErrAuthenticationFailed
+	}
+
+	// Decrypt
+	keystream := generateKeystream(key, nonce, len(ciphertext))
+	decrypted := make([]byte, len(ciphertext))
+	for i := range ciphertext {
+		decrypted[i] = ciphertext[i] ^ keystream[i]
+	}
+
+	// v1 format: skip counter (8 bytes)
+	return decrypted[8:], nil
+}
+
+// generateKeystream generates a SHA256-based keystream.
+func generateKeystream(key, nonce []byte, length int) []byte {
+	numBlocks := (length + 31) / 32
+	keystream := make([]byte, 0, numBlocks*32)
+
+	for i := 0; i < numBlocks; i++ {
+		counter := make([]byte, 4)
+		binary.LittleEndian.PutUint32(counter, uint32(i))
+
+		h := sha256.New()
+		h.Write(key)
+		h.Write(nonce)
+		h.Write(counter)
+		keystream = append(keystream, h.Sum(nil)...)
+	}
+
+	return keystream[:length]
+}
+
+
+
+================================================
+FILE: java/src/main/java/ai/guard8/shield/Shield.java
+================================================
+package ai.guard8.shield;
+
+import javax.crypto.Mac;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.PBEKeySpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
+import java.util.Arrays;
+
+/**
+ * Shield - EXPTIME-Secure Symmetric Encryption Library
+ *
+ * Uses only symmetric cryptographic primitives with proven exponential-time security:
+ * PBKDF2-SHA256, HMAC-SHA256, and SHA256-based stream cipher.
+ * Breaking requires 2^256 operations - no shortcut exists.
+ */
+public class Shield {
+    public static final int KEY_SIZE = 32;
+    public static final int NONCE_SIZE = 16;
+    public static final int MAC_SIZE = 16;
+    public static final int ITERATIONS = 100000;
+    public static final int MIN_CIPHERTEXT_SIZE = NONCE_SIZE + 8 + MAC_SIZE;
+
+    // V2 constants
+    public static final int V2_HEADER_SIZE = 17;  // counter(8) + timestamp(8) + pad_len(1)
+    public static final int MIN_PADDING = 32;
+    public static final int MAX_PADDING = 128;
+    public static final long MIN_TIMESTAMP_MS = 1577836800000L;  // 2020-01-01
+    public static final long MAX_TIMESTAMP_MS = 4102444800000L;  // 2100-01-01
+    public static final long DEFAULT_MAX_AGE_MS = 60000L;
+
+    private final byte[] key;
+    private final Long maxAgeMs;  // null = disabled
+    private static final SecureRandom random = new SecureRandom();
+
+    /**
+     * Create Shield from password and service name.
+     */
+    public Shield(String password, String service) {
+        this(password, service, DEFAULT_MAX_AGE_MS);
+    }
+
+    /**
+     * Create Shield from password and service name with custom max age.
+     */
+    public Shield(String password, String service, Long maxAgeMs) {
+        byte[] salt = sha256(service.getBytes());
+        this.key = pbkdf2(password, salt, ITERATIONS, KEY_SIZE);
+        this.maxAgeMs = maxAgeMs;
+    }
+
+    /**
+     * Create Shield with pre-shared key.
+     */
+    public Shield(byte[] key) {
+        this(key, DEFAULT_MAX_AGE_MS);
+    }
+
+    /**
+     * Create Shield with pre-shared key and custom max age.
+     */
+    public Shield(byte[] key, Long maxAgeMs) {
+        if (key.length != KEY_SIZE) {
+            throw new IllegalArgumentException("Invalid key size");
+        }
+        this.key = Arrays.copyOf(key, KEY_SIZE);
+        this.maxAgeMs = maxAgeMs;
+    }
+
+    /**
+     * Create Shield with hardware fingerprinting (device-bound encryption).
+     *
+     * <p>Derives keys from password + hardware identifier, binding encryption to
+     * the physical device. Keys cannot be transferred to other hardware.
+     *
+     * @param password User's password
+     * @param service Service identifier
+     * @param mode Fingerprint mode
+     * @return Shield instance with device-bound key
+     * @throws Exception If hardware fingerprint unavailable
+     *
+     * <p>Example:
+     * <pre>{@code
+     * Shield shield = Shield.withFingerprint("password", "github.com", FingerprintMode.COMBINED);
+     * byte[] encrypted = shield.encrypt("secret".getBytes());
+     * }</pre>
+     */
+    public static Shield withFingerprint(String password, String service, Fingerprint.FingerprintMode mode) throws Exception {
+        String fingerprint = Fingerprint.collect(mode);
+
+        String combinedPassword = fingerprint.isEmpty() ? password : password + ":" + fingerprint;
+
+        return new Shield(combinedPassword, service);
+    }
+
+    /**
+     * Encrypt plaintext (v2 format).
+     */
+    public byte[] encrypt(byte[] plaintext) {
+        return encryptWithKey(key, plaintext);
+    }
+
+    /**
+     * Decrypt ciphertext (auto-detects v1/v2).
+     */
+    public byte[] decrypt(byte[] ciphertext) {
+        return decryptWithKey(key, ciphertext, maxAgeMs);
+    }
+
+    /**
+     * Decrypt v1 format explicitly (for legacy compatibility).
+     */
+    public byte[] decryptV1(byte[] ciphertext) {
+        return decryptV1WithKey(key, ciphertext);
+    }
+
+    /**
+     * Get the derived key.
+     */
+    public byte[] getKey() {
+        return Arrays.copyOf(key, KEY_SIZE);
+    }
+
+    /**
+     * Wipe key from memory.
+     */
+    public void wipe() {
+        Arrays.fill(key, (byte) 0);
+    }
+
+    // ============== Static Methods ==============
+
+    /**
+     * Quick encrypt with explicit key.
+     */
+    public static byte[] quickEncrypt(byte[] key, byte[] plaintext) {
+        if (key.length != KEY_SIZE) {
+            throw new IllegalArgumentException("Invalid key size");
+        }
+        return encryptWithKey(key, plaintext);
+    }
+
+    /**
+     * Quick decrypt with explicit key.
+     */
+    public static byte[] quickDecrypt(byte[] key, byte[] ciphertext) {
+        if (key.length != KEY_SIZE) {
+            throw new IllegalArgumentException("Invalid key size");
+        }
+        return decryptWithKey(key, ciphertext, null);
+    }
+
+    private static byte[] encryptWithKey(byte[] key, byte[] plaintext) {
+        // Generate random nonce
+        byte[] nonce = new byte[NONCE_SIZE];
+        random.nextBytes(nonce);
+
+        // Counter prefix (8 bytes of zeros)
+        byte[] counter = new byte[8];
+
+        // Timestamp in milliseconds since Unix epoch
+        long timestampMs = System.currentTimeMillis();
+        byte[] timestamp = new byte[8];
+        ByteBuffer.wrap(timestamp).order(ByteOrder.LITTLE_ENDIAN).putLong(timestampMs);
+
+        // Random padding: 32-128 bytes
+        int padLen = (random.nextInt() & 0xFF) % (MAX_PADDING - MIN_PADDING + 1) + MIN_PADDING;
+        byte[] padLenByte = new byte[] { (byte) padLen };
+        byte[] padding = new byte[padLen];
+        random.nextBytes(padding);
+
+        // Data to encrypt: counter || timestamp || pad_len || padding || plaintext
+        byte[] dataToEncrypt = new byte[8 + 8 + 1 + padLen + plaintext.length];
+        int pos = 0;
+        System.arraycopy(counter, 0, dataToEncrypt, pos, 8);
+        pos += 8;
+        System.arraycopy(timestamp, 0, dataToEncrypt, pos, 8);
+        pos += 8;
+        System.arraycopy(padLenByte, 0, dataToEncrypt, pos, 1);
+        pos += 1;
+        System.arraycopy(padding, 0, dataToEncrypt, pos, padLen);
+        pos += padLen;
+        System.arraycopy(plaintext, 0, dataToEncrypt, pos, plaintext.length);
+
+        // Generate keystream and XOR
+        byte[] keystream = generateKeystream(key, nonce, dataToEncrypt.length);
+        byte[] ciphertext = new byte[dataToEncrypt.length];
+        for (int i = 0; i < dataToEncrypt.length; i++) {
+            ciphertext[i] = (byte) (dataToEncrypt[i] ^ keystream[i]);
+        }
+
+        // Compute HMAC over nonce || ciphertext
+        byte[] macData = new byte[NONCE_SIZE + ciphertext.length];
+        System.arraycopy(nonce, 0, macData, 0, NONCE_SIZE);
+        System.arraycopy(ciphertext, 0, macData, NONCE_SIZE, ciphertext.length);
+        byte[] mac = hmacSha256(key, macData);
+
+        // Format: nonce || ciphertext || mac
+        byte[] result = new byte[NONCE_SIZE + ciphertext.length + MAC_SIZE];
+        System.arraycopy(nonce, 0, result, 0, NONCE_SIZE);
+        System.arraycopy(ciphertext, 0, result, NONCE_SIZE, ciphertext.length);
+        System.arraycopy(mac, 0, result, NONCE_SIZE + ciphertext.length, MAC_SIZE);
+
+        return result;
+    }
+
+    private static byte[] decryptWithKey(byte[] key, byte[] encrypted, Long maxAgeMs) {
+        if (encrypted.length < MIN_CIPHERTEXT_SIZE) {
+            throw new IllegalArgumentException("Ciphertext too short");
+        }
+
+        // Parse components
+        byte[] nonce = Arrays.copyOfRange(encrypted, 0, NONCE_SIZE);
+        byte[] ciphertext = Arrays.copyOfRange(encrypted, NONCE_SIZE, encrypted.length - MAC_SIZE);
+        byte[] receivedMac = Arrays.copyOfRange(encrypted, encrypted.length - MAC_SIZE, encrypted.length);
+
+        // Verify MAC
+        byte[] macData = new byte[NONCE_SIZE + ciphertext.length];
+        System.arraycopy(nonce, 0, macData, 0, NONCE_SIZE);
+        System.arraycopy(ciphertext, 0, macData, NONCE_SIZE, ciphertext.length);
+        byte[] expectedMac = hmacSha256(key, macData);
+
+        if (!constantTimeEquals(receivedMac, Arrays.copyOf(expectedMac, MAC_SIZE))) {
+            throw new SecurityException("Authentication failed");
+        }
+
+        // Decrypt
+        byte[] keystream = generateKeystream(key, nonce, ciphertext.length);
+        byte[] decrypted = new byte[ciphertext.length];
+        for (int i = 0; i < ciphertext.length; i++) {
+            decrypted[i] = (byte) (ciphertext[i] ^ keystream[i]);
+        }
+
+        // Auto-detect v2 by timestamp range (2020-2100)
+        if (decrypted.length >= V2_HEADER_SIZE) {
+            byte[] timestampBytes = Arrays.copyOfRange(decrypted, 8, 16);
+            long timestampMs = ByteBuffer.wrap(timestampBytes).order(ByteOrder.LITTLE_ENDIAN).getLong();
+
+            if (timestampMs >= MIN_TIMESTAMP_MS && timestampMs <= MAX_TIMESTAMP_MS) {
+                // v2 format detected
+                int padLen = decrypted[16] & 0xFF;
+
+                // Validate padding length is within protocol bounds (SECURITY: CVE-PENDING)
+                if (padLen < MIN_PADDING || padLen > MAX_PADDING) {
+                    throw new SecurityException("Authentication failed");
+                }
+
+                int dataStart = V2_HEADER_SIZE + padLen;
+
+                if (decrypted.length < dataStart) {
+                    throw new IllegalArgumentException("Ciphertext too short");
+                }
+
+                // Replay protection
+                if (maxAgeMs != null) {
+                    long nowMs = System.currentTimeMillis();
+                    long age = nowMs - timestampMs;
+
+                    // Reject if too far in future (>5s clock skew) or too old
+                    if (timestampMs > nowMs + 5000 || age > maxAgeMs) {
+                        throw new SecurityException("Authentication failed");
+                    }
+                }
+
+                return Arrays.copyOfRange(decrypted, dataStart, decrypted.length);
+            }
+        }
+
+        // v1 format: skip counter (8 bytes)
+        return Arrays.copyOfRange(decrypted, 8, decrypted.length);
+    }
+
+    private static byte[] decryptV1WithKey(byte[] key, byte[] encrypted) {
+        if (encrypted.length < MIN_CIPHERTEXT_SIZE) {
+            throw new IllegalArgumentException("Ciphertext too short");
+        }
+
+        // Parse components
+        byte[] nonce = Arrays.copyOfRange(encrypted, 0, NONCE_SIZE);
+        byte[] ciphertext = Arrays.copyOfRange(encrypted, NONCE_SIZE, encrypted.length - MAC_SIZE);
+        byte[] receivedMac = Arrays.copyOfRange(encrypted, encrypted.length - MAC_SIZE, encrypted.length);
+
+        // Verify MAC
+        byte[] macData = new byte[NONCE_SIZE + ciphertext.length];
+        System.arraycopy(nonce, 0, macData, 0, NONCE_SIZE);
+        System.arraycopy(ciphertext, 0, macData, NONCE_SIZE, ciphertext.length);
+        byte[] expectedMac = hmacSha256(key, macData);
+
+        if (!constantTimeEquals(receivedMac, Arrays.copyOf(expectedMac, MAC_SIZE))) {
+            throw new SecurityException("Authentication failed");
+        }
+
+        // Decrypt
+        byte[] keystream = generateKeystream(key, nonce, ciphertext.length);
+        byte[] decrypted = new byte[ciphertext.length];
+        for (int i = 0; i < ciphertext.length; i++) {
+            decrypted[i] = (byte) (ciphertext[i] ^ keystream[i]);
+        }
+
+        // v1 format: skip counter (8 bytes)
+        return Arrays.copyOfRange(decrypted, 8, decrypted.length);
+    }
+
+    private static byte[] generateKeystream(byte[] key, byte[] nonce, int length) {
+        int numBlocks = (length + 31) / 32;
+        byte[] keystream = new byte[numBlocks * 32];
+
+        for (int i = 0; i < numBlocks; i++) {
+            byte[] block = new byte[KEY_SIZE + NONCE_SIZE + 4];
+            System.arraycopy(key, 0, block, 0, KEY_SIZE);
+            System.arraycopy(nonce, 0, block, KEY_SIZE, NONCE_SIZE);
+            ByteBuffer.wrap(block, KEY_SIZE + NONCE_SIZE, 4)
+                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .putInt(i);
+
+            byte[] hash = sha256(block);
+            System.arraycopy(hash, 0, keystream, i * 32, 32);
+        }
+
+        return Arrays.copyOf(keystream, length);
+    }
+
+    // ============== Crypto Utilities ==============
+
+    public static byte[] sha256(byte[] data) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            return md.digest(data);
+        } catch (Exception e) {
+            throw new RuntimeException("SHA-256 not available", e);
+        }
+    }
+
+    public static byte[] hmacSha256(byte[] key, byte[] data) {
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(key, "HmacSHA256"));
+            return mac.doFinal(data);
+        } catch (Exception e) {
+            throw new RuntimeException("HMAC-SHA256 not available", e);
+        }
+    }
+
+    public static byte[] pbkdf2(String password, byte[] salt, int iterations, int keyLength) {
+        try {
+            PBEKeySpec spec = new PBEKeySpec(password.toCharArray(), salt, iterations, keyLength * 8);
+            SecretKeyFactory skf = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+            return skf.generateSecret(spec).getEncoded();
+        } catch (Exception e) {
+            throw new RuntimeException("PBKDF2 not available", e);
+        }
+    }
+
+    public static boolean constantTimeEquals(byte[] a, byte[] b) {
+        if (a.length != b.length) {
+            return false;
+        }
+        int result = 0;
+        for (int i = 0; i < a.length; i++) {
+            result |= a[i] ^ b[i];
+        }
+        return result == 0;
+    }
+
+    public static byte[] randomBytes(int length) {
+        byte[] bytes = new byte[length];
+        random.nextBytes(bytes);
+        return bytes;
+    }
+
+    public static void secureWipe(byte[] data) {
+        Arrays.fill(data, (byte) 0);
+    }
+}
+
+
+
+================================================
+FILE: javascript/src/shield.js
+================================================
+/**
+ * Shield - EXPTIME-Secure Encryption (Node.js)
+ *
+ * INTEROPERABLE with Python shield package.
+ * Uses SHA256-based stream cipher with HMAC authentication.
+ * Breaking requires 2^256 operations - no shortcut exists.
+ */
+
+const crypto = require('crypto');
+
+// Constants
+const PBKDF2_ITERATIONS = 100000;
+const NONCE_SIZE = 16;
+const MAC_SIZE = 16;
+const COUNTER_SIZE = 8;
+
+// V2 constants
+const V2_HEADER_SIZE = 17;  // counter(8) + timestamp(8) + pad_len(1)
+const MIN_PADDING = 32;
+const MAX_PADDING = 128;
+
+// Timestamp range for v2 detection (2020-2100 in milliseconds)
+const MIN_TIMESTAMP_MS = 1577836800000;
+const MAX_TIMESTAMP_MS = 4102444800000;
+
+/**
+ * Generate keystream using SHA256 (AES-256-CTR equivalent).
+ */
+function generateKeystream(key, nonce, length) {
+    let keystream = Buffer.alloc(0);
+    const numBlocks = Math.ceil(length / 32);
+
+    for (let i = 0; i < numBlocks; i++) {
+        const counter = Buffer.alloc(4);
+        counter.writeUInt32LE(i);
+        const block = crypto.createHash('sha256')
+            .update(Buffer.concat([key, nonce, counter]))
+            .digest();
+        keystream = Buffer.concat([keystream, block]);
+    }
+
+    return keystream.slice(0, length);
+}
+
+/**
+ * Shield encryption class.
+ *
+ * @example
+ * const shield = new Shield('password', 'github.com');
+ * const encrypted = shield.encrypt(Buffer.from('secret'));
+ * const decrypted = shield.decrypt(encrypted);
+ */
+class Shield {
+    /**
+     * Create Shield instance with password-derived key.
+     *
+     * @param {string} password - User's password
+     * @param {string} service - Service identifier (e.g., 'github.com')
+     * @param {Object} options - Optional settings
+     * @param {Buffer} options.salt - Custom salt (default: SHA256(service))
+     * @param {number} options.iterations - PBKDF2 iterations (default: 100000)
+     * @param {number} options.maxAgeMs - Maximum message age in milliseconds (default: 60000, null = disabled)
+     */
+    constructor(password, service, options = {}) {
+        const salt = options.salt ||
+            crypto.createHash('sha256').update(service).digest();
+        const iterations = options.iterations || PBKDF2_ITERATIONS;
+        const maxAgeMs = options.maxAgeMs !== undefined ? options.maxAgeMs : 60000;
+
+        this._key = crypto.pbkdf2Sync(password, salt, iterations, 32, 'sha256');
+        this._counter = 0;
+        this._maxAgeMs = maxAgeMs;
+    }
+
+    /**
+     * Create Shield instance from raw key (no password derivation).
+     *
+     * @param {Buffer} key - 32-byte symmetric key
+     * @returns {Shield} Shield instance
+     */
+    static withKey(key) {
+        if (key.length !== 32) {
+            throw new Error(`Key must be 32 bytes, got ${key.length}`);
+        }
+        const instance = Object.create(Shield.prototype);
+        instance._key = key;
+        instance._counter = 0;
+        instance._maxAgeMs = 60000;
+        return instance;
+    }
+
+    /**
+     * Create Shield with hardware fingerprinting (device-bound encryption).
+     *
+     * Derives keys from password + hardware identifier, binding encryption to
+     * the physical device. Keys cannot be transferred to other hardware.
+     *
+     * @param {string} password - User's password
+     * @param {string} service - Service identifier
+     * @param {Object} options - Options
+     * @param {string} options.mode - Fingerprint mode ('none', 'motherboard', 'cpu', 'combined')
+     * @returns {Shield} Shield instance with device-bound key
+     * @throws {Error} If hardware fingerprint unavailable
+     *
+     * @example
+     * const shield = Shield.withFingerprint('password', 'github.com', { mode: 'combined' });
+     * const encrypted = shield.encrypt(Buffer.from('secret'));
+     */
+    static withFingerprint(password, service, options = {}) {
+        const { FingerprintMode, collectFingerprint } = require('./fingerprint');
+
+        const mode = options.mode || FingerprintMode.COMBINED;
+        const fingerprint = collectFingerprint(mode);
+
+        const combinedPassword = fingerprint ? `${password}:${fingerprint}` : password;
+
+        return new Shield(combinedPassword, service, options);
+    }
+
+    /**
+     * Encrypt data (v2 format with replay protection and length obfuscation).
+     *
+     * Inner format: counter(8) || timestamp_ms(8) || pad_len(1) || random_padding(32-128) || plaintext
+     *
+     * @param {Buffer} plaintext - Data to encrypt
+     * @returns {Buffer} Ciphertext: nonce(16) || encrypted_data || mac(16)
+     */
+    encrypt(plaintext) {
+        const nonce = crypto.randomBytes(NONCE_SIZE);
+        const counterBytes = Buffer.alloc(COUNTER_SIZE);
+        counterBytes.writeBigUInt64LE(BigInt(this._counter));
+        this._counter++;
+
+        // Timestamp in milliseconds since Unix epoch
+        const timestampMs = Date.now();
+        const timestampBytes = Buffer.alloc(8);
+        timestampBytes.writeBigUInt64LE(BigInt(timestampMs));
+
+        // Random padding: 32-128 bytes
+        const randomByte = crypto.randomBytes(1)[0];
+        const padLen = (randomByte % (MAX_PADDING - MIN_PADDING + 1)) + MIN_PADDING;
+        const padLenByte = Buffer.alloc(1);
+        padLenByte[0] = padLen;
+        const padding = crypto.randomBytes(padLen);
+
+        // Data to encrypt: counter || timestamp || pad_len || padding || plaintext
+        const data = Buffer.concat([counterBytes, timestampBytes, padLenByte, padding, plaintext]);
+
+        // Generate keystream
+        const keystream = generateKeystream(this._key, nonce, data.length);
+
+        // XOR encrypt
+        const ciphertext = Buffer.alloc(data.length);
+        for (let i = 0; i < data.length; i++) {
+            ciphertext[i] = data[i] ^ keystream[i];
+        }
+
+        // HMAC authenticate
+        const mac = crypto.createHmac('sha256', this._key)
+            .update(Buffer.concat([nonce, ciphertext]))
+            .digest()
+            .slice(0, MAC_SIZE);
+
+        return Buffer.concat([nonce, ciphertext, mac]);
+    }
+
+    /**
+     * Decrypt and verify data (auto-detects v1/v2 format).
+     *
+     * @param {Buffer} encrypted - Ciphertext from encrypt()
+     * @returns {Buffer|null} Plaintext, or null if authentication fails or replay detected
+     */
+    decrypt(encrypted) {
+        const minSize = NONCE_SIZE + COUNTER_SIZE + MAC_SIZE;
+        if (encrypted.length < minSize) {
+            return null;
+        }
+
+        const nonce = encrypted.slice(0, NONCE_SIZE);
+        const ciphertext = encrypted.slice(NONCE_SIZE, -MAC_SIZE);
+        const mac = encrypted.slice(-MAC_SIZE);
+
+        // Verify MAC (constant-time)
+        const expectedMac = crypto.createHmac('sha256', this._key)
+            .update(Buffer.concat([nonce, ciphertext]))
+            .digest()
+            .slice(0, MAC_SIZE);
+
+        if (!crypto.timingSafeEqual(mac, expectedMac)) {
+            return null;
+        }
+
+        // Decrypt
+        const keystream = generateKeystream(this._key, nonce, ciphertext.length);
+        const decrypted = Buffer.alloc(ciphertext.length);
+        for (let i = 0; i < ciphertext.length; i++) {
+            decrypted[i] = ciphertext[i] ^ keystream[i];
+        }
+
+        // Auto-detect v2 by timestamp range (2020-2100)
+        if (decrypted.length >= V2_HEADER_SIZE) {
+            const timestampBytes = decrypted.slice(8, 16);
+            const timestampMs = timestampBytes.readBigUInt64LE();
+
+            if (timestampMs >= MIN_TIMESTAMP_MS && timestampMs <= MAX_TIMESTAMP_MS) {
+                // v2 format detected
+                const padLen = decrypted[16];
+
+                // Validate padding length is within protocol bounds (SECURITY: CVE-PENDING)
+                if (padLen < MIN_PADDING || padLen > MAX_PADDING) {
+                    return null;
+                }
+
+                const dataStart = V2_HEADER_SIZE + padLen;
+
+                if (decrypted.length < dataStart) {
+                    return null;
+                }
+
+                // Replay protection
+                if (this._maxAgeMs !== null) {
+                    const nowMs = Date.now();
+                    const age = nowMs - Number(timestampMs);
+
+                    // Reject if too far in future (>5s clock skew) or too old
+                    if (Number(timestampMs) > nowMs + 5000 || age > this._maxAgeMs) {
+                        return null;
+                    }
+                }
+
+                return decrypted.slice(dataStart);
+            }
+        }
+
+        // v1 format: skip counter (8 bytes)
+        return decrypted.slice(COUNTER_SIZE);
+    }
+
+    /**
+     * Decrypt v1 format explicitly (for legacy compatibility).
+     *
+     * @param {Buffer} encrypted - Ciphertext from encrypt()
+     * @returns {Buffer|null} Plaintext, or null if authentication fails
+     */
+    decryptV1(encrypted) {
+        const minSize = NONCE_SIZE + COUNTER_SIZE + MAC_SIZE;
+        if (encrypted.length < minSize) {
+            return null;
+        }
+
+        const nonce = encrypted.slice(0, NONCE_SIZE);
+        const ciphertext = encrypted.slice(NONCE_SIZE, -MAC_SIZE);
+        const mac = encrypted.slice(-MAC_SIZE);
+
+        // Verify MAC (constant-time)
+        const expectedMac = crypto.createHmac('sha256', this._key)
+            .update(Buffer.concat([nonce, ciphertext]))
+            .digest()
+            .slice(0, MAC_SIZE);
+
+        if (!crypto.timingSafeEqual(mac, expectedMac)) {
+            return null;
+        }
+
+        // Decrypt
+        const keystream = generateKeystream(this._key, nonce, ciphertext.length);
+        const decrypted = Buffer.alloc(ciphertext.length);
+        for (let i = 0; i < ciphertext.length; i++) {
+            decrypted[i] = ciphertext[i] ^ keystream[i];
+        }
+
+        // v1 format: skip counter (8 bytes)
+        return decrypted.slice(COUNTER_SIZE);
+    }
+
+    /**
+     * Get the derived key (for testing/debugging).
+     * @returns {Buffer} The 32-byte key
+     */
+    get key() {
+        return this._key;
+    }
+}
+
+/**
+ * One-shot encrypt with pre-shared key (no password derivation).
+ *
+ * @param {Buffer} key - 32-byte symmetric key
+ * @param {Buffer} data - Data to encrypt
+ * @returns {Buffer} Ciphertext
+ */
+function quickEncrypt(key, data) {
+    const nonce = crypto.randomBytes(NONCE_SIZE);
+    const keystream = generateKeystream(key, nonce, data.length);
+
+    const ciphertext = Buffer.alloc(data.length);
+    for (let i = 0; i < data.length; i++) {
+        ciphertext[i] = data[i] ^ keystream[i];
+    }
+
+    const mac = crypto.createHmac('sha256', key)
+        .update(Buffer.concat([nonce, ciphertext]))
+        .digest()
+        .slice(0, MAC_SIZE);
+
+    return Buffer.concat([nonce, ciphertext, mac]);
+}
+
+/**
+ * One-shot decrypt with pre-shared key.
+ *
+ * @param {Buffer} key - 32-byte symmetric key
+ * @param {Buffer} encrypted - Ciphertext from quickEncrypt()
+ * @returns {Buffer|null} Plaintext, or null if authentication fails
+ */
+function quickDecrypt(key, encrypted) {
+    if (encrypted.length < NONCE_SIZE + MAC_SIZE) {
+        return null;
+    }
+
+    const nonce = encrypted.slice(0, NONCE_SIZE);
+    const ciphertext = encrypted.slice(NONCE_SIZE, -MAC_SIZE);
+    const mac = encrypted.slice(-MAC_SIZE);
+
+    const expectedMac = crypto.createHmac('sha256', key)
+        .update(Buffer.concat([nonce, ciphertext]))
+        .digest()
+        .slice(0, MAC_SIZE);
+
+    if (!crypto.timingSafeEqual(mac, expectedMac)) {
+        return null;
+    }
+
+    const keystream = generateKeystream(key, nonce, ciphertext.length);
+    const decrypted = Buffer.alloc(ciphertext.length);
+    for (let i = 0; i < ciphertext.length; i++) {
+        decrypted[i] = ciphertext[i] ^ keystream[i];
+    }
+
+    return decrypted;
+}
+
+module.exports = {
+    Shield,
+    quickEncrypt,
+    quickDecrypt,
+    generateKeystream
+};
+
+
+
+================================================
+FILE: kotlin/src/main/kotlin/ai/guard8/shield/Shield.kt
+================================================
+package ai.guard8.shield
+
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.security.MessageDigest
+import java.security.SecureRandom
+import javax.crypto.Mac
+import javax.crypto.SecretKeyFactory
+import javax.crypto.spec.PBEKeySpec
+import javax.crypto.spec.SecretKeySpec
+
+/**
+ * Shield - EXPTIME-Secure Symmetric Encryption Library
+ *
+ * Uses only symmetric cryptographic primitives with proven exponential-time security:
+ * PBKDF2-SHA256, HMAC-SHA256, and SHA256-based stream cipher.
+ * Breaking requires 2^256 operations - no shortcut exists.
+ */
+class Shield private constructor(private val key: ByteArray) : AutoCloseable {
+
+    companion object {
+        const val KEY_SIZE = 32
+        const val NONCE_SIZE = 16
+        const val MAC_SIZE = 16
+        const val ITERATIONS = 100_000
+        const val MIN_CIPHERTEXT_SIZE = NONCE_SIZE + 8 + MAC_SIZE
+
+        private val random = SecureRandom()
+
+        /**
+         * Create Shield from password and service name.
+         */
+        fun create(password: String, service: String): Shield {
+            val salt = sha256(service.toByteArray())
+            val key = pbkdf2(password, salt, ITERATIONS, KEY_SIZE)
+            return Shield(key)
+        }
+
+        /**
+         * Create Shield with pre-shared key.
+         */
+        fun withKey(key: ByteArray): Shield {
+            require(key.size == KEY_SIZE) { "Invalid key size" }
+            return Shield(key.copyOf())
+        }
+
+        /**
+         * Quick encrypt with explicit key.
+         */
+        fun quickEncrypt(key: ByteArray, plaintext: ByteArray): ByteArray {
+            require(key.size == KEY_SIZE) { "Invalid key size" }
+            return encryptWithKey(key, plaintext)
+        }
+
+        /**
+         * Quick decrypt with explicit key.
+         */
+        fun quickDecrypt(key: ByteArray, ciphertext: ByteArray): ByteArray {
+            require(key.size == KEY_SIZE) { "Invalid key size" }
+            return decryptWithKey(key, ciphertext)
+        }
+
+        private fun encryptWithKey(key: ByteArray, plaintext: ByteArray): ByteArray {
+            // Generate random nonce
+            val nonce = randomBytes(NONCE_SIZE)
+
+            // Counter prefix (8 bytes of zeros)
+            val dataToEncrypt = ByteArray(8 + plaintext.size)
+            System.arraycopy(plaintext, 0, dataToEncrypt, 8, plaintext.size)
+
+            // Generate keystream and XOR
+            val keystream = generateKeystream(key, nonce, dataToEncrypt.size)
+            val ciphertext = ByteArray(dataToEncrypt.size)
+            for (i in dataToEncrypt.indices) {
+                ciphertext[i] = (dataToEncrypt[i].toInt() xor keystream[i].toInt()).toByte()
+            }
+
+            // Compute HMAC over nonce || ciphertext
+            val macData = nonce + ciphertext
+            val mac = hmacSha256(key, macData)
+
+            // Format: nonce || ciphertext || mac
+            return nonce + ciphertext + mac.copyOf(MAC_SIZE)
+        }
+
+        private fun decryptWithKey(key: ByteArray, encrypted: ByteArray): ByteArray {
+            require(encrypted.size >= MIN_CIPHERTEXT_SIZE) { "Ciphertext too short" }
+
+            // Parse components
+            val nonce = encrypted.copyOfRange(0, NONCE_SIZE)
+            val ciphertext = encrypted.copyOfRange(NONCE_SIZE, encrypted.size - MAC_SIZE)
+            val receivedMac = encrypted.copyOfRange(encrypted.size - MAC_SIZE, encrypted.size)
+
+            // Verify MAC
+            val macData = nonce + ciphertext
+            val expectedMac = hmacSha256(key, macData).copyOf(MAC_SIZE)
+
+            require(constantTimeEquals(receivedMac, expectedMac)) { "Authentication failed" }
+
+            // Decrypt
+            val keystream = generateKeystream(key, nonce, ciphertext.size)
+            val decrypted = ByteArray(ciphertext.size)
+            for (i in ciphertext.indices) {
+                decrypted[i] = (ciphertext[i].toInt() xor keystream[i].toInt()).toByte()
+            }
+
+            // Skip 8-byte counter prefix
+            return decrypted.copyOfRange(8, decrypted.size)
+        }
+
+        private fun generateKeystream(key: ByteArray, nonce: ByteArray, length: Int): ByteArray {
+            val numBlocks = (length + 31) / 32
+            val keystream = ByteArray(numBlocks * 32)
+
+            for (i in 0 until numBlocks) {
+                val block = ByteArray(KEY_SIZE + NONCE_SIZE + 4)
+                System.arraycopy(key, 0, block, 0, KEY_SIZE)
+                System.arraycopy(nonce, 0, block, KEY_SIZE, NONCE_SIZE)
+                ByteBuffer.wrap(block, KEY_SIZE + NONCE_SIZE, 4)
+                    .order(ByteOrder.LITTLE_ENDIAN)
+                    .putInt(i)
+
+                val hash = sha256(block)
+                System.arraycopy(hash, 0, keystream, i * 32, 32)
+            }
+
+            return keystream.copyOf(length)
+        }
+
+        // ============== Crypto Utilities ==============
+
+        fun sha256(data: ByteArray): ByteArray {
+            return MessageDigest.getInstance("SHA-256").digest(data)
+        }
+
+        fun hmacSha256(key: ByteArray, data: ByteArray): ByteArray {
+            val mac = Mac.getInstance("HmacSHA256")
+            mac.init(SecretKeySpec(key, "HmacSHA256"))
+            return mac.doFinal(data)
+        }
+
+        fun pbkdf2(password: String, salt: ByteArray, iterations: Int, keyLength: Int): ByteArray {
+            val spec = PBEKeySpec(password.toCharArray(), salt, iterations, keyLength * 8)
+            val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+            return factory.generateSecret(spec).encoded
+        }
+
+        fun constantTimeEquals(a: ByteArray, b: ByteArray): Boolean {
+            if (a.size != b.size) return false
+            var result = 0
+            for (i in a.indices) {
+                result = result or (a[i].toInt() xor b[i].toInt())
+            }
+            return result == 0
+        }
+
+        fun randomBytes(length: Int): ByteArray {
+            val bytes = ByteArray(length)
+            random.nextBytes(bytes)
+            return bytes
+        }
+
+        fun secureWipe(data: ByteArray) {
+            data.fill(0)
+        }
+    }
+
+    /**
+     * Encrypt plaintext.
+     */
+    fun encrypt(plaintext: ByteArray): ByteArray = encryptWithKey(key, plaintext)
+
+    /**
+     * Decrypt ciphertext.
+     */
+    fun decrypt(ciphertext: ByteArray): ByteArray = decryptWithKey(key, ciphertext)
+
+    /**
+     * Get the derived key.
+     */
+    fun getKey(): ByteArray = key.copyOf()
+
+    /**
+     * Wipe key from memory.
+     */
+    override fun close() {
+        secureWipe(key)
+    }
+}
+
+/**
+ * Shield errors.
+ */
+sealed class ShieldException(message: String) : Exception(message) {
+    class InvalidKeySize : ShieldException("Invalid key size")
+    class CiphertextTooShort : ShieldException("Ciphertext too short")
+    class AuthenticationFailed : ShieldException("Authentication failed")
+    class LamportKeyUsed : ShieldException("Lamport key already used")
+    class ReplayDetected : ShieldException("Replay detected")
+    class OutOfOrder : ShieldException("Out of order message")
+    class TokenExpired : ShieldException("Token expired")
+    class InvalidToken : ShieldException("Invalid token")
+    class SessionExpired : ShieldException("Session expired")
+}
+
+
+
+================================================
+FILE: python/shield/core.py
+================================================
+"""
+Shield Core - Password-based symmetric encryption.
+
+This module provides the main Shield class for encrypting and decrypting
+data using password-derived keys. It uses PBKDF2-SHA256 for key derivation
+and a SHA256-based stream cipher with HMAC-SHA256 authentication.
+
+Security:
+    - PBKDF2 with 100,000 iterations
+    - 256-bit keys
+    - 16-byte random nonces
+    - HMAC-SHA256 authentication (16-byte tags)
+    - Constant-time MAC comparison
+"""
+
+import os
+import hmac
+import hashlib
+import struct
+import time
+from typing import Optional, Union
+
+# Key derivation iterations (higher = more secure, slower)
+PBKDF2_ITERATIONS = 100_000
+
+# Sizes in bytes
+NONCE_SIZE = 16
+MAC_SIZE = 16
+COUNTER_SIZE = 8
+
+# V2 constants
+V2_HEADER_SIZE = 17  # counter(8) + timestamp(8) + pad_len(1)
+MIN_PADDING = 32
+MAX_PADDING = 128
+
+# Timestamp range for v2 detection (2020-2100 in milliseconds)
+MIN_TIMESTAMP_MS = 1_577_836_800_000
+MAX_TIMESTAMP_MS = 4_102_444_800_000
+
+
+class Shield:
+    """
+    EXPTIME-secure symmetric encryption.
+
+    Uses password-derived keys with PBKDF2 and encrypts using
+    a SHA256-based stream cipher with HMAC-SHA256 authentication.
+    Breaking requires 2^256 operations - no shortcut exists.
+
+    Version 2 adds replay protection and length obfuscation:
+    - Timestamp validation prevents replay attacks
+    - Random padding (32-128 bytes) obfuscates message length
+
+    Example:
+        >>> s = Shield("my_password", "github.com")
+        >>> encrypted = s.encrypt(b"secret data")
+        >>> decrypted = s.decrypt(encrypted)
+        >>> assert decrypted == b"secret data"
+    """
+
+    def __init__(
+        self,
+        password: str,
+        service: str,
+        salt: Optional[bytes] = None,
+        iterations: int = PBKDF2_ITERATIONS,
+        max_age_ms: Optional[int] = 60_000,
+    ):
+        """
+        Initialize Shield with password and service name.
+
+        Args:
+            password: User's password for this service
+            service: Service identifier (e.g., "github.com")
+            salt: Optional custom salt (defaults to SHA256(service))
+            iterations: PBKDF2 iterations (default: 100,000)
+            max_age_ms: Maximum message age in milliseconds for replay protection
+                       (default: 60000 = 60 seconds, None = disabled)
+        """
+        if salt is None:
+            salt = hashlib.sha256(service.encode()).digest()
+
+        self._key = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), salt, iterations
+        )
+        self._counter = 0
+        self._max_age_ms = max_age_ms
+
+    @classmethod
+    def with_key(cls, key: bytes) -> "Shield":
+        """
+        Create Shield instance with a pre-shared key (no password derivation).
+
+        Args:
+            key: 32-byte symmetric key
+
+        Returns:
+            Shield instance
+
+        Raises:
+            ValueError: If key is not 32 bytes
+        """
+        if len(key) != 32:
+            raise ValueError(f"Key must be 32 bytes, got {len(key)}")
+
+        instance = cls.__new__(cls)
+        instance._key = key
+        instance._counter = 0
+        instance._max_age_ms = 60_000
+        return instance
+
+    @classmethod
+    def with_fingerprint(cls, password: str, service: str, mode: str = "combined") -> "Shield":
+        """
+        Create Shield with hardware fingerprinting (device-bound encryption).
+
+        Derives keys from password + hardware identifier, binding encryption to
+        the physical device. Keys cannot be transferred to other hardware without
+        the correct fingerprint.
+
+        Args:
+            password: User's password
+            service: Service identifier (e.g., "github.com")
+            mode: Fingerprint mode - "none", "motherboard", "cpu", or "combined"
+
+        Returns:
+            Shield instance with device-bound key
+
+        Raises:
+            FingerprintError: If hardware identifiers cannot be collected
+
+        Security:
+            - Binding Strength: MEDIUM (hardware IDs are stable but replaceable)
+            - Spoofability: LOW-MEDIUM (requires hardware access or VM manipulation)
+            - Portability: NONE (keys are device-bound by design)
+
+        Example:
+            >>> s = Shield.with_fingerprint("password", "github.com", "combined")
+            >>> encrypted = s.encrypt(b"secret")
+        """
+        from .fingerprint import collect_fingerprint, FingerprintMode
+
+        # Map string mode to enum
+        mode_map = {
+            "none": FingerprintMode.NONE,
+            "motherboard": FingerprintMode.MOTHERBOARD,
+            "cpu": FingerprintMode.CPU,
+            "combined": FingerprintMode.COMBINED,
+        }
+        fingerprint_mode = mode_map.get(mode.lower())
+        if fingerprint_mode is None:
+            raise ValueError(f"Invalid fingerprint mode: {mode}")
+
+        # Collect hardware fingerprint
+        fingerprint = collect_fingerprint(fingerprint_mode)
+
+        # Combine password with fingerprint
+        combined_password = f"{password}:{fingerprint}" if fingerprint else password
+
+        # Create instance with combined password
+        return cls(combined_password, service)
+
+    def encrypt(self, plaintext: bytes) -> bytes:
+        """
+        Encrypt data (v2 format with replay protection and length obfuscation).
+
+        Inner format: counter(8) || timestamp_ms(8) || pad_len(1) || random_padding(32-128) || plaintext
+
+        Args:
+            plaintext: Data to encrypt
+
+        Returns:
+            Ciphertext in format: nonce(16) || encrypted_data || mac(16)
+        """
+        nonce = os.urandom(NONCE_SIZE)
+        counter_bytes = struct.pack("<Q", self._counter)
+        self._counter += 1
+
+        # Timestamp in milliseconds since Unix epoch
+        timestamp_ms = int(time.time() * 1000)
+        timestamp_bytes = struct.pack("<Q", timestamp_ms)
+
+        # Random padding: 32-128 bytes
+        pad_len = int.from_bytes(os.urandom(1), "little") % (MAX_PADDING - MIN_PADDING + 1) + MIN_PADDING
+        pad_len_byte = struct.pack("B", pad_len)
+        padding = os.urandom(pad_len)
+
+        # Data to encrypt: counter || timestamp || pad_len || padding || plaintext
+        data = counter_bytes + timestamp_bytes + pad_len_byte + padding + plaintext
+
+        # Generate keystream
+        keystream = _generate_keystream(self._key, nonce, len(data))
+
+        # XOR encrypt
+        ciphertext = bytes(p ^ k for p, k in zip(data, keystream))
+
+        # HMAC authenticate
+        mac = hmac.new(self._key, nonce + ciphertext, hashlib.sha256).digest()[
+            :MAC_SIZE
+        ]
+
+        return nonce + ciphertext + mac
+
+    def decrypt(self, encrypted: bytes) -> Optional[bytes]:
+        """
+        Decrypt and verify data (auto-detects v1/v2 format).
+
+        Args:
+            encrypted: Ciphertext from encrypt()
+
+        Returns:
+            Plaintext bytes, or None if authentication fails or replay detected
+        """
+        min_size = NONCE_SIZE + COUNTER_SIZE + MAC_SIZE
+        if len(encrypted) < min_size:
+            return None
+
+        nonce = encrypted[:NONCE_SIZE]
+        ciphertext = encrypted[NONCE_SIZE:-MAC_SIZE]
+        mac = encrypted[-MAC_SIZE:]
+
+        # Verify MAC first (constant-time)
+        expected_mac = hmac.new(
+            self._key, nonce + ciphertext, hashlib.sha256
+        ).digest()[:MAC_SIZE]
+
+        if not hmac.compare_digest(mac, expected_mac):
+            return None
+
+        # Decrypt
+        keystream = _generate_keystream(self._key, nonce, len(ciphertext))
+        decrypted = bytes(c ^ k for c, k in zip(ciphertext, keystream))
+
+        # Auto-detect v2 by timestamp range (2020-2100)
+        if len(decrypted) >= V2_HEADER_SIZE:
+            timestamp_bytes = decrypted[8:16]
+            timestamp_ms = struct.unpack("<Q", timestamp_bytes)[0]
+
+            if MIN_TIMESTAMP_MS <= timestamp_ms <= MAX_TIMESTAMP_MS:
+                # v2 format detected
+                pad_len = decrypted[16]
+
+                # Validate padding length is within protocol bounds (SECURITY: CVE-PENDING)
+                if pad_len < MIN_PADDING or pad_len > MAX_PADDING:
+                    return None
+
+                data_start = V2_HEADER_SIZE + pad_len
+
+                if len(decrypted) < data_start:
+                    return None
+
+                # Replay protection
+                if self._max_age_ms is not None:
+                    now_ms = int(time.time() * 1000)
+                    age = now_ms - timestamp_ms
+
+                    # Reject if too far in future (>5s clock skew) or too old
+                    if timestamp_ms > now_ms + 5000 or age > self._max_age_ms:
+                        return None
+
+                return decrypted[data_start:]
+
+        # v1 format: skip counter (8 bytes)
+        return decrypted[COUNTER_SIZE:]
+
+    def decrypt_v1(self, encrypted: bytes) -> Optional[bytes]:
+        """
+        Decrypt v1 format explicitly (for legacy compatibility).
+
+        Args:
+            encrypted: Ciphertext from encrypt()
+
+        Returns:
+            Plaintext bytes, or None if authentication fails
+        """
+        min_size = NONCE_SIZE + COUNTER_SIZE + MAC_SIZE
+        if len(encrypted) < min_size:
+            return None
+
+        nonce = encrypted[:NONCE_SIZE]
+        ciphertext = encrypted[NONCE_SIZE:-MAC_SIZE]
+        mac = encrypted[-MAC_SIZE:]
+
+        # Verify MAC first (constant-time)
+        expected_mac = hmac.new(
+            self._key, nonce + ciphertext, hashlib.sha256
+        ).digest()[:MAC_SIZE]
+
+        if not hmac.compare_digest(mac, expected_mac):
+            return None
+
+        # Decrypt
+        keystream = _generate_keystream(self._key, nonce, len(ciphertext))
+        decrypted = bytes(c ^ k for c, k in zip(ciphertext, keystream))
+
+        # v1 format: skip counter (8 bytes)
+        return decrypted[COUNTER_SIZE:]
+
+    @property
+    def key(self) -> bytes:
+        """Get the derived key (for testing/debugging)."""
+        return self._key
+
+
+def _generate_keystream(key: bytes, nonce: bytes, length: int) -> bytes:
+    """
+    Generate keystream using SHA256 (AES-256-CTR equivalent).
+
+    Args:
+        key: 32-byte key
+        nonce: 16-byte nonce
+        length: Number of keystream bytes needed
+
+    Returns:
+        Keystream bytes
+    """
+    keystream = b""
+    num_blocks = (length + 31) // 32
+
+    for i in range(num_blocks):
+        counter = struct.pack("<I", i)
+        block = hashlib.sha256(key + nonce + counter).digest()
+        keystream += block
+
+    return keystream[:length]
+
+
+def quick_encrypt(key: bytes, data: bytes) -> bytes:
+    """
+    One-shot encrypt with pre-shared key (no password derivation).
+
+    Args:
+        key: 32-byte symmetric key
+        data: Data to encrypt
+
+    Returns:
+        Ciphertext in format: nonce(16) || encrypted_data || mac(16)
+
+    Example:
+        >>> key = os.urandom(32)
+        >>> encrypted = quick_encrypt(key, b"secret")
+        >>> decrypted = quick_decrypt(key, encrypted)
+    """
+    nonce = os.urandom(NONCE_SIZE)
+    keystream = _generate_keystream(key, nonce, len(data))
+    ciphertext = bytes(d ^ k for d, k in zip(data, keystream))
+    mac = hmac.new(key, nonce + ciphertext, hashlib.sha256).digest()[:MAC_SIZE]
+    return nonce + ciphertext + mac
+
+
+def quick_decrypt(key: bytes, encrypted: bytes) -> Optional[bytes]:
+    """
+    One-shot decrypt with pre-shared key.
+
+    Args:
+        key: 32-byte symmetric key
+        encrypted: Ciphertext from quick_encrypt()
+
+    Returns:
+        Plaintext bytes, or None if authentication fails
+    """
+    if len(encrypted) < NONCE_SIZE + MAC_SIZE:
+        return None
+
+    nonce = encrypted[:NONCE_SIZE]
+    ciphertext = encrypted[NONCE_SIZE:-MAC_SIZE]
+    mac = encrypted[-MAC_SIZE:]
+
+    expected_mac = hmac.new(key, nonce + ciphertext, hashlib.sha256).digest()[
+        :MAC_SIZE
+    ]
+
+    if not hmac.compare_digest(mac, expected_mac):
+        return None
+
+    keystream = _generate_keystream(key, nonce, len(ciphertext))
+    return bytes(c ^ k for c, k in zip(ciphertext, keystream))
+
+
+
+================================================
+FILE: shield-core/src/shield.rs
+================================================
+//! Core Shield encryption implementation.
+//!
+//! Matches Python `shield.py` byte-for-byte for interoperability.
+
+// Crypto block counters are intentionally u32 - data >4GB would have other issues
+#![allow(clippy::cast_possible_truncation)]
+
+use ring::{hmac, pbkdf2};
+use std::num::NonZeroU32;
+use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+use crate::error::{Result, ShieldError};
+
+/// PBKDF2 iteration count (matches Python implementation).
+const PBKDF2_ITERATIONS: u32 = 100_000;
+
+/// Nonce size in bytes.
+const NONCE_SIZE: usize = 16;
+
+/// MAC size in bytes.
+const MAC_SIZE: usize = 16;
+
+/// Minimum ciphertext size: nonce + counter(8) + mac.
+const MIN_CIPHERTEXT_SIZE: usize = NONCE_SIZE + 8 + MAC_SIZE;
+
+/// V2 header size: counter(8) + timestamp(8) + pad_len(1)
+const V2_HEADER_SIZE: usize = 17;
+
+/// Minimum padding size (bytes)
+const MIN_PADDING: usize = 32;
+
+/// Maximum padding size (bytes)
+const MAX_PADDING: usize = 128;
+
+/// Timestamp range for v2 detection (2020-01-01 to 2100-01-01 in milliseconds)
+const MIN_TIMESTAMP_MS: u64 = 1_577_836_800_000;
+const MAX_TIMESTAMP_MS: u64 = 4_102_444_800_000;
+
+/// EXPTIME-secure symmetric encryption.
+///
+/// Uses password-derived keys with PBKDF2 and encrypts using
+/// a SHA256-based stream cipher with HMAC-SHA256 authentication.
+/// Breaking requires 2^256 operations - no shortcut exists.
+///
+/// **Version 2** adds replay protection and length obfuscation:
+/// - Timestamp validation prevents replay attacks
+/// - Random padding (32-128 bytes) obfuscates message length
+///
+/// Key material is securely zeroized from memory when dropped.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct Shield {
+    key: [u8; 32],
+    #[zeroize(skip)]
+    #[allow(dead_code)]
+    counter: u64,
+    /// Maximum message age in milliseconds (None = no replay protection)
+    #[zeroize(skip)]
+    max_age_ms: Option<u64>,
+}
+
+impl Shield {
+    /// Create a new Shield instance from password and service name.
+    ///
+    /// # Arguments
+    /// * `password` - User's password
+    /// * `service` - Service identifier (e.g., "github.com")
+    ///
+    /// # Example
+    /// ```
+    /// use shield_core::Shield;
+    /// let shield = Shield::new("my_password", "example.com");
+    /// ```
+    #[must_use]
+    pub fn new(password: &str, service: &str) -> Self {
+        // Derive salt from service name (matches Python)
+        let salt = ring::digest::digest(&ring::digest::SHA256, service.as_bytes());
+
+        // Derive key using PBKDF2
+        let mut key = [0u8; 32];
+        pbkdf2::derive(
+            pbkdf2::PBKDF2_HMAC_SHA256,
+            NonZeroU32::new(PBKDF2_ITERATIONS).unwrap(),
+            salt.as_ref(),
+            password.as_bytes(),
+            &mut key,
+        );
+
+        Self {
+            key,
+            counter: 0,
+            max_age_ms: Some(60_000), // Default: 60 seconds
+        }
+    }
+
+    /// Create Shield with a pre-shared key (no password derivation).
+    #[must_use]
+    pub fn with_key(key: [u8; 32]) -> Self {
+        Self {
+            key,
+            counter: 0,
+            max_age_ms: Some(60_000),
+        }
+    }
+
+    /// Create Shield with hardware fingerprinting (device-bound encryption).
+    ///
+    /// Derives keys from password + hardware identifier, binding encryption to the physical device.
+    /// Keys cannot be transferred to other hardware without the correct fingerprint.
+    ///
+    /// # Arguments
+    /// * `password` - User's password
+    /// * `service` - Service identifier (e.g., "github.com")
+    /// * `mode` - Fingerprint collection mode (Motherboard, CPU, or Combined)
+    ///
+    /// # Example
+    /// ```
+    /// use shield_core::{Shield, FingerprintMode};
+    /// let shield = Shield::with_fingerprint("password", "example.com", FingerprintMode::Combined)?;
+    /// # Ok::<(), shield_core::ShieldError>(())
+    /// ```
+    ///
+    /// # Errors
+    /// Returns error if hardware fingerprint cannot be collected.
+    ///
+    /// # Security
+    /// - **Binding Strength**: MEDIUM (hardware IDs are stable but replaceable)
+    /// - **Spoofability**: LOW-MEDIUM (requires hardware access or VM manipulation)
+    /// - **Portability**: NONE (keys are device-bound by design)
+    pub fn with_fingerprint(
+        password: &str,
+        service: &str,
+        mode: crate::fingerprint::FingerprintMode,
+    ) -> Result<Self> {
+        // Collect hardware fingerprint
+        let fingerprint = crate::fingerprint::collect_fingerprint(mode)?;
+
+        // Combine password with fingerprint
+        let combined_password = if fingerprint.is_empty() {
+            password.to_string()
+        } else {
+            format!("{}:{}", password, fingerprint)
+        };
+
+        // Derive salt from service name
+        let salt = ring::digest::digest(&ring::digest::SHA256, service.as_bytes());
+
+        // Derive key using PBKDF2 with combined password
+        let mut key = [0u8; 32];
+        pbkdf2::derive(
+            pbkdf2::PBKDF2_HMAC_SHA256,
+            NonZeroU32::new(PBKDF2_ITERATIONS).unwrap(),
+            salt.as_ref(),
+            combined_password.as_bytes(),
+            &mut key,
+        );
+
+        Ok(Self {
+            key,
+            counter: 0,
+            max_age_ms: Some(60_000),
+        })
+    }
+
+    /// Set maximum message age for replay protection.
+    ///
+    /// # Arguments
+    /// * `max_age_ms` - Maximum age in milliseconds, or None to disable replay protection
+    #[must_use]
+    pub fn with_max_age(mut self, max_age_ms: Option<u64>) -> Self {
+        self.max_age_ms = max_age_ms;
+        self
+    }
+
+    /// Encrypt data (v2 format with replay protection and length obfuscation).
+    ///
+    /// Returns: `nonce(16) || ciphertext || mac(16)`
+    ///
+    /// Inner format: `counter(8) || timestamp_ms(8) || pad_len(1) || random_padding(32-128) || plaintext`
+    ///
+    /// # Errors
+    /// Returns error if random generation fails.
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        Self::encrypt_with_key(&self.key, plaintext)
+    }
+
+    /// Encrypt with explicit key (v2 format).
+    pub fn encrypt_with_key(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
+        // Generate random nonce
+        let nonce: [u8; NONCE_SIZE] = crate::random::random_bytes()?;
+
+        // Counter prefix (always 0 for compatibility)
+        let counter_bytes = 0u64.to_le_bytes();
+
+        // Timestamp in milliseconds since Unix epoch
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let timestamp_bytes = timestamp_ms.to_le_bytes();
+
+        // Random padding: 32-128 bytes
+        let pad_len_byte: [u8; 1] = crate::random::random_bytes()?;
+        let pad_len = (pad_len_byte[0] as usize % (MAX_PADDING - MIN_PADDING + 1)) + MIN_PADDING;
+        let padding = crate::random::random_vec(pad_len)?;
+
+        // Data to encrypt: counter || timestamp || pad_len || padding || plaintext
+        let mut data_to_encrypt = Vec::with_capacity(V2_HEADER_SIZE + pad_len + plaintext.len());
+        data_to_encrypt.extend_from_slice(&counter_bytes);
+        data_to_encrypt.extend_from_slice(&timestamp_bytes);
+        data_to_encrypt.push(pad_len as u8);
+        data_to_encrypt.extend_from_slice(&padding);
+        data_to_encrypt.extend_from_slice(plaintext);
+
+        // Generate keystream and XOR
+        let keystream = generate_keystream(key, &nonce, data_to_encrypt.len());
+        let ciphertext: Vec<u8> = data_to_encrypt
+            .iter()
+            .zip(keystream.iter())
+            .map(|(p, k)| p ^ k)
+            .collect();
+
+        // Compute HMAC over nonce || ciphertext
+        let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, key);
+        let mut hmac_data = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
+        hmac_data.extend_from_slice(&nonce);
+        hmac_data.extend_from_slice(&ciphertext);
+        let tag = hmac::sign(&hmac_key, &hmac_data);
+
+        // Format: nonce || ciphertext || mac(16)
+        let mut result = Vec::with_capacity(NONCE_SIZE + ciphertext.len() + MAC_SIZE);
+        result.extend_from_slice(&nonce);
+        result.extend_from_slice(&ciphertext);
+        result.extend_from_slice(&tag.as_ref()[..MAC_SIZE]);
+
+        Ok(result)
+    }
+
+    /// Decrypt and verify data (supports both v1 and v2 formats).
+    ///
+    /// Automatically detects v2 format by timestamp range and applies replay protection if configured.
+    ///
+    /// # Errors
+    /// Returns error if MAC verification fails, ciphertext is malformed, or message is expired.
+    pub fn decrypt(&self, encrypted: &[u8]) -> Result<Vec<u8>> {
+        Self::decrypt_with_max_age(&self.key, encrypted, self.max_age_ms)
+    }
+
+    /// Decrypt with explicit key (no replay protection).
+    pub fn decrypt_with_key(key: &[u8; 32], encrypted: &[u8]) -> Result<Vec<u8>> {
+        Self::decrypt_with_max_age(key, encrypted, Some(60_000))
+    }
+
+    /// Decrypt with explicit max age for replay protection.
+    pub fn decrypt_with_max_age(
+        key: &[u8; 32],
+        encrypted: &[u8],
+        max_age_ms: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        if encrypted.len() < MIN_CIPHERTEXT_SIZE {
+            return Err(ShieldError::CiphertextTooShort {
+                expected: MIN_CIPHERTEXT_SIZE,
+                actual: encrypted.len(),
+            });
+        }
+
+        // Parse components
+        let nonce = &encrypted[..NONCE_SIZE];
+        let ciphertext = &encrypted[NONCE_SIZE..encrypted.len() - MAC_SIZE];
+        let mac = &encrypted[encrypted.len() - MAC_SIZE..];
+
+        // Verify MAC first (constant-time)
+        let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, key);
+        let mut hmac_data = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
+        hmac_data.extend_from_slice(nonce);
+        hmac_data.extend_from_slice(ciphertext);
+        let expected_tag = hmac::sign(&hmac_key, &hmac_data);
+
+        // Constant-time comparison
+        if mac.ct_eq(&expected_tag.as_ref()[..MAC_SIZE]).unwrap_u8() != 1 {
+            return Err(ShieldError::AuthenticationFailed);
+        }
+
+        // Decrypt
+        let keystream = generate_keystream(key, nonce, ciphertext.len());
+        let decrypted: Vec<u8> = ciphertext
+            .iter()
+            .zip(keystream.iter())
+            .map(|(c, k)| c ^ k)
+            .collect();
+
+        // Check if this is v2 format by examining timestamp range
+        if decrypted.len() >= V2_HEADER_SIZE {
+            let timestamp_bytes = &decrypted[8..16];
+            let timestamp_ms = u64::from_le_bytes(timestamp_bytes.try_into().unwrap());
+
+            // Valid v2 timestamp range: 2020-2100
+            if (MIN_TIMESTAMP_MS..=MAX_TIMESTAMP_MS).contains(&timestamp_ms) {
+                // This is v2 format
+                let pad_len = decrypted[16] as usize;
+                let data_start = V2_HEADER_SIZE + pad_len;
+
+                if data_start > decrypted.len() {
+                    return Err(ShieldError::InvalidFormat);
+                }
+
+                // Replay protection (if enabled)
+                if let Some(max_age) = max_age_ms {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+
+                    let age = (now_ms as i64) - (timestamp_ms as i64);
+
+                    // Reject future timestamps (clock skew > 5s)
+                    if age < -5000 {
+                        return Err(ShieldError::InvalidFormat);
+                    }
+
+                    // Reject expired messages
+                    if age > max_age as i64 {
+                        return Err(ShieldError::InvalidFormat);
+                    }
+                }
+
+                return Ok(decrypted[data_start..].to_vec());
+            }
+        }
+
+        // v1 fallback: counter(8) || plaintext
+        Ok(decrypted[8..].to_vec())
+    }
+
+    /// Decrypt v1 format explicitly (for backward compatibility with legacy ciphertext).
+    ///
+    /// Always uses v1 parsing: skip 8-byte counter prefix, no timestamp check.
+    pub fn decrypt_v1(&self, encrypted: &[u8]) -> Result<Vec<u8>> {
+        Self::decrypt_v1_with_key(&self.key, encrypted)
+    }
+
+    /// Decrypt v1 format with explicit key.
+    pub fn decrypt_v1_with_key(key: &[u8; 32], encrypted: &[u8]) -> Result<Vec<u8>> {
+        if encrypted.len() < MIN_CIPHERTEXT_SIZE {
+            return Err(ShieldError::CiphertextTooShort {
+                expected: MIN_CIPHERTEXT_SIZE,
+                actual: encrypted.len(),
+            });
+        }
+
+        // Parse components
+        let nonce = &encrypted[..NONCE_SIZE];
+        let ciphertext = &encrypted[NONCE_SIZE..encrypted.len() - MAC_SIZE];
+        let mac = &encrypted[encrypted.len() - MAC_SIZE..];
+
+        // Verify MAC
+        let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, key);
+        let mut hmac_data = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
+        hmac_data.extend_from_slice(nonce);
+        hmac_data.extend_from_slice(ciphertext);
+        let expected_tag = hmac::sign(&hmac_key, &hmac_data);
+
+        if mac.ct_eq(&expected_tag.as_ref()[..MAC_SIZE]).unwrap_u8() != 1 {
+            return Err(ShieldError::AuthenticationFailed);
+        }
+
+        // Decrypt
+        let keystream = generate_keystream(key, nonce, ciphertext.len());
+        let decrypted: Vec<u8> = ciphertext
+            .iter()
+            .zip(keystream.iter())
+            .map(|(c, k)| c ^ k)
+            .collect();
+
+        // v1 format: skip 8-byte counter prefix
+        Ok(decrypted[8..].to_vec())
+    }
+
+    /// Get the derived key (for testing/debugging).
+    #[must_use]
+    pub fn key(&self) -> &[u8; 32] {
+        &self.key
+    }
+}
+
+/// Generate keystream using SHA256 (matches Python implementation).
+fn generate_keystream(key: &[u8], nonce: &[u8], length: usize) -> Vec<u8> {
+    let mut keystream = Vec::with_capacity(length.div_ceil(32) * 32);
+    let num_blocks = length.div_ceil(32);
+
+    for i in 0..num_blocks {
+        let counter = (i as u32).to_le_bytes();
+
+        // SHA256(key || nonce || counter)
+        let mut data = Vec::with_capacity(key.len() + nonce.len() + 4);
+        data.extend_from_slice(key);
+        data.extend_from_slice(nonce);
+        data.extend_from_slice(&counter);
+
+        let hash = ring::digest::digest(&ring::digest::SHA256, &data);
+        keystream.extend_from_slice(hash.as_ref());
+    }
+
+    keystream.truncate(length);
+    keystream
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_keystream_deterministic() {
+        let key = [1u8; 32];
+        let nonce = [2u8; 16];
+
+        let ks1 = generate_keystream(&key, &nonce, 64);
+        let ks2 = generate_keystream(&key, &nonce, 64);
+
+        assert_eq!(ks1, ks2);
+    }
+
+    #[test]
+    fn test_keystream_different_nonce() {
+        let key = [1u8; 32];
+        let nonce1 = [2u8; 16];
+        let nonce2 = [3u8; 16];
+
+        let ks1 = generate_keystream(&key, &nonce1, 32);
+        let ks2 = generate_keystream(&key, &nonce2, 32);
+
+        assert_ne!(ks1, ks2);
+    }
+
+    #[test]
+    fn test_encrypt_format_v2() {
+        let shield = Shield::new("password", "service");
+        let encrypted = shield.encrypt(b"test").unwrap();
+
+        // v2: nonce(16) + [counter(8) + timestamp(8) + pad_len(1) + padding(32-128) + plaintext(4)] + mac(16)
+        // Minimum: 16 + (17 + 32 + 4) + 16 = 85 bytes
+        // Maximum: 16 + (17 + 128 + 4) + 16 = 181 bytes
+        assert!(encrypted.len() >= 85 && encrypted.len() <= 181);
+    }
+
+    #[test]
+    fn test_v2_roundtrip() {
+        let shield = Shield::new("password", "service");
+        let plaintext = b"Hello, Shield v2!";
+
+        let encrypted = shield.encrypt(plaintext).unwrap();
+        let decrypted = shield.decrypt(&encrypted).unwrap();
+
+        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
+    }
+
+    #[test]
+    fn test_v2_replay_protection_fresh() {
+        let shield = Shield::new("password", "service");
+        let encrypted = shield.encrypt(b"fresh message").unwrap();
+
+        // Decrypt immediately - should succeed
+        let decrypted = shield.decrypt(&encrypted).unwrap();
+        assert_eq!(b"fresh message", decrypted.as_slice());
+    }
+
+    #[test]
+    fn test_v2_replay_protection_disabled() {
+        let shield = Shield::new("password", "service").with_max_age(None);
+        let encrypted = shield.encrypt(b"no expiry").unwrap();
+
+        // Should always work with replay protection disabled
+        let decrypted = shield.decrypt(&encrypted).unwrap();
+        assert_eq!(b"no expiry", decrypted.as_slice());
+    }
+
+    #[test]
+    fn test_v2_length_variation() {
+        let shield = Shield::new("password", "service");
+        let plaintext = b"same message";
+
+        // Encrypt same plaintext multiple times
+        let mut lengths = std::collections::HashSet::new();
+        for _ in 0..20 {
+            let encrypted = shield.encrypt(plaintext).unwrap();
+            lengths.insert(encrypted.len());
+        }
+
+        // Due to random padding (32-128 bytes), should have multiple unique lengths
+        assert!(lengths.len() > 1, "Expected length variation due to random padding");
+    }
+
+    #[test]
+    fn test_v1_backward_compat() {
+        // Create a v1-format ciphertext manually (no timestamp, no padding)
+        let key = [1u8; 32];
+        let plaintext = b"v1 message";
+
+        // v1 format: nonce(16) || [counter(8) || plaintext] || mac(16)
+        let nonce: [u8; 16] = [2u8; 16];
+        let counter_bytes = 0u64.to_le_bytes();
+
+        let mut data_to_encrypt = Vec::new();
+        data_to_encrypt.extend_from_slice(&counter_bytes);
+        data_to_encrypt.extend_from_slice(plaintext);
+
+        let keystream = generate_keystream(&key, &nonce, data_to_encrypt.len());
+        let ciphertext: Vec<u8> = data_to_encrypt
+            .iter()
+            .zip(keystream.iter())
+            .map(|(p, k)| p ^ k)
+            .collect();
+
+        let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, &key);
+        let mut hmac_data = Vec::new();
+        hmac_data.extend_from_slice(&nonce);
+        hmac_data.extend_from_slice(&ciphertext);
+        let tag = hmac::sign(&hmac_key, &hmac_data);
+
+        let mut v1_encrypted = Vec::new();
+        v1_encrypted.extend_from_slice(&nonce);
+        v1_encrypted.extend_from_slice(&ciphertext);
+        v1_encrypted.extend_from_slice(&tag.as_ref()[..16]);
+
+        // v2 decrypt() should handle v1 format via fallback
+        let shield = Shield::with_key(key);
+        let decrypted = shield.decrypt(&v1_encrypted).unwrap();
+        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
+    }
+
+    #[test]
+    fn test_v1_explicit_decrypt() {
+        // Create v1 ciphertext
+        let key = [3u8; 32];
+        let plaintext = b"explicit v1";
+
+        let nonce: [u8; 16] = [4u8; 16];
+        let counter_bytes = 0u64.to_le_bytes();
+
+        let mut data_to_encrypt = Vec::new();
+        data_to_encrypt.extend_from_slice(&counter_bytes);
+        data_to_encrypt.extend_from_slice(plaintext);
+
+        let keystream = generate_keystream(&key, &nonce, data_to_encrypt.len());
+        let ciphertext: Vec<u8> = data_to_encrypt
+            .iter()
+            .zip(keystream.iter())
+            .map(|(p, k)| p ^ k)
+            .collect();
+
+        let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, &key);
+        let mut hmac_data = Vec::new();
+        hmac_data.extend_from_slice(&nonce);
+        hmac_data.extend_from_slice(&ciphertext);
+        let tag = hmac::sign(&hmac_key, &hmac_data);
+
+        let mut v1_encrypted = Vec::new();
+        v1_encrypted.extend_from_slice(&nonce);
+        v1_encrypted.extend_from_slice(&ciphertext);
+        v1_encrypted.extend_from_slice(&tag.as_ref()[..16]);
+
+        // Use explicit v1 decrypt
+        let shield = Shield::with_key(key);
+        let decrypted = shield.decrypt_v1(&v1_encrypted).unwrap();
+        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
+    }
+
+    #[test]
+    fn test_tamper_detection_v2() {
+        let shield = Shield::new("password", "service");
+        let mut encrypted = shield.encrypt(b"data").unwrap();
+
+        // Tamper with ciphertext
+        encrypted[20] ^= 0xFF;
+
+        // Should fail MAC verification
+        assert!(shield.decrypt(&encrypted).is_err());
+    }
+}
+
+
+
+================================================
+FILE: swift/Sources/Shield/Shield.swift
+================================================
+import Foundation
+import CommonCrypto
+
+/// Shield - EXPTIME-Secure Symmetric Encryption Library
+///
+/// Uses only symmetric cryptographic primitives with proven exponential-time security:
+/// PBKDF2-SHA256, HMAC-SHA256, and SHA256-based stream cipher.
+/// Breaking requires 2^256 operations - no shortcut exists.
+public class Shield {
+    public static let keySize = 32
+    public static let nonceSize = 16
+    public static let macSize = 16
+    public static let iterations: UInt32 = 100_000
+    public static let minCiphertextSize = nonceSize + 8 + macSize
+
+    private var key: [UInt8]
+
+    /// Create Shield from password and service name.
+    public init(password: String, service: String) {
+        let salt = Shield.sha256(Array(service.utf8))
+        self.key = Shield.pbkdf2(password: password, salt: salt, iterations: Shield.iterations, keyLength: Shield.keySize)
+    }
+
+    /// Create Shield with pre-shared key.
+    public init(key: [UInt8]) throws {
+        guard key.count == Shield.keySize else {
+            throw ShieldError.invalidKeySize
+        }
+        self.key = key
+    }
+
+    /// Encrypt plaintext.
+    public func encrypt(_ plaintext: [UInt8]) throws -> [UInt8] {
+        return try Shield.encryptWithKey(key, plaintext: plaintext)
+    }
+
+    /// Decrypt ciphertext.
+    public func decrypt(_ ciphertext: [UInt8]) throws -> [UInt8] {
+        return try Shield.decryptWithKey(key, ciphertext: ciphertext)
+    }
+
+    /// Get the derived key.
+    public func getKey() -> [UInt8] {
+        return key
+    }
+
+    /// Wipe key from memory.
+    public func wipe() {
+        for i in 0..<key.count {
+            key[i] = 0
+        }
+    }
+
+    // MARK: - Static Methods
+
+    /// Quick encrypt with explicit key.
+    public static func quickEncrypt(key: [UInt8], plaintext: [UInt8]) throws -> [UInt8] {
+        guard key.count == keySize else {
+            throw ShieldError.invalidKeySize
+        }
+        return try encryptWithKey(key, plaintext: plaintext)
+    }
+
+    /// Quick decrypt with explicit key.
+    public static func quickDecrypt(key: [UInt8], ciphertext: [UInt8]) throws -> [UInt8] {
+        guard key.count == keySize else {
+            throw ShieldError.invalidKeySize
+        }
+        return try decryptWithKey(key, ciphertext: ciphertext)
+    }
+
+    private static func encryptWithKey(_ key: [UInt8], plaintext: [UInt8]) throws -> [UInt8] {
+        // Generate random nonce
+        var nonce = [UInt8](repeating: 0, count: nonceSize)
+        guard SecRandomCopyBytes(kSecRandomDefault, nonceSize, &nonce) == errSecSuccess else {
+            throw ShieldError.randomGenerationFailed
+        }
+
+        // Counter prefix (8 bytes of zeros)
+        var dataToEncrypt = [UInt8](repeating: 0, count: 8) + plaintext
+
+        // Generate keystream and XOR
+        let keystream = generateKeystream(key: key, nonce: nonce, length: dataToEncrypt.count)
+        var ciphertext = [UInt8](repeating: 0, count: dataToEncrypt.count)
+        for i in 0..<dataToEncrypt.count {
+            ciphertext[i] = dataToEncrypt[i] ^ keystream[i]
+        }
+
+        // Compute HMAC over nonce || ciphertext
+        let macData = nonce + ciphertext
+        let mac = hmacSha256(key: key, data: macData)
+
+        // Format: nonce || ciphertext || mac
+        return nonce + ciphertext + Array(mac.prefix(macSize))
+    }
+
+    private static func decryptWithKey(_ key: [UInt8], ciphertext encrypted: [UInt8]) throws -> [UInt8] {
+        guard encrypted.count >= minCiphertextSize else {
+            throw ShieldError.ciphertextTooShort
+        }
+
+        // Parse components
+        let nonce = Array(encrypted.prefix(nonceSize))
+        let ciphertext = Array(encrypted[nonceSize..<(encrypted.count - macSize)])
+        let receivedMac = Array(encrypted.suffix(macSize))
+
+        // Verify MAC
+        let macData = nonce + ciphertext
+        let expectedMac = Array(hmacSha256(key: key, data: macData).prefix(macSize))
+
+        guard constantTimeEquals(receivedMac, expectedMac) else {
+            throw ShieldError.authenticationFailed
+        }
+
+        // Decrypt
+        let keystream = generateKeystream(key: key, nonce: nonce, length: ciphertext.count)
+        var decrypted = [UInt8](repeating: 0, count: ciphertext.count)
+        for i in 0..<ciphertext.count {
+            decrypted[i] = ciphertext[i] ^ keystream[i]
+        }
+
+        // Skip 8-byte counter prefix
+        return Array(decrypted.dropFirst(8))
+    }
+
+    private static func generateKeystream(key: [UInt8], nonce: [UInt8], length: Int) -> [UInt8] {
+        let numBlocks = (length + 31) / 32
+        var keystream = [UInt8]()
+        keystream.reserveCapacity(numBlocks * 32)
+
+        for i in 0..<numBlocks {
+            var block = key + nonce
+            block.append(contentsOf: withUnsafeBytes(of: UInt32(i).littleEndian) { Array($0) })
+            let hash = sha256(block)
+            keystream.append(contentsOf: hash)
+        }
+
+        return Array(keystream.prefix(length))
+    }
+
+    // MARK: - Crypto Utilities
+
+    public static func sha256(_ data: [UInt8]) -> [UInt8] {
+        var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        data.withUnsafeBytes { buffer in
+            _ = CC_SHA256(buffer.baseAddress, CC_LONG(data.count), &hash)
+        }
+        return hash
+    }
+
+    public static func hmacSha256(key: [UInt8], data: [UInt8]) -> [UInt8] {
+        var mac = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        key.withUnsafeBytes { keyBuffer in
+            data.withUnsafeBytes { dataBuffer in
+                CCHmac(CCHmacAlgorithm(kCCHmacAlgSHA256),
+                       keyBuffer.baseAddress, key.count,
+                       dataBuffer.baseAddress, data.count,
+                       &mac)
+            }
+        }
+        return mac
+    }
+
+    public static func pbkdf2(password: String, salt: [UInt8], iterations: UInt32, keyLength: Int) -> [UInt8] {
+        var derivedKey = [UInt8](repeating: 0, count: keyLength)
+        let passwordData = Array(password.utf8)
+
+        passwordData.withUnsafeBytes { passwordBuffer in
+            salt.withUnsafeBytes { saltBuffer in
+                CCKeyDerivationPBKDF(
+                    CCPBKDFAlgorithm(kCCPBKDF2),
+                    passwordBuffer.baseAddress?.assumingMemoryBound(to: Int8.self),
+                    passwordData.count,
+                    saltBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    salt.count,
+                    CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256),
+                    iterations,
+                    &derivedKey,
+                    keyLength
+                )
+            }
+        }
+
+        return derivedKey
+    }
+
+    public static func constantTimeEquals(_ a: [UInt8], _ b: [UInt8]) -> Bool {
+        guard a.count == b.count else { return false }
+        var result: UInt8 = 0
+        for i in 0..<a.count {
+            result |= a[i] ^ b[i]
+        }
+        return result == 0
+    }
+
+    public static func randomBytes(_ count: Int) -> [UInt8]? {
+        var bytes = [UInt8](repeating: 0, count: count)
+        guard SecRandomCopyBytes(kSecRandomDefault, count, &bytes) == errSecSuccess else {
+            return nil
+        }
+        return bytes
+    }
+
+    public static func secureWipe(_ data: inout [UInt8]) {
+        for i in 0..<data.count {
+            data[i] = 0
+        }
+    }
+}
+
+// MARK: - Errors
+
+public enum ShieldError: Error {
+    case invalidKeySize
+    case ciphertextTooShort
+    case authenticationFailed
+    case randomGenerationFailed
+    case lamportKeyUsed
+    case replayDetected
+    case outOfOrder
+    case tokenExpired
+    case invalidToken
+    case sessionExpired
+}
+
+

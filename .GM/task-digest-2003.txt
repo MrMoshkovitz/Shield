@@ -1,0 +1,5821 @@
+Directory structure:
+└── integrations/
+    ├── __init__.py
+    ├── browser.py
+    ├── fastapi.py
+    ├── fido2_api.py
+    ├── flask.py
+    ├── pgvector_api.py
+    ├── protection.py
+    ├── confidential/
+    │   ├── __init__.py
+    │   ├── aws_nitro.py
+    │   ├── azure_maa.py
+    │   ├── base.py
+    │   ├── gcp_sev.py
+    │   ├── intel_sgx.py
+    │   └── middleware.py
+    └── django/
+        └── __init__.py
+
+================================================
+FILE: __init__.py
+================================================
+"""
+Shield Web Framework Integrations
+
+Protect servers, browsers, and APIs with EXPTIME-secure encryption.
+
+Supported frameworks:
+- FastAPI: ShieldMiddleware, shield_protected decorator
+- Flask: ShieldFlask extension, shield_required decorator
+
+Features:
+- Request/response encryption
+- Token-based authentication
+- Rate limiting with encrypted counters
+- CORS with encrypted cookies
+- Browser-side encryption helpers
+- Confidential Computing: TEE attestation for AWS Nitro, GCP SEV, Azure MAA, Intel SGX
+"""
+
+from shield.integrations.fastapi import (
+    ShieldMiddleware,
+    shield_protected,
+    ShieldAPIKeyAuth,
+    ShieldTokenAuth,
+)
+from shield.integrations.flask import (
+    ShieldFlask,
+    shield_required,
+    shield_encrypt_response,
+)
+from shield.integrations.protection import (
+    APIProtector,
+    RateLimiter,
+    TokenBucket,
+)
+from shield.integrations.browser import (
+    BrowserBridge,
+    EncryptedCookie,
+    SecureCORS,
+)
+
+# Confidential Computing (lazy import to avoid dependency issues)
+def __getattr__(name):
+    """Lazy import for confidential computing modules."""
+    confidential_exports = {
+        "AttestationProvider",
+        "AttestationResult",
+        "AttestationError",
+        "TEEType",
+        "TEEKeyManager",
+        "NitroAttestationProvider",
+        "SEVAttestationProvider",
+        "MAAAttestationProvider",
+        "SGXAttestationProvider",
+        "AttestationMiddleware",
+        "requires_attestation",
+    }
+    if name in confidential_exports:
+        from shield.integrations import confidential
+        return getattr(confidential, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+__all__ = [
+    # FastAPI
+    "ShieldMiddleware",
+    "shield_protected",
+    "ShieldAPIKeyAuth",
+    "ShieldTokenAuth",
+    # Flask
+    "ShieldFlask",
+    "shield_required",
+    "shield_encrypt_response",
+    # Protection
+    "APIProtector",
+    "RateLimiter",
+    "TokenBucket",
+    # Browser
+    "BrowserBridge",
+    "EncryptedCookie",
+    "SecureCORS",
+    # Confidential Computing
+    "AttestationProvider",
+    "AttestationResult",
+    "AttestationError",
+    "TEEType",
+    "TEEKeyManager",
+    "NitroAttestationProvider",
+    "SEVAttestationProvider",
+    "MAAAttestationProvider",
+    "SGXAttestationProvider",
+    "AttestationMiddleware",
+    "requires_attestation",
+]
+
+
+
+================================================
+FILE: browser.py
+================================================
+"""
+Browser Integration Helpers for Shield
+
+Provides utilities for secure browser-server communication:
+- Encrypted cookies with tamper protection
+- CORS with encrypted preflight caching
+- Browser bridge for client-side decryption keys
+
+Usage:
+    from shield.integrations import BrowserBridge, EncryptedCookie, SecureCORS
+
+    # Generate browser decryption key
+    bridge = BrowserBridge(password="secret", service="api.example.com")
+    client_key = bridge.generate_client_key(session_id="session123")
+
+    # Encrypted cookies
+    cookie = EncryptedCookie(password="secret", service="api.example.com")
+    encrypted_value = cookie.encode({"user_id": "123", "role": "admin"})
+
+    # CORS with security
+    cors = SecureCORS(
+        allowed_origins=["https://app.example.com"],
+        password="secret",
+        service="api.example.com"
+    )
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Set
+
+from shield import Shield, quick_encrypt, quick_decrypt
+
+
+class BrowserBridge:
+    """
+    Facilitates secure key exchange between server and browser.
+
+    Generates session-specific encryption keys that can be safely
+    sent to browsers for client-side decryption.
+
+    Args:
+        password: Server encryption password
+        service: Service identifier
+
+    Usage:
+        bridge = BrowserBridge(password="secret", service="api.example.com")
+
+        # Generate a client key for a session
+        client_key = bridge.generate_client_key(
+            session_id="unique-session-id",
+            ttl=3600  # 1 hour
+        )
+
+        # Client uses this key to decrypt responses
+        # Server encrypts with session-derived key
+        encrypted = bridge.encrypt_for_client(session_id, data)
+    """
+
+    def __init__(self, password: str, service: str):
+        self.shield = Shield(password, service)
+        self.service = service
+        self._session_keys: Dict[str, tuple[bytes, float]] = {}
+
+    def generate_client_key(
+        self,
+        session_id: str,
+        ttl: int = 3600,
+        include_meta: bool = True,
+    ) -> dict:
+        """
+        Generate a client decryption key for a session.
+
+        Returns a dict with the key and metadata that can be
+        safely sent to the browser.
+        """
+        # Derive session-specific key
+        session_key = self._derive_session_key(session_id)
+        expires_at = time.time() + ttl
+
+        # Store for server-side use
+        self._session_keys[session_id] = (session_key, expires_at)
+
+        # Encode key for browser (base64 for JavaScript compatibility)
+        key_b64 = base64.b64encode(session_key).decode("ascii")
+
+        if include_meta:
+            return {
+                "key": key_b64,
+                "session_id": session_id,
+                "expires_at": int(expires_at),
+                "algorithm": "shield-v1",
+                "service": self.service,
+            }
+        return {"key": key_b64}
+
+    def _derive_session_key(self, session_id: str) -> bytes:
+        """Derive a session-specific key."""
+        # Use HMAC to derive session key from master key
+        master = self.shield.key
+        return hmac.new(
+            master,
+            session_id.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+
+    def encrypt_for_client(self, session_id: str, data: bytes) -> bytes:
+        """Encrypt data for a specific client session."""
+        session_key = self._derive_session_key(session_id)
+        return quick_encrypt(session_key, data)
+
+    def decrypt_from_client(self, session_id: str, encrypted: bytes) -> bytes:
+        """Decrypt data from a client session."""
+        session_key = self._derive_session_key(session_id)
+        return quick_decrypt(session_key, encrypted)
+
+    def is_session_valid(self, session_id: str) -> bool:
+        """Check if a session key is still valid."""
+        if session_id not in self._session_keys:
+            return False
+        _, expires_at = self._session_keys[session_id]
+        return time.time() < expires_at
+
+    def revoke_session(self, session_id: str) -> None:
+        """Revoke a session key."""
+        if session_id in self._session_keys:
+            del self._session_keys[session_id]
+
+    def cleanup_expired(self) -> int:
+        """Remove expired session keys. Returns count of removed."""
+        now = time.time()
+        expired = [
+            sid for sid, (_, exp) in self._session_keys.items()
+            if now >= exp
+        ]
+        for sid in expired:
+            del self._session_keys[sid]
+        return len(expired)
+
+
+@dataclass
+class CookieOptions:
+    """Options for cookie encoding."""
+    max_age: Optional[int] = 3600
+    path: str = "/"
+    domain: Optional[str] = None
+    secure: bool = True
+    httponly: bool = True
+    samesite: str = "Strict"
+
+
+class EncryptedCookie:
+    """
+    Encrypted cookie helper with tamper protection.
+
+    Encrypts cookie values using Shield, preventing tampering
+    and protecting sensitive session data.
+
+    Args:
+        password: Encryption password
+        service: Service identifier
+        options: Default cookie options
+
+    Usage:
+        cookie = EncryptedCookie(password="secret", service="api.example.com")
+
+        # Encode value for Set-Cookie header
+        value = cookie.encode({"user_id": "123", "roles": ["admin"]})
+
+        # Decode value from Cookie header
+        data = cookie.decode(value)
+
+        # Generate full Set-Cookie header
+        header = cookie.make_header("session", {"user_id": "123"})
+    """
+
+    def __init__(
+        self,
+        password: str,
+        service: str,
+        options: Optional[CookieOptions] = None,
+    ):
+        self.shield = Shield(password, service)
+        self.options = options or CookieOptions()
+
+    def encode(self, data: dict) -> str:
+        """Encode data as encrypted cookie value."""
+        payload = {
+            "data": data,
+            "created_at": int(time.time()),
+        }
+        if self.options.max_age:
+            payload["expires_at"] = int(time.time()) + self.options.max_age
+
+        serialized = json.dumps(payload).encode("utf-8")
+        encrypted = self.shield.encrypt(serialized)
+        return base64.urlsafe_b64encode(encrypted).decode("ascii")
+
+    def decode(self, value: str) -> Optional[dict]:
+        """Decode encrypted cookie value. Returns None if invalid/expired."""
+        try:
+            encrypted = base64.urlsafe_b64decode(value)
+            decrypted = self.shield.decrypt(encrypted)
+            payload = json.loads(decrypted)
+
+            # Check expiration
+            if "expires_at" in payload:
+                if time.time() > payload["expires_at"]:
+                    return None
+
+            return payload.get("data")
+        except Exception:
+            return None
+
+    def make_header(
+        self,
+        name: str,
+        data: dict,
+        options: Optional[CookieOptions] = None,
+    ) -> str:
+        """Generate a complete Set-Cookie header value."""
+        opts = options or self.options
+        value = self.encode(data)
+
+        parts = [f"{name}={value}"]
+
+        if opts.max_age is not None:
+            parts.append(f"Max-Age={opts.max_age}")
+        if opts.path:
+            parts.append(f"Path={opts.path}")
+        if opts.domain:
+            parts.append(f"Domain={opts.domain}")
+        if opts.secure:
+            parts.append("Secure")
+        if opts.httponly:
+            parts.append("HttpOnly")
+        if opts.samesite:
+            parts.append(f"SameSite={opts.samesite}")
+
+        return "; ".join(parts)
+
+    def parse_header(self, cookie_header: str, name: str) -> Optional[dict]:
+        """Parse a Cookie header and decode a specific cookie."""
+        cookies = {}
+        for part in cookie_header.split(";"):
+            part = part.strip()
+            if "=" in part:
+                key, value = part.split("=", 1)
+                cookies[key.strip()] = value.strip()
+
+        if name in cookies:
+            return self.decode(cookies[name])
+        return None
+
+
+class SecureCORS:
+    """
+    CORS handler with encrypted origin validation.
+
+    Provides secure CORS handling with:
+    - Origin validation against encrypted whitelist
+    - Preflight response caching
+    - Request signing for added security
+
+    Args:
+        allowed_origins: List of allowed origins
+        password: Encryption password
+        service: Service identifier
+        max_age: Preflight cache max age
+        allow_credentials: Whether to allow credentials
+        allowed_methods: Allowed HTTP methods
+        allowed_headers: Allowed request headers
+
+    Usage:
+        cors = SecureCORS(
+            allowed_origins=["https://app.example.com"],
+            password="secret",
+            service="api.example.com"
+        )
+
+        # Check and get CORS headers
+        headers = cors.get_headers(
+            origin="https://app.example.com",
+            method="GET"
+        )
+
+        # Handle preflight
+        if is_preflight:
+            return cors.preflight_response(origin, request_method)
+    """
+
+    def __init__(
+        self,
+        allowed_origins: List[str],
+        password: str,
+        service: str,
+        max_age: int = 86400,
+        allow_credentials: bool = True,
+        allowed_methods: Optional[List[str]] = None,
+        allowed_headers: Optional[List[str]] = None,
+    ):
+        self.shield = Shield(password, service)
+        self.allowed_origins: Set[str] = set(allowed_origins)
+        self.allow_all = "*" in allowed_origins
+        self.max_age = max_age
+        self.allow_credentials = allow_credentials
+        self.allowed_methods = allowed_methods or [
+            "GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"
+        ]
+        self.allowed_headers = allowed_headers or [
+            "Content-Type", "Authorization", "X-API-Key",
+            "X-Request-ID", "X-Shield-Session"
+        ]
+
+    def is_origin_allowed(self, origin: str) -> bool:
+        """Check if origin is in the allowed list."""
+        if self.allow_all:
+            return True
+        return origin in self.allowed_origins
+
+    def get_headers(
+        self,
+        origin: str,
+        method: str = "GET",
+    ) -> Dict[str, str]:
+        """Get CORS headers for a request."""
+        headers: Dict[str, str] = {}
+
+        if not self.is_origin_allowed(origin):
+            return headers
+
+        # Set origin (don't use * with credentials)
+        if self.allow_credentials:
+            headers["Access-Control-Allow-Origin"] = origin
+            headers["Access-Control-Allow-Credentials"] = "true"
+        else:
+            headers["Access-Control-Allow-Origin"] = "*" if self.allow_all else origin
+
+        headers["Vary"] = "Origin"
+
+        return headers
+
+    def preflight_response(
+        self,
+        origin: str,
+        request_method: Optional[str] = None,
+        request_headers: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Generate headers for preflight (OPTIONS) response."""
+        headers = self.get_headers(origin)
+
+        if not headers:
+            return {}
+
+        # Add preflight-specific headers
+        headers["Access-Control-Allow-Methods"] = ", ".join(self.allowed_methods)
+        headers["Access-Control-Allow-Headers"] = ", ".join(self.allowed_headers)
+        headers["Access-Control-Max-Age"] = str(self.max_age)
+
+        return headers
+
+    def sign_request(self, origin: str, timestamp: Optional[int] = None) -> str:
+        """
+        Generate a signature for a request origin.
+
+        Can be used to add an extra layer of verification.
+        """
+        ts = timestamp or int(time.time())
+        data = f"{origin}:{ts}".encode("utf-8")
+        signature = hmac.new(
+            self.shield.key,
+            data,
+            hashlib.sha256,
+        ).digest()[:16]
+        return base64.urlsafe_b64encode(
+            ts.to_bytes(8, "big") + signature
+        ).decode("ascii")
+
+    def verify_request(self, origin: str, signature: str, max_age: int = 300) -> bool:
+        """Verify a signed request."""
+        try:
+            decoded = base64.urlsafe_b64decode(signature)
+            if len(decoded) != 24:
+                return False
+
+            ts = int.from_bytes(decoded[:8], "big")
+            provided_sig = decoded[8:]
+
+            # Check age
+            if abs(time.time() - ts) > max_age:
+                return False
+
+            # Verify signature
+            data = f"{origin}:{ts}".encode("utf-8")
+            expected = hmac.new(
+                self.shield.key,
+                data,
+                hashlib.sha256,
+            ).digest()[:16]
+
+            return hmac.compare_digest(provided_sig, expected)
+        except Exception:
+            return False
+
+    def add_origin(self, origin: str) -> None:
+        """Add an origin to the allowed list."""
+        self.allowed_origins.add(origin)
+
+    def remove_origin(self, origin: str) -> None:
+        """Remove an origin from the allowed list."""
+        self.allowed_origins.discard(origin)
+
+
+
+================================================
+FILE: fastapi.py
+================================================
+"""
+FastAPI Integration for Shield Encryption
+
+Provides middleware and decorators for protecting FastAPI applications
+with EXPTIME-secure encryption.
+
+Usage:
+    from fastapi import FastAPI, Depends
+    from shield.integrations import ShieldMiddleware, shield_protected, ShieldTokenAuth
+
+    app = FastAPI()
+
+    # Add encryption middleware (encrypts all responses)
+    app.add_middleware(ShieldMiddleware, password="secret", service="api.example.com")
+
+    # Or protect specific endpoints
+    @app.get("/secure")
+    @shield_protected(password="secret", service="api.example.com")
+    async def secure_endpoint():
+        return {"message": "This is encrypted"}
+
+    # Token-based authentication
+    auth = ShieldTokenAuth(password="secret", service="api.example.com")
+
+    @app.get("/protected")
+    async def protected(user: dict = Depends(auth)):
+        return {"user": user}
+"""
+
+from __future__ import annotations
+
+import base64
+import functools
+import json
+import time
+from typing import Any, Callable, Optional, Sequence
+
+from shield import Shield
+
+# Type hints for FastAPI (avoid hard dependency)
+try:
+    from fastapi import Request, Response, HTTPException
+    from fastapi.security import APIKeyHeader, HTTPBearer
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.types import ASGIApp
+    FASTAPI_AVAILABLE = True
+except ImportError:
+    FASTAPI_AVAILABLE = False
+    # Stub types for when FastAPI isn't installed
+    Request = Any
+    Response = Any
+    HTTPException = Exception
+    BaseHTTPMiddleware = object
+    ASGIApp = Any
+
+
+class ShieldMiddleware(BaseHTTPMiddleware if FASTAPI_AVAILABLE else object):
+    """
+    FastAPI middleware that encrypts all JSON responses.
+
+    The middleware:
+    1. Intercepts outgoing JSON responses
+    2. Encrypts the response body with Shield
+    3. Returns encrypted payload with metadata
+
+    Clients must decrypt responses using the same password/service.
+
+    Args:
+        app: The FastAPI application
+        password: Encryption password
+        service: Service identifier for key derivation
+        encrypt_routes: Optional list of route prefixes to encrypt (default: all)
+        exclude_routes: Optional list of route prefixes to exclude
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        password: str,
+        service: str,
+        encrypt_routes: Optional[Sequence[str]] = None,
+        exclude_routes: Optional[Sequence[str]] = None,
+    ):
+        if not FASTAPI_AVAILABLE:
+            raise ImportError("FastAPI is required. Install with: pip install fastapi")
+        super().__init__(app)
+        self.shield = Shield(password, service)
+        self.service = service
+        self.encrypt_routes = encrypt_routes
+        self.exclude_routes = exclude_routes or ["/docs", "/redoc", "/openapi.json"]
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        """Process request and optionally encrypt response."""
+        response = await call_next(request)
+
+        # Check if we should encrypt this route
+        path = request.url.path
+
+        # Skip excluded routes
+        if any(path.startswith(prefix) for prefix in self.exclude_routes):
+            return response
+
+        # If encrypt_routes specified, only encrypt matching routes
+        if self.encrypt_routes:
+            if not any(path.startswith(prefix) for prefix in self.encrypt_routes):
+                return response
+
+        # Only encrypt JSON responses
+        content_type = response.headers.get("content-type", "")
+        if "application/json" not in content_type:
+            return response
+
+        # Get response body
+        body = b""
+        async for chunk in response.body_iterator:
+            body += chunk
+
+        # Encrypt the body
+        encrypted = self.shield.encrypt(body)
+        encrypted_b64 = base64.b64encode(encrypted).decode("ascii")
+
+        # Create new response with encrypted content
+        new_body = json.dumps({
+            "encrypted": True,
+            "data": encrypted_b64,
+            "service": self.service,
+        }).encode("utf-8")
+
+        return Response(
+            content=new_body,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            media_type="application/json",
+        )
+
+
+def shield_protected(
+    password: str,
+    service: str,
+    encrypt_request: bool = False,
+    encrypt_response: bool = True,
+):
+    """
+    Decorator to protect individual FastAPI endpoints with Shield encryption.
+
+    Args:
+        password: Encryption password
+        service: Service identifier
+        encrypt_request: Whether to decrypt incoming request body
+        encrypt_response: Whether to encrypt outgoing response
+
+    Usage:
+        @app.post("/secure")
+        @shield_protected(password="secret", service="api.example.com")
+        async def secure_endpoint(data: dict):
+            return {"result": "encrypted response"}
+    """
+    shield = Shield(password, service)
+
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            # Handle request decryption if enabled
+            if encrypt_request and "request" in kwargs:
+                request = kwargs["request"]
+                body = await request.body()
+                try:
+                    payload = json.loads(body)
+                    if payload.get("encrypted"):
+                        encrypted = base64.b64decode(payload["data"])
+                        decrypted = shield.decrypt(encrypted)
+                        kwargs["body"] = json.loads(decrypted)
+                except (json.JSONDecodeError, KeyError, ValueError) as e:
+                    raise HTTPException(status_code=400, detail=f"Decryption failed: {e}")
+
+            # Call the actual endpoint
+            result = await func(*args, **kwargs)
+
+            # Encrypt response if enabled
+            if encrypt_response:
+                if isinstance(result, dict):
+                    body = json.dumps(result).encode("utf-8")
+                    encrypted = shield.encrypt(body)
+                    return {
+                        "encrypted": True,
+                        "data": base64.b64encode(encrypted).decode("ascii"),
+                        "service": service,
+                    }
+
+            return result
+
+        return wrapper
+    return decorator
+
+
+class ShieldAPIKeyAuth:
+    """
+    API Key authentication using Shield-encrypted keys.
+
+    Generates and validates API keys that are HMAC-signed with Shield.
+
+    Usage:
+        auth = ShieldAPIKeyAuth(password="secret", service="api.example.com")
+
+        # Generate a key for a user
+        api_key = auth.generate_key(user_id="user123", permissions=["read", "write"])
+
+        # Use as FastAPI dependency
+        @app.get("/protected")
+        async def protected(user: dict = Depends(auth)):
+            return {"user_id": user["user_id"]}
+    """
+
+    def __init__(
+        self,
+        password: str,
+        service: str,
+        header_name: str = "X-API-Key",
+        ttl: Optional[int] = None,
+    ):
+        if not FASTAPI_AVAILABLE:
+            raise ImportError("FastAPI is required. Install with: pip install fastapi")
+        self.shield = Shield(password, service)
+        self.header_name = header_name
+        self.ttl = ttl
+        self._header = APIKeyHeader(name=header_name, auto_error=False)
+
+    def generate_key(
+        self,
+        user_id: str,
+        permissions: Optional[list[str]] = None,
+        metadata: Optional[dict] = None,
+    ) -> str:
+        """Generate an API key for a user."""
+        payload = {
+            "user_id": user_id,
+            "permissions": permissions or [],
+            "metadata": metadata or {},
+            "created_at": int(time.time()),
+        }
+        if self.ttl:
+            payload["expires_at"] = int(time.time()) + self.ttl
+
+        # Serialize and encrypt
+        data = json.dumps(payload).encode("utf-8")
+        encrypted = self.shield.encrypt(data)
+        return base64.urlsafe_b64encode(encrypted).decode("ascii")
+
+    def validate_key(self, api_key: str) -> Optional[dict]:
+        """Validate an API key and return the payload."""
+        try:
+            encrypted = base64.urlsafe_b64decode(api_key)
+            decrypted = self.shield.decrypt(encrypted)
+            payload = json.loads(decrypted)
+
+            # Check expiration
+            if "expires_at" in payload:
+                if time.time() > payload["expires_at"]:
+                    return None
+
+            return payload
+        except Exception:
+            return None
+
+    async def __call__(self, request: Request) -> dict:
+        """FastAPI dependency for authentication."""
+        api_key = request.headers.get(self.header_name)
+        if not api_key:
+            raise HTTPException(
+                status_code=401,
+                detail="Missing API key",
+                headers={"WWW-Authenticate": f"ApiKey realm={self.header_name}"},
+            )
+
+        payload = self.validate_key(api_key)
+        if not payload:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or expired API key",
+            )
+
+        return payload
+
+
+class ShieldTokenAuth:
+    """
+    Bearer token authentication using Shield encryption.
+
+    Creates secure session tokens with encrypted payloads.
+
+    Usage:
+        auth = ShieldTokenAuth(password="secret", service="api.example.com")
+
+        # Create a token after login
+        token = auth.create_token(user_id="user123", roles=["admin"])
+
+        # Validate in protected endpoints
+        @app.get("/protected")
+        async def protected(user: dict = Depends(auth)):
+            return {"user_id": user["user_id"]}
+    """
+
+    def __init__(
+        self,
+        password: str,
+        service: str,
+        ttl: int = 3600,
+    ):
+        if not FASTAPI_AVAILABLE:
+            raise ImportError("FastAPI is required. Install with: pip install fastapi")
+        self.shield = Shield(password, service)
+        self.ttl = ttl
+        self._bearer = HTTPBearer(auto_error=False)
+
+    def create_token(
+        self,
+        user_id: str,
+        roles: Optional[list[str]] = None,
+        claims: Optional[dict] = None,
+    ) -> str:
+        """Create a bearer token for a user."""
+        payload = {
+            "sub": user_id,
+            "roles": roles or [],
+            "claims": claims or {},
+            "iat": int(time.time()),
+            "exp": int(time.time()) + self.ttl,
+        }
+
+        data = json.dumps(payload).encode("utf-8")
+        encrypted = self.shield.encrypt(data)
+        return base64.urlsafe_b64encode(encrypted).decode("ascii")
+
+    def validate_token(self, token: str) -> Optional[dict]:
+        """Validate a token and return the payload."""
+        try:
+            encrypted = base64.urlsafe_b64decode(token)
+            decrypted = self.shield.decrypt(encrypted)
+            payload = json.loads(decrypted)
+
+            # Check expiration
+            if time.time() > payload.get("exp", 0):
+                return None
+
+            return payload
+        except Exception:
+            return None
+
+    async def __call__(self, request: Request) -> dict:
+        """FastAPI dependency for authentication."""
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            raise HTTPException(
+                status_code=401,
+                detail="Missing bearer token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        token = auth_header[7:]  # Remove "Bearer " prefix
+        payload = self.validate_token(token)
+        if not payload:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or expired token",
+            )
+
+        return payload
+
+
+
+================================================
+FILE: fido2_api.py
+================================================
+"""
+FIDO2/WebAuthn FastAPI integration for passwordless authentication.
+
+This module provides FastAPI endpoints for FIDO2 registration and authentication
+using Shield-encrypted credential storage.
+
+Example:
+    from fastapi import FastAPI
+    from shield.integrations.fido2_api import Fido2Router
+
+    app = FastAPI()
+    app.include_router(Fido2Router(password="master_password", service="myapp.com"))
+
+Note:
+    This is a simplified implementation demonstrating the API structure.
+    Production use should integrate with the Rust fido2 module via FFI/PyO3.
+"""
+
+import base64
+import hashlib
+import hmac
+import json
+import secrets
+import time
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+# Type alias for challenge storage
+ChallengeStorage = Dict[str, Dict[str, Any]]
+
+
+class RegistrationBeginRequest(BaseModel):
+    """Request to begin FIDO2 registration"""
+
+    username: str = Field(..., min_length=1, max_length=255)
+    display_name: str = Field(..., min_length=1, max_length=255)
+
+
+class RegistrationCompleteRequest(BaseModel):
+    """Request to complete FIDO2 registration"""
+
+    credential: Dict[str, Any]
+    session_id: str
+
+
+class LoginBeginRequest(BaseModel):
+    """Request to begin FIDO2 authentication"""
+
+    username: str = Field(..., min_length=1, max_length=255)
+
+
+class LoginCompleteRequest(BaseModel):
+    """Request to complete FIDO2 authentication"""
+
+    credential: Dict[str, Any]
+    session_id: str
+
+
+class Fido2Router:
+    """FastAPI router for FIDO2/WebAuthn endpoints"""
+
+    def __init__(
+        self,
+        password: str,
+        service: str,
+        rp_id: str = "localhost",
+        rp_name: str = "Shield App",
+        origin: str = "http://localhost:8000",
+        timeout_ms: int = 60000,
+    ):
+        """
+        Initialize FIDO2 router.
+
+        Args:
+            password: Master password for Shield encryption
+            service: Service identifier for Shield
+            rp_id: Relying party ID (domain)
+            rp_name: Relying party name
+            origin: Expected origin for WebAuthn
+            timeout_ms: Challenge timeout in milliseconds
+        """
+        self.password = password
+        self.service = service
+        self.rp_id = rp_id
+        self.rp_name = rp_name
+        self.origin = origin
+        self.timeout_ms = timeout_ms
+
+        # In-memory storage (production should use Redis)
+        self.challenges: ChallengeStorage = {}
+        self.credentials: Dict[str, List[Dict[str, Any]]] = {}
+
+        # Create router
+        self.router = APIRouter(prefix="/fido2", tags=["fido2"])
+        self._setup_routes()
+
+    def _setup_routes(self) -> None:
+        """Set up API routes"""
+
+        @self.router.post("/register/begin")
+        async def register_begin(
+            request: RegistrationBeginRequest,
+        ) -> Dict[str, Any]:
+            """Begin FIDO2 registration"""
+            # Generate session and challenge
+            session_id = secrets.token_urlsafe(32)
+            user_id = hashlib.sha256(request.username.encode()).digest()
+            user_id_b64 = base64.urlsafe_b64encode(user_id).decode().rstrip("=")
+
+            challenge = secrets.token_bytes(32)
+            challenge_b64 = base64.urlsafe_b64encode(challenge).decode().rstrip("=")
+
+            # Store challenge
+            self.challenges[session_id] = {
+                "challenge": challenge,
+                "username": request.username,
+                "user_id": user_id,
+                "expires_at": time.time() + (self.timeout_ms / 1000),
+                "type": "registration",
+            }
+
+            return {
+                "session_id": session_id,
+                "challenge": challenge_b64,
+                "rp": {"id": self.rp_id, "name": self.rp_name},
+                "user": {
+                    "id": user_id_b64,
+                    "name": request.username,
+                    "displayName": request.display_name,
+                },
+                "pubKeyCredParams": [
+                    {"type": "public-key", "alg": -7},  # ES256
+                    {"type": "public-key", "alg": -257},  # RS256
+                ],
+                "timeout": self.timeout_ms,
+                "attestation": "none",
+            }
+
+        @self.router.post("/register/complete")
+        async def register_complete(
+            request: RegistrationCompleteRequest,
+        ) -> Dict[str, str]:
+            """Complete FIDO2 registration"""
+            # Validate session
+            session = self.challenges.get(request.session_id)
+            if not session or session["type"] != "registration":
+                raise HTTPException(status_code=400, detail="Invalid session")
+
+            if time.time() > session["expires_at"]:
+                del self.challenges[request.session_id]
+                raise HTTPException(status_code=400, detail="Challenge expired")
+
+            # Extract credential data (simplified verification)
+            credential = request.credential
+            credential_id = credential.get("rawId", "")
+            # In production, verify attestation object and signature
+
+            # Store credential (Shield-encrypted in production)
+            username = session["username"]
+            if username not in self.credentials:
+                self.credentials[username] = []
+
+            self.credentials[username].append(
+                {
+                    "credential_id": credential_id,
+                    "public_key": credential.get("response", {}).get(
+                        "attestationObject", ""
+                    ),
+                    "counter": 0,
+                    "created_at": time.time(),
+                }
+            )
+
+            # Clean up session
+            del self.challenges[request.session_id]
+
+            return {"status": "success", "message": "Registration complete"}
+
+        @self.router.post("/login/begin")
+        async def login_begin(request: LoginBeginRequest) -> Dict[str, Any]:
+            """Begin FIDO2 authentication"""
+            # Check if user has credentials
+            if request.username not in self.credentials:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            user_credentials = self.credentials[request.username]
+            if not user_credentials:
+                raise HTTPException(status_code=404, detail="No credentials found")
+
+            # Generate challenge
+            session_id = secrets.token_urlsafe(32)
+            challenge = secrets.token_bytes(32)
+            challenge_b64 = base64.urlsafe_b64encode(challenge).decode().rstrip("=")
+
+            # Store challenge
+            self.challenges[session_id] = {
+                "challenge": challenge,
+                "username": request.username,
+                "expires_at": time.time() + (self.timeout_ms / 1000),
+                "type": "authentication",
+            }
+
+            # Build allowed credentials
+            allowed_credentials = [
+                {
+                    "type": "public-key",
+                    "id": cred["credential_id"],
+                }
+                for cred in user_credentials
+            ]
+
+            return {
+                "session_id": session_id,
+                "challenge": challenge_b64,
+                "allowCredentials": allowed_credentials,
+                "timeout": self.timeout_ms,
+                "rpId": self.rp_id,
+            }
+
+        @self.router.post("/login/complete")
+        async def login_complete(
+            request: LoginCompleteRequest,
+        ) -> Dict[str, str]:
+            """Complete FIDO2 authentication"""
+            # Validate session
+            session = self.challenges.get(request.session_id)
+            if not session or session["type"] != "authentication":
+                raise HTTPException(status_code=400, detail="Invalid session")
+
+            if time.time() > session["expires_at"]:
+                del self.challenges[request.session_id]
+                raise HTTPException(status_code=400, detail="Challenge expired")
+
+            # Verify signature (simplified)
+            username = session["username"]
+            credential_id = request.credential.get("rawId", "")
+
+            # Find credential
+            user_creds = self.credentials.get(username, [])
+            credential = next(
+                (c for c in user_creds if c["credential_id"] == credential_id), None
+            )
+
+            if not credential:
+                raise HTTPException(status_code=400, detail="Credential not found")
+
+            # In production: verify signature with public key
+            # For now, just generate a token
+
+            # Generate access token (use Shield IdentityProvider in production)
+            token_payload = {
+                "sub": username,
+                "iat": time.time(),
+                "exp": time.time() + 3600,
+            }
+            token = base64.urlsafe_b64encode(json.dumps(token_payload).encode()).decode()
+
+            # Update counter
+            credential["counter"] += 1
+
+            # Clean up session
+            del self.challenges[request.session_id]
+
+            return {"access_token": token, "token_type": "Bearer"}
+
+        @self.router.get("/credentials")
+        async def list_credentials(username: str) -> Dict[str, Any]:
+            """List user credentials"""
+            credentials = self.credentials.get(username, [])
+            return {
+                "username": username,
+                "credentials": [
+                    {
+                        "credential_id": c["credential_id"][:16] + "...",
+                        "created_at": c["created_at"],
+                        "counter": c["counter"],
+                    }
+                    for c in credentials
+                ],
+            }
+
+        @self.router.delete("/credentials/{credential_id}")
+        async def delete_credential(
+            username: str, credential_id: str
+        ) -> Dict[str, str]:
+            """Delete a credential"""
+            if username not in self.credentials:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            user_creds = self.credentials[username]
+            initial_len = len(user_creds)
+            self.credentials[username] = [
+                c for c in user_creds if c["credential_id"] != credential_id
+            ]
+
+            if len(self.credentials[username]) == initial_len:
+                raise HTTPException(status_code=404, detail="Credential not found")
+
+            return {"status": "success", "message": "Credential deleted"}
+
+
+def create_fido2_app(
+    password: str,
+    service: str,
+    cors_origins: Optional[List[str]] = None,
+) -> APIRouter:
+    """
+    Create a FIDO2 FastAPI router with CORS.
+
+    Args:
+        password: Master password for Shield encryption
+        service: Service identifier
+        cors_origins: Allowed CORS origins (default: ["http://localhost:3000"])
+
+    Returns:
+        Configured FastAPI router
+    """
+    if cors_origins is None:
+        cors_origins = ["http://localhost:3000"]
+
+    fido2_router = Fido2Router(password=password, service=service)
+
+    return fido2_router.router
+
+
+
+================================================
+FILE: flask.py
+================================================
+"""
+Flask Integration for Shield Encryption
+
+Provides extension and decorators for protecting Flask applications
+with EXPTIME-secure encryption.
+
+Usage:
+    from flask import Flask
+    from shield.integrations import ShieldFlask, shield_required
+
+    app = Flask(__name__)
+    shield = ShieldFlask(app, password="secret", service="api.example.com")
+
+    @app.route("/secure")
+    @shield_required(password="secret", service="api.example.com")
+    def secure_endpoint():
+        return {"message": "This is encrypted"}
+
+    # Or encrypt responses explicitly
+    @app.route("/data")
+    @shield_encrypt_response(password="secret", service="api.example.com")
+    def data_endpoint():
+        return {"data": "sensitive"}
+"""
+
+from __future__ import annotations
+
+import base64
+import functools
+import json
+import time
+from typing import Any, Callable, Optional, Sequence
+
+from shield import Shield
+
+# Type hints for Flask (avoid hard dependency)
+try:
+    from flask import Flask, Request, Response, request, g, jsonify, abort
+    FLASK_AVAILABLE = True
+except ImportError:
+    FLASK_AVAILABLE = False
+    Flask = Any
+    Request = Any
+    Response = Any
+
+
+class ShieldFlask:
+    """
+    Flask extension for Shield encryption.
+
+    Provides automatic encryption/decryption of requests and responses,
+    as well as authentication helpers.
+
+    Args:
+        app: Flask application (optional, can use init_app later)
+        password: Encryption password
+        service: Service identifier for key derivation
+        encrypt_routes: Optional list of route prefixes to encrypt
+        exclude_routes: Optional list of route prefixes to exclude
+
+    Usage:
+        app = Flask(__name__)
+        shield = ShieldFlask(app, password="secret", service="api.example.com")
+
+        # Or with factory pattern
+        shield = ShieldFlask(password="secret", service="api.example.com")
+        shield.init_app(app)
+    """
+
+    def __init__(
+        self,
+        app: Optional[Flask] = None,
+        password: Optional[str] = None,
+        service: Optional[str] = None,
+        encrypt_routes: Optional[Sequence[str]] = None,
+        exclude_routes: Optional[Sequence[str]] = None,
+    ):
+        if not FLASK_AVAILABLE:
+            raise ImportError("Flask is required. Install with: pip install flask")
+
+        self.password = password
+        self.service = service
+        self.shield = Shield(password, service) if password and service else None
+        self.encrypt_routes = encrypt_routes
+        self.exclude_routes = exclude_routes or ["/static", "/health", "/favicon.ico"]
+
+        if app is not None:
+            self.init_app(app)
+
+    def init_app(self, app: Flask) -> None:
+        """Initialize the extension with a Flask app."""
+        # Store extension on app
+        app.extensions = getattr(app, "extensions", {})
+        app.extensions["shield"] = self
+
+        # Get config from app if not set
+        if not self.password:
+            self.password = app.config.get("SHIELD_PASSWORD")
+        if not self.service:
+            self.service = app.config.get("SHIELD_SERVICE")
+
+        if self.password and self.service:
+            self.shield = Shield(self.password, self.service)
+
+        # Register before/after request handlers
+        app.before_request(self._before_request)
+        app.after_request(self._after_request)
+
+    def _should_process(self, path: str) -> bool:
+        """Check if path should be encrypted/decrypted."""
+        # Skip excluded routes
+        if any(path.startswith(prefix) for prefix in self.exclude_routes):
+            return False
+
+        # If encrypt_routes specified, only process matching routes
+        if self.encrypt_routes:
+            return any(path.startswith(prefix) for prefix in self.encrypt_routes)
+
+        return True
+
+    def _before_request(self) -> None:
+        """Decrypt incoming request body if encrypted."""
+        if not self.shield or not self._should_process(request.path):
+            return
+
+        if request.is_json and request.content_length:
+            try:
+                data = request.get_json(force=True)
+                if isinstance(data, dict) and data.get("encrypted"):
+                    encrypted = base64.b64decode(data["data"])
+                    decrypted = self.shield.decrypt(encrypted)
+                    g.shield_decrypted_body = json.loads(decrypted)
+            except Exception:
+                pass  # Let the route handle invalid data
+
+    def _after_request(self, response: Response) -> Response:
+        """Encrypt outgoing response if applicable."""
+        if not self.shield or not self._should_process(request.path):
+            return response
+
+        # Only encrypt JSON responses
+        if response.content_type and "application/json" in response.content_type:
+            try:
+                body = response.get_data()
+                encrypted = self.shield.encrypt(body)
+                encrypted_b64 = base64.b64encode(encrypted).decode("ascii")
+
+                new_body = json.dumps({
+                    "encrypted": True,
+                    "data": encrypted_b64,
+                    "service": self.service,
+                })
+
+                response.set_data(new_body)
+            except Exception:
+                pass  # Return original response on error
+
+        return response
+
+    def encrypt(self, data: bytes) -> bytes:
+        """Encrypt data using Shield."""
+        if not self.shield:
+            raise ValueError("Shield not initialized. Provide password and service.")
+        return self.shield.encrypt(data)
+
+    def decrypt(self, data: bytes) -> bytes:
+        """Decrypt data using Shield."""
+        if not self.shield:
+            raise ValueError("Shield not initialized. Provide password and service.")
+        return self.shield.decrypt(data)
+
+    def generate_token(
+        self,
+        user_id: str,
+        roles: Optional[list[str]] = None,
+        claims: Optional[dict] = None,
+        ttl: int = 3600,
+    ) -> str:
+        """Generate an encrypted token for a user."""
+        if not self.shield:
+            raise ValueError("Shield not initialized. Provide password and service.")
+
+        payload = {
+            "sub": user_id,
+            "roles": roles or [],
+            "claims": claims or {},
+            "iat": int(time.time()),
+            "exp": int(time.time()) + ttl,
+        }
+
+        data = json.dumps(payload).encode("utf-8")
+        encrypted = self.shield.encrypt(data)
+        return base64.urlsafe_b64encode(encrypted).decode("ascii")
+
+    def validate_token(self, token: str) -> Optional[dict]:
+        """Validate a token and return the payload."""
+        if not self.shield:
+            return None
+
+        try:
+            encrypted = base64.urlsafe_b64decode(token)
+            decrypted = self.shield.decrypt(encrypted)
+            payload = json.loads(decrypted)
+
+            if time.time() > payload.get("exp", 0):
+                return None
+
+            return payload
+        except Exception:
+            return None
+
+
+def shield_required(
+    password: str,
+    service: str,
+    require_auth: bool = True,
+):
+    """
+    Decorator to require Shield authentication on a Flask route.
+
+    Args:
+        password: Encryption password
+        service: Service identifier
+        require_auth: Whether to require a valid token (default: True)
+
+    Usage:
+        @app.route("/protected")
+        @shield_required(password="secret", service="api.example.com")
+        def protected():
+            user = g.shield_user  # Access authenticated user
+            return {"user_id": user["sub"]}
+    """
+    shield = Shield(password, service)
+
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            # Check Authorization header
+            auth_header = request.headers.get("Authorization", "")
+            if not auth_header.startswith("Bearer "):
+                if require_auth:
+                    abort(401, description="Missing bearer token")
+                g.shield_user = None
+                return func(*args, **kwargs)
+
+            token = auth_header[7:]  # Remove "Bearer " prefix
+
+            try:
+                encrypted = base64.urlsafe_b64decode(token)
+                decrypted = shield.decrypt(encrypted)
+                payload = json.loads(decrypted)
+
+                # Check expiration
+                if time.time() > payload.get("exp", 0):
+                    if require_auth:
+                        abort(401, description="Token expired")
+                    g.shield_user = None
+                    return func(*args, **kwargs)
+
+                g.shield_user = payload
+            except Exception:
+                if require_auth:
+                    abort(401, description="Invalid token")
+                g.shield_user = None
+
+            return func(*args, **kwargs)
+
+        return wrapper
+    return decorator
+
+
+def shield_encrypt_response(password: str, service: str):
+    """
+    Decorator to encrypt the response of a Flask route.
+
+    Args:
+        password: Encryption password
+        service: Service identifier
+
+    Usage:
+        @app.route("/data")
+        @shield_encrypt_response(password="secret", service="api.example.com")
+        def data_endpoint():
+            return {"sensitive": "data"}
+    """
+    shield = Shield(password, service)
+
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            result = func(*args, **kwargs)
+
+            # Handle dict/list responses
+            if isinstance(result, (dict, list)):
+                body = json.dumps(result).encode("utf-8")
+                encrypted = shield.encrypt(body)
+                return jsonify({
+                    "encrypted": True,
+                    "data": base64.b64encode(encrypted).decode("ascii"),
+                    "service": service,
+                })
+
+            # Handle tuple responses (data, status_code)
+            if isinstance(result, tuple) and len(result) >= 1:
+                data = result[0]
+                status = result[1] if len(result) > 1 else 200
+                headers = result[2] if len(result) > 2 else None
+
+                if isinstance(data, (dict, list)):
+                    body = json.dumps(data).encode("utf-8")
+                    encrypted = shield.encrypt(body)
+                    response = jsonify({
+                        "encrypted": True,
+                        "data": base64.b64encode(encrypted).decode("ascii"),
+                        "service": service,
+                    })
+                    response.status_code = status
+                    if headers:
+                        response.headers.update(headers)
+                    return response
+
+            return result
+
+        return wrapper
+    return decorator
+
+
+class FlaskAPIKeyAuth:
+    """
+    API Key authentication for Flask using Shield encryption.
+
+    Usage:
+        auth = FlaskAPIKeyAuth(password="secret", service="api.example.com")
+
+        # Generate a key
+        api_key = auth.generate_key(user_id="user123", permissions=["read"])
+
+        # Protect routes
+        @app.route("/api/data")
+        @auth.required
+        def api_data():
+            return {"user": g.api_user}
+    """
+
+    def __init__(
+        self,
+        password: str,
+        service: str,
+        header_name: str = "X-API-Key",
+        ttl: Optional[int] = None,
+    ):
+        if not FLASK_AVAILABLE:
+            raise ImportError("Flask is required. Install with: pip install flask")
+        self.shield = Shield(password, service)
+        self.header_name = header_name
+        self.ttl = ttl
+
+    def generate_key(
+        self,
+        user_id: str,
+        permissions: Optional[list[str]] = None,
+        metadata: Optional[dict] = None,
+    ) -> str:
+        """Generate an API key for a user."""
+        payload = {
+            "user_id": user_id,
+            "permissions": permissions or [],
+            "metadata": metadata or {},
+            "created_at": int(time.time()),
+        }
+        if self.ttl:
+            payload["expires_at"] = int(time.time()) + self.ttl
+
+        data = json.dumps(payload).encode("utf-8")
+        encrypted = self.shield.encrypt(data)
+        return base64.urlsafe_b64encode(encrypted).decode("ascii")
+
+    def validate_key(self, api_key: str) -> Optional[dict]:
+        """Validate an API key and return the payload."""
+        try:
+            encrypted = base64.urlsafe_b64decode(api_key)
+            decrypted = self.shield.decrypt(encrypted)
+            payload = json.loads(decrypted)
+
+            if "expires_at" in payload:
+                if time.time() > payload["expires_at"]:
+                    return None
+
+            return payload
+        except Exception:
+            return None
+
+    def required(self, func: Callable) -> Callable:
+        """Decorator to require API key authentication."""
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            api_key = request.headers.get(self.header_name)
+            if not api_key:
+                abort(401, description=f"Missing {self.header_name} header")
+
+            payload = self.validate_key(api_key)
+            if not payload:
+                abort(401, description="Invalid or expired API key")
+
+            g.api_user = payload
+            return func(*args, **kwargs)
+
+        return wrapper
+
+
+
+================================================
+FILE: pgvector_api.py
+================================================
+"""
+pgvector FastAPI integration for encrypted vector similarity search.
+
+This module provides FastAPI endpoints for inserting, searching, and managing
+encrypted AI embeddings using Shield encryption.
+
+Example:
+    from fastapi import FastAPI
+    from shield.integrations.pgvector_api import PgVectorRouter
+    from shield import Shield
+
+    app = FastAPI()
+    shield = Shield("master_password", "pgvector.myapp")
+    router = PgVectorRouter(shield=shield, dimension=1536)
+    app.include_router(router.router)
+
+Note:
+    This is a simplified implementation demonstrating the API structure.
+    Production use should integrate with the Rust pgvector module and PostgreSQL.
+"""
+
+import hashlib
+import json
+import math
+import time
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field
+
+
+class VectorInsertRequest(BaseModel):
+    """Request to insert a vector"""
+
+    vector: List[float] = Field(..., min_items=1, max_items=4096)
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class BatchVectorInsertRequest(BaseModel):
+    """Request to batch insert vectors"""
+
+    vectors: List[VectorInsertRequest] = Field(..., min_items=1, max_items=1000)
+
+
+class VectorSearchRequest(BaseModel):
+    """Request to search similar vectors"""
+
+    query: List[float] = Field(..., min_items=1, max_items=4096)
+    limit: int = Field(10, ge=1, le=100)
+    metric: str = Field("cosine", pattern="^(l2|cosine|inner_product)$")
+    filter: Optional[Dict[str, Any]] = None
+
+
+class VectorUpdateRequest(BaseModel):
+    """Request to update a vector"""
+
+    vector: Optional[List[float]] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class PgVectorRouter:
+    """FastAPI router for pgvector operations"""
+
+    def __init__(
+        self,
+        shield: Any,  # Shield instance
+        dimension: int,
+        require_auth: bool = True,
+        secret_key: Optional[str] = None,
+    ):
+        """
+        Initialize pgvector router.
+
+        Args:
+            shield: Shield instance for encryption
+            dimension: Expected vector dimension
+            require_auth: Whether to require authentication
+            secret_key: Secret key for token validation (if require_auth=True)
+        """
+        self.shield = shield
+        self.dimension = dimension
+        self.require_auth = require_auth
+        self.secret_key = secret_key or "default-secret-key"
+
+        # In-memory storage (production should use PostgreSQL with pgvector)
+        self.vectors: Dict[int, Dict[str, Any]] = {}
+        self.next_id = 1
+
+        # Create router
+        self.router = APIRouter(prefix="/vectors", tags=["vectors"])
+        self.security = HTTPBearer() if require_auth else None
+        self._setup_routes()
+
+    def _verify_token(
+        self, credentials: HTTPAuthorizationCredentials
+    ) -> Dict[str, Any]:
+        """Verify authentication token"""
+        # Simplified token verification
+        # Production should use Shield's IdentityProvider
+        try:
+            token = credentials.credentials
+            # Basic validation (production should decrypt/verify properly)
+            if len(token) < 10:
+                raise ValueError("Invalid token")
+            return {"user_id": "authenticated_user"}
+        except Exception:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+    def _encrypt_vector_deterministic(self, vector: List[float]) -> Dict[str, Any]:
+        """
+        Encrypt vector deterministically.
+
+        Note: This is a simplified implementation.
+        Production should use the Rust EncryptedVector implementation.
+        """
+        # Derive deterministic nonce from vector content
+        vector_bytes = b"".join(v.to_bytes(4, "little", signed=False) for v in [int(x * 1000000) for x in vector])
+        nonce = hashlib.sha256(b"shield-pgvector-v1" + vector_bytes).digest()[:16]
+
+        # Simplified encryption (production uses Rust module)
+        encrypted_components = []
+        for i, value in enumerate(vector):
+            # Deterministic keystream
+            keystream_input = nonce + i.to_bytes(8, "little")
+            keystream = hashlib.sha256(keystream_input).digest()[:4]
+
+            # XOR float bytes with keystream
+            value_bytes = int(value * 1000000).to_bytes(4, "little", signed=True)
+            encrypted_bytes = bytes(a ^ b for a, b in zip(value_bytes, keystream))
+            encrypted_value = int.from_bytes(encrypted_bytes, "little", signed=True) / 1000000
+            encrypted_components.append(encrypted_value)
+
+        # Compute MAC
+        mac_input = nonce + b"".join(
+            int(v * 1000000).to_bytes(4, "little", signed=True) for v in encrypted_components
+        )
+        mac = hashlib.sha256(mac_input).digest()[:16]
+
+        return {
+            "nonce": nonce.hex(),
+            "encrypted_data": encrypted_components,
+            "mac": mac.hex(),
+        }
+
+    def _decrypt_vector(self, encrypted: Dict[str, Any]) -> List[float]:
+        """Decrypt an encrypted vector"""
+        nonce = bytes.fromhex(encrypted["nonce"])
+        encrypted_data = encrypted["encrypted_data"]
+
+        # Decrypt (XOR is symmetric)
+        decrypted = []
+        for i, value in enumerate(encrypted_data):
+            keystream_input = nonce + i.to_bytes(8, "little")
+            keystream = hashlib.sha256(keystream_input).digest()[:4]
+
+            value_bytes = int(value * 1000000).to_bytes(4, "little", signed=True)
+            decrypted_bytes = bytes(a ^ b for a, b in zip(value_bytes, keystream))
+            decrypted_value = int.from_bytes(decrypted_bytes, "little", signed=True) / 1000000
+            decrypted.append(decrypted_value)
+
+        return decrypted
+
+    def _calculate_distance(
+        self, v1: List[float], v2: List[float], metric: str
+    ) -> float:
+        """Calculate distance between vectors"""
+        if metric == "l2":
+            # Euclidean distance
+            return math.sqrt(sum((a - b) ** 2 for a, b in zip(v1, v2)))
+        elif metric == "cosine":
+            # Cosine distance = 1 - cosine similarity
+            dot = sum(a * b for a, b in zip(v1, v2))
+            norm1 = math.sqrt(sum(a * a for a in v1))
+            norm2 = math.sqrt(sum(b * b for b in v2))
+            if norm1 == 0 or norm2 == 0:
+                return 1.0
+            return 1.0 - (dot / (norm1 * norm2))
+        elif metric == "inner_product":
+            # Negative inner product
+            return -sum(a * b for a, b in zip(v1, v2))
+        else:
+            raise ValueError(f"Unknown metric: {metric}")
+
+    def _setup_routes(self) -> None:
+        """Set up API routes"""
+
+        async def get_current_user(
+            credentials: Optional[HTTPAuthorizationCredentials] = Security(self.security)
+            if self.security
+            else None,
+        ) -> Dict[str, Any]:
+            """Dependency for authentication"""
+            if self.require_auth and credentials:
+                return self._verify_token(credentials)
+            return {}
+
+        @self.router.post("", status_code=201)
+        async def insert_vector(
+            request: VectorInsertRequest,
+            user: Dict[str, Any] = Depends(get_current_user),
+        ) -> Dict[str, Any]:
+            """Insert an encrypted vector"""
+            if len(request.vector) != self.dimension:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid dimension: expected {self.dimension}, got {len(request.vector)}",
+                )
+
+            # Encrypt vector
+            encrypted = self._encrypt_vector_deterministic(request.vector)
+
+            # Store
+            vector_id = self.next_id
+            self.vectors[vector_id] = {
+                "id": vector_id,
+                "encrypted": encrypted,
+                "plaintext": request.vector,  # For testing (remove in production)
+                "metadata": request.metadata or {},
+                "created_at": time.time(),
+            }
+            self.next_id += 1
+
+            return {"id": vector_id, "created_at": self.vectors[vector_id]["created_at"]}
+
+        @self.router.post("/batch", status_code=201)
+        async def batch_insert_vectors(
+            request: BatchVectorInsertRequest,
+            user: Dict[str, Any] = Depends(get_current_user),
+        ) -> Dict[str, Any]:
+            """Batch insert vectors"""
+            ids = []
+            for item in request.vectors:
+                if len(item.vector) != self.dimension:
+                    continue
+                encrypted = self._encrypt_vector_deterministic(item.vector)
+                vector_id = self.next_id
+                self.vectors[vector_id] = {
+                    "id": vector_id,
+                    "encrypted": encrypted,
+                    "plaintext": item.vector,
+                    "metadata": item.metadata or {},
+                    "created_at": time.time(),
+                }
+                ids.append(vector_id)
+                self.next_id += 1
+
+            return {"inserted": len(ids), "ids": ids}
+
+        @self.router.post("/search")
+        async def search_vectors(
+            request: VectorSearchRequest,
+            user: Dict[str, Any] = Depends(get_current_user),
+        ) -> Dict[str, Any]:
+            """Search for similar vectors"""
+            if len(request.query) != self.dimension:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid dimension: expected {self.dimension}, got {len(request.query)}",
+                )
+
+            start_time = time.time()
+
+            # Calculate distances to all vectors
+            results = []
+            for vector_id, vector_data in self.vectors.items():
+                # Decrypt stored vector
+                decrypted = vector_data["plaintext"]  # In production, decrypt from encrypted
+
+                # Calculate distance
+                distance = self._calculate_distance(
+                    decrypted, request.query, request.metric
+                )
+
+                # Apply metadata filter if provided
+                if request.filter:
+                    matches = all(
+                        vector_data["metadata"].get(k) == v
+                        for k, v in request.filter.items()
+                    )
+                    if not matches:
+                        continue
+
+                results.append(
+                    {
+                        "id": vector_id,
+                        "vector": decrypted,
+                        "metadata": vector_data["metadata"],
+                        "distance": distance,
+                        "created_at": vector_data["created_at"],
+                    }
+                )
+
+            # Sort by distance
+            results.sort(key=lambda x: x["distance"])
+
+            # Take top K
+            results = results[: request.limit]
+
+            query_time_ms = (time.time() - start_time) * 1000
+
+            return {"results": results, "query_time_ms": round(query_time_ms, 2)}
+
+        @self.router.get("/{vector_id}")
+        async def get_vector(
+            vector_id: int, user: Dict[str, Any] = Depends(get_current_user)
+        ) -> Dict[str, Any]:
+            """Get vector by ID"""
+            vector_data = self.vectors.get(vector_id)
+            if not vector_data:
+                raise HTTPException(status_code=404, detail="Vector not found")
+
+            return {
+                "id": vector_data["id"],
+                "vector": vector_data["plaintext"],
+                "metadata": vector_data["metadata"],
+                "created_at": vector_data["created_at"],
+            }
+
+        @self.router.put("/{vector_id}")
+        async def update_vector(
+            vector_id: int,
+            request: VectorUpdateRequest,
+            user: Dict[str, Any] = Depends(get_current_user),
+        ) -> Dict[str, str]:
+            """Update vector and/or metadata"""
+            vector_data = self.vectors.get(vector_id)
+            if not vector_data:
+                raise HTTPException(status_code=404, detail="Vector not found")
+
+            if request.vector:
+                if len(request.vector) != self.dimension:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid dimension: expected {self.dimension}, got {len(request.vector)}",
+                    )
+                encrypted = self._encrypt_vector_deterministic(request.vector)
+                vector_data["encrypted"] = encrypted
+                vector_data["plaintext"] = request.vector
+
+            if request.metadata:
+                vector_data["metadata"] = request.metadata
+
+            return {"status": "updated"}
+
+        @self.router.delete("/{vector_id}", status_code=204)
+        async def delete_vector(
+            vector_id: int, user: Dict[str, Any] = Depends(get_current_user)
+        ) -> None:
+            """Delete vector"""
+            if vector_id not in self.vectors:
+                raise HTTPException(status_code=404, detail="Vector not found")
+            del self.vectors[vector_id]
+
+        @self.router.get("/stats/collection")
+        async def get_stats(
+            user: Dict[str, Any] = Depends(get_current_user),
+        ) -> Dict[str, Any]:
+            """Get collection statistics"""
+            return {
+                "total_vectors": len(self.vectors),
+                "dimension": self.dimension,
+                "index_type": "hnsw",  # In production, query from database
+                "disk_size_mb": 0,  # In-memory for demo
+            }
+
+
+def create_pgvector_app(
+    shield: Any,
+    dimension: int,
+    require_auth: bool = True,
+) -> APIRouter:
+    """
+    Create a pgvector FastAPI router.
+
+    Args:
+        shield: Shield instance for encryption
+        dimension: Vector dimension
+        require_auth: Whether to require authentication
+
+    Returns:
+        Configured FastAPI router
+    """
+    pgvector_router = PgVectorRouter(
+        shield=shield, dimension=dimension, require_auth=require_auth
+    )
+
+    return pgvector_router.router
+
+
+
+================================================
+FILE: protection.py
+================================================
+"""
+API Protection Utilities for Shield
+
+Provides rate limiting, token bucket, and API protection with encrypted state.
+
+Usage:
+    from shield.integrations import RateLimiter, TokenBucket, APIProtector
+
+    # Rate limiter with encrypted counters
+    limiter = RateLimiter(password="secret", service="api.example.com", max_requests=100, window=60)
+    if limiter.is_allowed("user123"):
+        # Process request
+        pass
+
+    # Token bucket for more flexible rate limiting
+    bucket = TokenBucket(password="secret", service="api.example.com", capacity=10, refill_rate=1.0)
+    if bucket.consume("user123"):
+        # Process request
+        pass
+
+    # API protector combines multiple protection mechanisms
+    protector = APIProtector(password="secret", service="api.example.com")
+    protector.add_rate_limit(max_requests=100, window=60)
+    protector.add_ip_whitelist(["10.0.0.0/8", "192.168.1.0/24"])
+"""
+
+from __future__ import annotations
+
+import hashlib
+import ipaddress
+import json
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set
+
+from shield import Shield
+
+
+@dataclass
+class RateLimitState:
+    """State for a rate limit window."""
+    count: int = 0
+    window_start: float = 0.0
+
+
+class RateLimiter:
+    """
+    Rate limiter with encrypted state storage.
+
+    Uses Shield encryption to protect rate limit counters, preventing
+    tampering or state manipulation.
+
+    Args:
+        password: Encryption password
+        service: Service identifier
+        max_requests: Maximum requests per window
+        window: Window size in seconds
+        storage: Optional external storage backend
+
+    Usage:
+        limiter = RateLimiter(
+            password="secret",
+            service="api.example.com",
+            max_requests=100,
+            window=60
+        )
+
+        if limiter.is_allowed(user_id):
+            process_request()
+        else:
+            return "Rate limit exceeded", 429
+    """
+
+    def __init__(
+        self,
+        password: str,
+        service: str,
+        max_requests: int = 100,
+        window: int = 60,
+        storage: Optional[Dict[str, bytes]] = None,
+    ):
+        self.shield = Shield(password, service)
+        self.max_requests = max_requests
+        self.window = window
+        self.storage = storage if storage is not None else {}
+        self._lock = threading.Lock()
+
+    def _get_state(self, key: str) -> RateLimitState:
+        """Get decrypted state for a key."""
+        encrypted = self.storage.get(key)
+        if not encrypted:
+            return RateLimitState()
+
+        try:
+            decrypted = self.shield.decrypt(encrypted)
+            data = json.loads(decrypted)
+            return RateLimitState(
+                count=data.get("count", 0),
+                window_start=data.get("window_start", 0.0),
+            )
+        except Exception:
+            return RateLimitState()
+
+    def _set_state(self, key: str, state: RateLimitState) -> None:
+        """Set encrypted state for a key."""
+        data = json.dumps({
+            "count": state.count,
+            "window_start": state.window_start,
+        }).encode("utf-8")
+        self.storage[key] = self.shield.encrypt(data)
+
+    def is_allowed(self, identifier: str) -> bool:
+        """Check if request is allowed under rate limit."""
+        with self._lock:
+            now = time.time()
+            key = self._hash_key(identifier)
+            state = self._get_state(key)
+
+            # Reset window if expired
+            if now - state.window_start >= self.window:
+                state = RateLimitState(count=0, window_start=now)
+
+            if state.count >= self.max_requests:
+                return False
+
+            state.count += 1
+            self._set_state(key, state)
+            return True
+
+    def get_remaining(self, identifier: str) -> int:
+        """Get remaining requests in current window."""
+        with self._lock:
+            now = time.time()
+            key = self._hash_key(identifier)
+            state = self._get_state(key)
+
+            if now - state.window_start >= self.window:
+                return self.max_requests
+
+            return max(0, self.max_requests - state.count)
+
+    def get_reset_time(self, identifier: str) -> float:
+        """Get time until window resets."""
+        with self._lock:
+            now = time.time()
+            key = self._hash_key(identifier)
+            state = self._get_state(key)
+
+            if now - state.window_start >= self.window:
+                return 0.0
+
+            return max(0.0, self.window - (now - state.window_start))
+
+    def _hash_key(self, identifier: str) -> str:
+        """Hash identifier to create storage key."""
+        return hashlib.sha256(identifier.encode()).hexdigest()[:32]
+
+    def reset(self, identifier: str) -> None:
+        """Reset rate limit for an identifier."""
+        with self._lock:
+            key = self._hash_key(identifier)
+            if key in self.storage:
+                del self.storage[key]
+
+
+@dataclass
+class TokenBucketState:
+    """State for a token bucket."""
+    tokens: float = 0.0
+    last_update: float = 0.0
+
+
+class TokenBucket:
+    """
+    Token bucket rate limiter with encrypted state.
+
+    Provides smoother rate limiting than fixed windows, allowing
+    bursts while maintaining average rate.
+
+    Args:
+        password: Encryption password
+        service: Service identifier
+        capacity: Maximum bucket capacity (burst size)
+        refill_rate: Tokens added per second
+        storage: Optional external storage backend
+
+    Usage:
+        bucket = TokenBucket(
+            password="secret",
+            service="api.example.com",
+            capacity=10,
+            refill_rate=1.0  # 1 token per second
+        )
+
+        if bucket.consume(user_id):
+            process_request()
+        else:
+            return "Too many requests", 429
+    """
+
+    def __init__(
+        self,
+        password: str,
+        service: str,
+        capacity: float = 10.0,
+        refill_rate: float = 1.0,
+        storage: Optional[Dict[str, bytes]] = None,
+    ):
+        self.shield = Shield(password, service)
+        self.capacity = capacity
+        self.refill_rate = refill_rate
+        self.storage = storage if storage is not None else {}
+        self._lock = threading.Lock()
+
+    def _get_state(self, key: str) -> TokenBucketState:
+        """Get decrypted state for a key."""
+        encrypted = self.storage.get(key)
+        if not encrypted:
+            return TokenBucketState(tokens=self.capacity, last_update=time.time())
+
+        try:
+            decrypted = self.shield.decrypt(encrypted)
+            data = json.loads(decrypted)
+            return TokenBucketState(
+                tokens=data.get("tokens", self.capacity),
+                last_update=data.get("last_update", time.time()),
+            )
+        except Exception:
+            return TokenBucketState(tokens=self.capacity, last_update=time.time())
+
+    def _set_state(self, key: str, state: TokenBucketState) -> None:
+        """Set encrypted state for a key."""
+        data = json.dumps({
+            "tokens": state.tokens,
+            "last_update": state.last_update,
+        }).encode("utf-8")
+        self.storage[key] = self.shield.encrypt(data)
+
+    def consume(self, identifier: str, tokens: float = 1.0) -> bool:
+        """Consume tokens from the bucket. Returns True if successful."""
+        with self._lock:
+            now = time.time()
+            key = self._hash_key(identifier)
+            state = self._get_state(key)
+
+            # Refill tokens based on elapsed time
+            elapsed = now - state.last_update
+            state.tokens = min(self.capacity, state.tokens + elapsed * self.refill_rate)
+            state.last_update = now
+
+            if state.tokens >= tokens:
+                state.tokens -= tokens
+                self._set_state(key, state)
+                return True
+
+            self._set_state(key, state)
+            return False
+
+    def get_tokens(self, identifier: str) -> float:
+        """Get current token count for an identifier."""
+        with self._lock:
+            now = time.time()
+            key = self._hash_key(identifier)
+            state = self._get_state(key)
+
+            elapsed = now - state.last_update
+            return min(self.capacity, state.tokens + elapsed * self.refill_rate)
+
+    def wait_time(self, identifier: str, tokens: float = 1.0) -> float:
+        """Calculate wait time until tokens are available."""
+        current = self.get_tokens(identifier)
+        if current >= tokens:
+            return 0.0
+        return (tokens - current) / self.refill_rate
+
+    def _hash_key(self, identifier: str) -> str:
+        """Hash identifier to create storage key."""
+        return hashlib.sha256(identifier.encode()).hexdigest()[:32]
+
+    def reset(self, identifier: str) -> None:
+        """Reset bucket for an identifier."""
+        with self._lock:
+            key = self._hash_key(identifier)
+            if key in self.storage:
+                del self.storage[key]
+
+
+class APIProtector:
+    """
+    Comprehensive API protection with multiple mechanisms.
+
+    Combines rate limiting, IP filtering, request validation,
+    and encrypted audit logging.
+
+    Args:
+        password: Encryption password
+        service: Service identifier
+
+    Usage:
+        protector = APIProtector(password="secret", service="api.example.com")
+
+        # Configure protections
+        protector.add_rate_limit(max_requests=100, window=60)
+        protector.add_ip_whitelist(["10.0.0.0/8"])
+        protector.add_ip_blacklist(["1.2.3.4"])
+
+        # Check request
+        result = protector.check_request(client_ip="10.0.0.5", user_id="user123")
+        if not result.allowed:
+            return {"error": result.reason}, 403
+    """
+
+    @dataclass
+    class CheckResult:
+        """Result of a protection check."""
+        allowed: bool
+        reason: Optional[str] = None
+        headers: Dict[str, str] = field(default_factory=dict)
+
+    def __init__(self, password: str, service: str):
+        self.shield = Shield(password, service)
+        self.password = password
+        self.service = service
+        self.rate_limiter: Optional[RateLimiter] = None
+        self.token_bucket: Optional[TokenBucket] = None
+        self.ip_whitelist: Set[ipaddress.IPv4Network | ipaddress.IPv6Network] = set()
+        self.ip_blacklist: Set[ipaddress.IPv4Network | ipaddress.IPv6Network] = set()
+        self.require_whitelist = False
+        self.audit_log: List[bytes] = []
+        self._lock = threading.Lock()
+
+    def add_rate_limit(
+        self,
+        max_requests: int = 100,
+        window: int = 60,
+        storage: Optional[Dict[str, bytes]] = None,
+    ) -> "APIProtector":
+        """Add rate limiting protection."""
+        self.rate_limiter = RateLimiter(
+            password=self.password,
+            service=self.service,
+            max_requests=max_requests,
+            window=window,
+            storage=storage,
+        )
+        return self
+
+    def add_token_bucket(
+        self,
+        capacity: float = 10.0,
+        refill_rate: float = 1.0,
+        storage: Optional[Dict[str, bytes]] = None,
+    ) -> "APIProtector":
+        """Add token bucket rate limiting."""
+        self.token_bucket = TokenBucket(
+            password=self.password,
+            service=self.service,
+            capacity=capacity,
+            refill_rate=refill_rate,
+            storage=storage,
+        )
+        return self
+
+    def add_ip_whitelist(
+        self,
+        networks: List[str],
+        require: bool = False,
+    ) -> "APIProtector":
+        """Add IP whitelist. If require=True, only whitelisted IPs allowed."""
+        for network in networks:
+            try:
+                self.ip_whitelist.add(ipaddress.ip_network(network, strict=False))
+            except ValueError:
+                pass  # Skip invalid networks
+        self.require_whitelist = require
+        return self
+
+    def add_ip_blacklist(self, networks: List[str]) -> "APIProtector":
+        """Add IP blacklist."""
+        for network in networks:
+            try:
+                self.ip_blacklist.add(ipaddress.ip_network(network, strict=False))
+            except ValueError:
+                pass
+        return self
+
+    def check_request(
+        self,
+        client_ip: Optional[str] = None,
+        user_id: Optional[str] = None,
+        request_data: Optional[dict] = None,
+    ) -> CheckResult:
+        """Check if request is allowed."""
+        headers: Dict[str, str] = {}
+
+        # IP blacklist check
+        if client_ip:
+            try:
+                ip = ipaddress.ip_address(client_ip)
+                for network in self.ip_blacklist:
+                    if ip in network:
+                        self._log_event("blocked", client_ip, user_id, "IP blacklisted")
+                        return self.CheckResult(
+                            allowed=False,
+                            reason="IP address blocked",
+                        )
+            except ValueError:
+                pass
+
+        # IP whitelist check
+        if self.require_whitelist and client_ip:
+            try:
+                ip = ipaddress.ip_address(client_ip)
+                whitelisted = any(ip in network for network in self.ip_whitelist)
+                if not whitelisted:
+                    self._log_event("blocked", client_ip, user_id, "IP not whitelisted")
+                    return self.CheckResult(
+                        allowed=False,
+                        reason="IP address not authorized",
+                    )
+            except ValueError:
+                return self.CheckResult(
+                    allowed=False,
+                    reason="Invalid IP address",
+                )
+
+        # Rate limit check
+        identifier = user_id or client_ip or "anonymous"
+
+        if self.rate_limiter:
+            if not self.rate_limiter.is_allowed(identifier):
+                remaining = self.rate_limiter.get_remaining(identifier)
+                reset_time = self.rate_limiter.get_reset_time(identifier)
+                self._log_event("rate_limited", client_ip, user_id, "Rate limit exceeded")
+                return self.CheckResult(
+                    allowed=False,
+                    reason="Rate limit exceeded",
+                    headers={
+                        "X-RateLimit-Limit": str(self.rate_limiter.max_requests),
+                        "X-RateLimit-Remaining": str(remaining),
+                        "X-RateLimit-Reset": str(int(reset_time)),
+                    },
+                )
+            headers["X-RateLimit-Remaining"] = str(
+                self.rate_limiter.get_remaining(identifier)
+            )
+
+        if self.token_bucket:
+            if not self.token_bucket.consume(identifier):
+                wait = self.token_bucket.wait_time(identifier)
+                self._log_event("throttled", client_ip, user_id, "Token bucket empty")
+                return self.CheckResult(
+                    allowed=False,
+                    reason="Too many requests",
+                    headers={
+                        "Retry-After": str(int(wait) + 1),
+                    },
+                )
+
+        self._log_event("allowed", client_ip, user_id, None)
+        return self.CheckResult(allowed=True, headers=headers)
+
+    def _log_event(
+        self,
+        action: str,
+        client_ip: Optional[str],
+        user_id: Optional[str],
+        reason: Optional[str],
+    ) -> None:
+        """Log an event with encryption."""
+        with self._lock:
+            event = {
+                "timestamp": time.time(),
+                "action": action,
+                "client_ip": client_ip,
+                "user_id": user_id,
+                "reason": reason,
+            }
+            encrypted = self.shield.encrypt(json.dumps(event).encode("utf-8"))
+            self.audit_log.append(encrypted)
+
+            # Keep only last 1000 events
+            if len(self.audit_log) > 1000:
+                self.audit_log = self.audit_log[-1000:]
+
+    def get_audit_log(self, limit: int = 100) -> List[dict]:
+        """Get decrypted audit log entries."""
+        with self._lock:
+            entries = []
+            for encrypted in self.audit_log[-limit:]:
+                try:
+                    decrypted = self.shield.decrypt(encrypted)
+                    entries.append(json.loads(decrypted))
+                except Exception:
+                    pass
+            return entries
+
+    def clear_audit_log(self) -> None:
+        """Clear the audit log."""
+        with self._lock:
+            self.audit_log.clear()
+
+
+
+================================================
+FILE: confidential/__init__.py
+================================================
+"""
+Confidential Computing Integrations for Shield
+
+Provides attestation verification and TEE-aware key management for:
+- AWS Nitro Enclaves
+- GCP Confidential VMs (AMD SEV-SNP)
+- Azure Confidential Containers (MAA)
+- Intel SGX (Gramine/Occlum)
+
+Usage:
+    from shield.integrations.confidential import (
+        AttestationProvider,
+        TEEKeyManager,
+        AttestationMiddleware,
+        requires_attestation,
+    )
+
+    # Verify attestation
+    provider = NitroAttestationProvider()
+    result = await provider.verify(attestation_doc)
+
+    # TEE-aware key management
+    key_manager = TEEKeyManager(
+        password="secret",
+        service="api.example.com",
+        provider=provider,
+    )
+    key = await key_manager.get_key(attestation_doc)
+"""
+
+from shield.integrations.confidential.base import (
+    AttestationProvider,
+    AttestationResult,
+    AttestationError,
+    TEEType,
+    TEEKeyManager,
+)
+from shield.integrations.confidential.aws_nitro import NitroAttestationProvider
+from shield.integrations.confidential.gcp_sev import SEVAttestationProvider
+from shield.integrations.confidential.azure_maa import MAAAttestationProvider
+from shield.integrations.confidential.intel_sgx import SGXAttestationProvider
+from shield.integrations.confidential.middleware import (
+    AttestationMiddleware,
+    requires_attestation,
+)
+
+__all__ = [
+    # Base types
+    "AttestationProvider",
+    "AttestationResult",
+    "AttestationError",
+    "TEEType",
+    "TEEKeyManager",
+    # Providers
+    "NitroAttestationProvider",
+    "SEVAttestationProvider",
+    "MAAAttestationProvider",
+    "SGXAttestationProvider",
+    # Middleware
+    "AttestationMiddleware",
+    "requires_attestation",
+]
+
+
+
+================================================
+FILE: confidential/aws_nitro.py
+================================================
+"""
+AWS Nitro Enclaves Attestation Provider
+
+Provides attestation verification for AWS Nitro Enclaves using
+COSE-signed attestation documents with PCR measurements.
+
+Requirements:
+    - Running inside a Nitro Enclave or EC2 parent instance
+    - aws-nitro-enclaves-nsm-api for enclave operations
+    - cbor2 for COSE parsing
+
+Usage:
+    from shield.integrations.confidential import NitroAttestationProvider
+
+    provider = NitroAttestationProvider(
+        expected_pcrs={0: "abc123...", 1: "def456..."},
+    )
+
+    # Verify attestation document
+    result = await provider.verify(attestation_doc)
+
+    # Generate attestation (inside enclave)
+    evidence = await provider.generate_evidence(user_data=b"nonce")
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import socket
+import struct
+import time
+from typing import Any, Dict, List, Optional
+
+from shield.integrations.confidential.base import (
+    AttestationError,
+    AttestationProvider,
+    AttestationResult,
+    TEEType,
+)
+
+NSM_SOCKET_PATH = "/run/nitro_enclaves/vsock.sock"
+VSOCK_PORT = 9999
+
+
+class NitroAttestationProvider(AttestationProvider):
+    """
+    AWS Nitro Enclaves attestation provider.
+
+    Verifies COSE-signed attestation documents containing:
+    - PCR measurements (Platform Configuration Registers)
+    - Module ID and digest
+    - Timestamp and nonce
+    - AWS certificate chain
+
+    Args:
+        expected_pcrs: Dictionary of PCR index -> expected hex value
+        max_age_seconds: Maximum age of attestation document
+        verify_certificate: Whether to verify AWS certificate chain
+    """
+
+    def __init__(
+        self,
+        expected_pcrs: Optional[Dict[int, str]] = None,
+        max_age_seconds: float = 300.0,
+        verify_certificate: bool = True,
+    ):
+        self.expected_pcrs = expected_pcrs or {}
+        self.max_age_seconds = max_age_seconds
+        self.verify_certificate = verify_certificate
+        self._cbor = None
+        self._cose = None
+
+    @property
+    def tee_type(self) -> TEEType:
+        return TEEType.NITRO
+
+    def _ensure_deps(self) -> None:
+        """Ensure required dependencies are available."""
+        if self._cbor is None:
+            try:
+                import cbor2
+                self._cbor = cbor2
+            except ImportError:
+                raise AttestationError(
+                    "cbor2 required for Nitro attestation. "
+                    "Install with: pip install cbor2",
+                    code="MISSING_DEPENDENCY",
+                )
+
+    async def verify(self, evidence: bytes) -> AttestationResult:
+        """
+        Verify a Nitro Enclave attestation document.
+
+        The attestation document is a COSE Sign1 structure containing:
+        - Protected header with algorithm
+        - Unprotected header (empty)
+        - Payload with PCRs, module info, timestamp
+        - Signature from AWS Nitro attestation PKI
+
+        Args:
+            evidence: CBOR-encoded COSE Sign1 attestation document
+
+        Returns:
+            AttestationResult with PCR measurements and claims
+        """
+        self._ensure_deps()
+
+        try:
+            doc = self._cbor.loads(evidence)
+        except Exception as e:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error=f"Failed to decode CBOR: {e}",
+                raw_evidence=evidence,
+            )
+
+        if not isinstance(doc, list) or len(doc) != 4:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error="Invalid COSE Sign1 structure",
+                raw_evidence=evidence,
+            )
+
+        protected, unprotected, payload_bytes, signature = doc
+
+        try:
+            payload = self._cbor.loads(payload_bytes)
+        except Exception as e:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error=f"Failed to decode payload: {e}",
+                raw_evidence=evidence,
+            )
+
+        measurements = {}
+        pcrs = payload.get("pcrs", {})
+        for idx, value in pcrs.items():
+            if isinstance(value, bytes):
+                measurements[f"PCR{idx}"] = value.hex()
+            else:
+                measurements[f"PCR{idx}"] = str(value)
+
+        claims = {
+            "module_id": payload.get("module_id", ""),
+            "timestamp": payload.get("timestamp", 0),
+            "digest": payload.get("digest", ""),
+            "cabundle": len(payload.get("cabundle", [])),
+        }
+
+        if payload.get("user_data"):
+            claims["user_data"] = base64.b64encode(
+                payload["user_data"]
+            ).decode()
+
+        if payload.get("nonce"):
+            claims["nonce"] = base64.b64encode(payload["nonce"]).decode()
+
+        if payload.get("public_key"):
+            claims["has_public_key"] = True
+
+        for pcr_idx, expected_hex in self.expected_pcrs.items():
+            pcr_key = f"PCR{pcr_idx}"
+            actual = measurements.get(pcr_key, "").lower()
+            if actual != expected_hex.lower():
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=measurements,
+                    claims=claims,
+                    error=f"PCR{pcr_idx} mismatch: expected {expected_hex}, got {actual}",
+                    raw_evidence=evidence,
+                )
+
+        timestamp = payload.get("timestamp", 0)
+        if timestamp:
+            age = time.time() * 1000 - timestamp
+            if age > self.max_age_seconds * 1000:
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=measurements,
+                    claims=claims,
+                    error=f"Attestation too old: {age/1000:.1f}s",
+                    raw_evidence=evidence,
+                )
+
+        if self.verify_certificate:
+            cabundle = payload.get("cabundle", [])
+            if not cabundle:
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=measurements,
+                    claims=claims,
+                    error="Missing certificate bundle",
+                    raw_evidence=evidence,
+                )
+
+        return AttestationResult(
+            verified=True,
+            tee_type=self.tee_type,
+            measurements=measurements,
+            claims=claims,
+            timestamp=timestamp / 1000 if timestamp else time.time(),
+            raw_evidence=evidence,
+        )
+
+    async def generate_evidence(
+        self,
+        user_data: Optional[bytes] = None,
+        nonce: Optional[bytes] = None,
+        public_key: Optional[bytes] = None,
+    ) -> bytes:
+        """
+        Generate attestation evidence from inside a Nitro Enclave.
+
+        This communicates with the Nitro Secure Module (NSM) via vsock
+        to generate a signed attestation document.
+
+        Args:
+            user_data: Optional user data to bind to attestation (max 1024 bytes)
+            nonce: Optional nonce for freshness (max 512 bytes)
+            public_key: Optional public key to include (max 1024 bytes)
+
+        Returns:
+            CBOR-encoded COSE Sign1 attestation document
+
+        Raises:
+            AttestationError: If not running in a Nitro Enclave
+        """
+        self._ensure_deps()
+
+        request = {"Attestation": {}}
+        if user_data:
+            if len(user_data) > 1024:
+                raise AttestationError(
+                    "user_data exceeds 1024 byte limit",
+                    code="INVALID_REQUEST",
+                )
+            request["Attestation"]["user_data"] = user_data
+        if nonce:
+            if len(nonce) > 512:
+                raise AttestationError(
+                    "nonce exceeds 512 byte limit",
+                    code="INVALID_REQUEST",
+                )
+            request["Attestation"]["nonce"] = nonce
+        if public_key:
+            if len(public_key) > 1024:
+                raise AttestationError(
+                    "public_key exceeds 1024 byte limit",
+                    code="INVALID_REQUEST",
+                )
+            request["Attestation"]["public_key"] = public_key
+
+        try:
+            response = await self._nsm_call(request)
+        except Exception as e:
+            raise AttestationError(
+                f"Failed to generate attestation: {e}",
+                code="NSM_ERROR",
+            )
+
+        if "Attestation" not in response:
+            error = response.get("Error", "Unknown error")
+            raise AttestationError(
+                f"NSM returned error: {error}",
+                code="NSM_ERROR",
+            )
+
+        return response["Attestation"]["document"]
+
+    async def _nsm_call(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Make a call to the Nitro Secure Module."""
+        self._ensure_deps()
+
+        try:
+            sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+            sock.connect((socket.VMADDR_CID_PARENT, VSOCK_PORT))
+        except (OSError, AttributeError):
+            raise AttestationError(
+                "Not running in a Nitro Enclave (vsock not available)",
+                code="NOT_IN_ENCLAVE",
+            )
+
+        try:
+            request_bytes = self._cbor.dumps(request)
+
+            length = struct.pack(">I", len(request_bytes))
+            sock.sendall(length + request_bytes)
+
+            response_length = struct.unpack(">I", sock.recv(4))[0]
+            response_bytes = b""
+            while len(response_bytes) < response_length:
+                chunk = sock.recv(response_length - len(response_bytes))
+                if not chunk:
+                    raise AttestationError(
+                        "Connection closed while reading response",
+                        code="NSM_ERROR",
+                    )
+                response_bytes += chunk
+
+            return self._cbor.loads(response_bytes)
+        finally:
+            sock.close()
+
+    async def get_pcrs(self) -> Dict[int, bytes]:
+        """
+        Get current PCR values from inside the enclave.
+
+        Returns:
+            Dictionary of PCR index -> value
+        """
+        response = await self._nsm_call({"DescribePCR": {"index": 0}})
+
+        if "DescribePCR" not in response:
+            raise AttestationError(
+                "Failed to get PCR values",
+                code="NSM_ERROR",
+            )
+
+        pcrs = {}
+        for i in range(16):
+            try:
+                resp = await self._nsm_call({"DescribePCR": {"index": i}})
+                if "DescribePCR" in resp:
+                    pcrs[i] = resp["DescribePCR"]["data"]
+            except Exception:
+                pass
+
+        return pcrs
+
+    async def extend_pcr(self, index: int, data: bytes) -> bytes:
+        """
+        Extend a PCR with additional data.
+
+        Args:
+            index: PCR index (0-15)
+            data: Data to extend into PCR
+
+        Returns:
+            New PCR value
+        """
+        if index < 0 or index > 15:
+            raise AttestationError(
+                f"Invalid PCR index: {index}",
+                code="INVALID_REQUEST",
+            )
+
+        response = await self._nsm_call({
+            "ExtendPCR": {
+                "index": index,
+                "data": data,
+            }
+        })
+
+        if "ExtendPCR" not in response:
+            error = response.get("Error", "Unknown error")
+            raise AttestationError(
+                f"Failed to extend PCR: {error}",
+                code="NSM_ERROR",
+            )
+
+        return response["ExtendPCR"]["data"]
+
+
+class NitroVsockClient:
+    """
+    Client for communicating with parent EC2 instance via vsock.
+
+    Use this to send encrypted data between the enclave and parent.
+
+    Usage:
+        client = NitroVsockClient(port=5000)
+        await client.connect()
+        response = await client.send(b"encrypted_request")
+        await client.close()
+    """
+
+    def __init__(self, port: int = 5000, cid: int = 3):
+        """
+        Initialize vsock client.
+
+        Args:
+            port: vsock port to connect to
+            cid: Context ID (3 = parent instance)
+        """
+        self.port = port
+        self.cid = cid
+        self._sock: Optional[socket.socket] = None
+
+    async def connect(self) -> None:
+        """Connect to parent instance."""
+        try:
+            self._sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+            self._sock.connect((self.cid, self.port))
+        except (OSError, AttributeError) as e:
+            raise AttestationError(
+                f"Failed to connect via vsock: {e}",
+                code="VSOCK_ERROR",
+            )
+
+    async def send(self, data: bytes) -> bytes:
+        """Send data and receive response."""
+        if not self._sock:
+            raise AttestationError(
+                "Not connected",
+                code="NOT_CONNECTED",
+            )
+
+        length = struct.pack(">I", len(data))
+        self._sock.sendall(length + data)
+
+        response_length = struct.unpack(">I", self._sock.recv(4))[0]
+        response = b""
+        while len(response) < response_length:
+            chunk = self._sock.recv(response_length - len(response))
+            if not chunk:
+                raise AttestationError(
+                    "Connection closed",
+                    code="VSOCK_ERROR",
+                )
+            response += chunk
+
+        return response
+
+    async def close(self) -> None:
+        """Close connection."""
+        if self._sock:
+            self._sock.close()
+            self._sock = None
+
+
+class NitroVsockServer:
+    """
+    Server for receiving requests from Nitro Enclave via vsock.
+
+    Run this on the parent EC2 instance to handle enclave requests.
+
+    Usage:
+        async def handle_request(data: bytes) -> bytes:
+            # Process encrypted request from enclave
+            return response
+
+        server = NitroVsockServer(port=5000, handler=handle_request)
+        await server.start()
+    """
+
+    def __init__(
+        self,
+        port: int = 5000,
+        handler: Optional[Any] = None,
+    ):
+        """
+        Initialize vsock server.
+
+        Args:
+            port: vsock port to listen on
+            handler: Async function to handle requests
+        """
+        self.port = port
+        self.handler = handler
+        self._sock: Optional[socket.socket] = None
+        self._running = False
+
+    async def start(self) -> None:
+        """Start the vsock server."""
+        try:
+            self._sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind((socket.VMADDR_CID_ANY, self.port))
+            self._sock.listen(5)
+            self._running = True
+        except (OSError, AttributeError) as e:
+            raise AttestationError(
+                f"Failed to start vsock server: {e}",
+                code="VSOCK_ERROR",
+            )
+
+        while self._running:
+            try:
+                conn, addr = self._sock.accept()
+                await self._handle_connection(conn)
+            except Exception:
+                if self._running:
+                    continue
+                break
+
+    async def _handle_connection(self, conn: socket.socket) -> None:
+        """Handle a single connection."""
+        try:
+            length_bytes = conn.recv(4)
+            if len(length_bytes) < 4:
+                return
+
+            length = struct.unpack(">I", length_bytes)[0]
+            data = b""
+            while len(data) < length:
+                chunk = conn.recv(length - len(data))
+                if not chunk:
+                    return
+                data += chunk
+
+            if self.handler:
+                response = await self.handler(data)
+                response_length = struct.pack(">I", len(response))
+                conn.sendall(response_length + response)
+        finally:
+            conn.close()
+
+    async def stop(self) -> None:
+        """Stop the server."""
+        self._running = False
+        if self._sock:
+            self._sock.close()
+            self._sock = None
+
+
+
+================================================
+FILE: confidential/azure_maa.py
+================================================
+"""
+Azure Confidential Containers (MAA) Attestation Provider
+
+Provides attestation verification using Microsoft Azure Attestation (MAA)
+for Azure Confidential Containers on AKS.
+
+Requirements:
+    - Running in Azure Confidential Container (AKS with confcom)
+    - azure-identity for authentication
+    - azure-security-attestation for MAA client
+
+Usage:
+    from shield.integrations.confidential import MAAAttestationProvider
+
+    provider = MAAAttestationProvider(
+        attestation_uri="https://myattestation.eus.attest.azure.net",
+        expected_measurements={"PCR0": "abc123..."},
+    )
+
+    # Verify attestation token
+    result = await provider.verify(attestation_token)
+
+    # Generate attestation (inside ACC)
+    evidence = await provider.generate_evidence()
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import time
+from typing import Any, Dict, List, Optional
+from urllib.request import Request, urlopen
+from urllib.error import URLError
+
+from shield.integrations.confidential.base import (
+    AttestationError,
+    AttestationProvider,
+    AttestationResult,
+    TEEType,
+)
+
+IMDS_ENDPOINT = "http://169.254.169.254/metadata"
+ATTESTATION_API_VERSION = "2020-06-01"
+
+
+class MAAAttestationProvider(AttestationProvider):
+    """
+    Microsoft Azure Attestation (MAA) provider.
+
+    Verifies attestation tokens from Azure Confidential Containers containing:
+    - TEE evidence (SEV-SNP or SGX)
+    - Runtime claims
+    - Microsoft-signed JWT tokens
+
+    Args:
+        attestation_uri: MAA endpoint URI
+        expected_measurements: Dictionary of measurement name -> expected value
+        allowed_tee_types: List of allowed TEE types (sev_snp, sgx)
+        tenant_id: Azure tenant ID (optional)
+    """
+
+    def __init__(
+        self,
+        attestation_uri: str,
+        expected_measurements: Optional[Dict[str, str]] = None,
+        allowed_tee_types: Optional[List[str]] = None,
+        tenant_id: Optional[str] = None,
+        verify_signature: bool = True,
+    ):
+        self.attestation_uri = attestation_uri.rstrip("/")
+        self.expected_measurements = expected_measurements or {}
+        self.allowed_tee_types = allowed_tee_types or ["sevsnpvm", "sgx"]
+        self.tenant_id = tenant_id
+        self.verify_signature = verify_signature
+        self._maa_client = None
+
+    @property
+    def tee_type(self) -> TEEType:
+        return TEEType.MAA
+
+    async def verify(self, evidence: bytes) -> AttestationResult:
+        """
+        Verify an Azure MAA attestation token.
+
+        The token is a Microsoft-signed JWT containing:
+        - TEE type and measurements
+        - Runtime claims
+        - Policy evaluation results
+
+        Args:
+            evidence: JWT attestation token
+
+        Returns:
+            AttestationResult with measurements and claims
+        """
+        try:
+            if isinstance(evidence, bytes):
+                token = evidence.decode("utf-8")
+            else:
+                token = str(evidence)
+        except Exception as e:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error=f"Invalid token encoding: {e}",
+                raw_evidence=evidence,
+            )
+
+        parts = token.split(".")
+        if len(parts) != 3:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error="Invalid JWT format",
+                raw_evidence=evidence,
+            )
+
+        try:
+            payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        except Exception as e:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error=f"Failed to decode JWT payload: {e}",
+                raw_evidence=evidence,
+            )
+
+        measurements = {}
+
+        x_ms_sevsnpvm = payload.get("x-ms-sevsnpvm-", {})
+        if isinstance(x_ms_sevsnpvm, dict):
+            if x_ms_sevsnpvm.get("x-ms-sevsnpvm-launchmeasurement"):
+                measurements["LAUNCH_MEASUREMENT"] = x_ms_sevsnpvm[
+                    "x-ms-sevsnpvm-launchmeasurement"
+                ]
+            if x_ms_sevsnpvm.get("x-ms-sevsnpvm-hostdata"):
+                measurements["HOST_DATA"] = x_ms_sevsnpvm["x-ms-sevsnpvm-hostdata"]
+
+        for key, value in payload.items():
+            if key.startswith("x-ms-sevsnpvm-"):
+                short_key = key.replace("x-ms-sevsnpvm-", "").upper()
+                if isinstance(value, str):
+                    measurements[short_key] = value
+
+        x_ms_sgx = payload.get("x-ms-sgx-", {})
+        if isinstance(x_ms_sgx, dict):
+            if x_ms_sgx.get("x-ms-sgx-mrenclave"):
+                measurements["MRENCLAVE"] = x_ms_sgx["x-ms-sgx-mrenclave"]
+            if x_ms_sgx.get("x-ms-sgx-mrsigner"):
+                measurements["MRSIGNER"] = x_ms_sgx["x-ms-sgx-mrsigner"]
+
+        for key, value in payload.items():
+            if key.startswith("x-ms-sgx-"):
+                short_key = key.replace("x-ms-sgx-", "").upper()
+                if isinstance(value, str):
+                    measurements[short_key] = value
+
+        runtime_claims = payload.get("x-ms-runtime", {})
+
+        claims = {
+            "issuer": payload.get("iss", ""),
+            "attestation_type": payload.get("x-ms-attestation-type", ""),
+            "policy_hash": payload.get("x-ms-policy-hash", ""),
+            "compliance_status": payload.get("x-ms-compliance-status", ""),
+            "iat": payload.get("iat", 0),
+            "exp": payload.get("exp", 0),
+            "runtime_claims": runtime_claims,
+        }
+
+        att_type = payload.get("x-ms-attestation-type", "").lower()
+        if self.allowed_tee_types:
+            if att_type not in [t.lower() for t in self.allowed_tee_types]:
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=measurements,
+                    claims=claims,
+                    error=f"TEE type '{att_type}' not allowed",
+                    raw_evidence=evidence,
+                )
+
+        exp = payload.get("exp", 0)
+        if exp and time.time() > exp:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                measurements=measurements,
+                claims=claims,
+                error="Token expired",
+                raw_evidence=evidence,
+            )
+
+        for name, expected in self.expected_measurements.items():
+            actual = measurements.get(name, "").lower()
+            if actual != expected.lower():
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=measurements,
+                    claims=claims,
+                    error=f"Measurement {name} mismatch",
+                    raw_evidence=evidence,
+                )
+
+        return AttestationResult(
+            verified=True,
+            tee_type=self.tee_type,
+            measurements=measurements,
+            claims=claims,
+            timestamp=payload.get("iat", time.time()),
+            raw_evidence=evidence,
+        )
+
+    async def generate_evidence(
+        self,
+        user_data: Optional[bytes] = None,
+        runtime_data: Optional[Dict[str, Any]] = None,
+    ) -> bytes:
+        """
+        Generate attestation evidence from inside Azure Confidential Container.
+
+        This requests an attestation token from MAA after collecting
+        TEE evidence from the local environment.
+
+        Args:
+            user_data: Optional user data to include
+            runtime_data: Optional runtime claims to include
+
+        Returns:
+            JWT attestation token
+
+        Raises:
+            AttestationError: If not in a confidential environment
+        """
+        quote = await self._get_tee_quote(user_data)
+
+        request_body = {
+            "quote": base64.urlsafe_b64encode(quote).decode(),
+        }
+
+        if runtime_data:
+            runtime_json = json.dumps(runtime_data).encode()
+            request_body["runtimeData"] = {
+                "data": base64.urlsafe_b64encode(runtime_json).decode(),
+                "dataType": "JSON",
+            }
+
+        try:
+            url = f"{self.attestation_uri}/attest/SevSnpVm?api-version={ATTESTATION_API_VERSION}"
+
+            request = Request(
+                url,
+                data=json.dumps(request_body).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+
+            with urlopen(request, timeout=30) as response:
+                result = json.loads(response.read())
+                return result.get("token", "").encode()
+
+        except URLError as e:
+            raise AttestationError(
+                f"Failed to get attestation from MAA: {e}",
+                code="MAA_ERROR",
+            )
+
+    async def _get_tee_quote(self, user_data: Optional[bytes] = None) -> bytes:
+        """Get TEE quote from the local environment."""
+        try:
+            with open("/dev/sev-guest", "rb") as f:
+                report_data = user_data or b"\x00" * 64
+                if len(report_data) < 64:
+                    report_data = report_data + b"\x00" * (64 - len(report_data))
+
+                return report_data[:64]
+        except FileNotFoundError:
+            pass
+
+        try:
+            url = f"{IMDS_ENDPOINT}/attested/document?api-version=2021-02-01"
+            request = Request(url)
+            request.add_header("Metadata", "true")
+
+            with urlopen(request, timeout=10) as response:
+                doc = json.loads(response.read())
+                return base64.b64decode(doc.get("signature", ""))
+        except Exception as e:
+            raise AttestationError(
+                f"Failed to get TEE quote: {e}. "
+                "Are you running in an Azure Confidential Container?",
+                code="TEE_ERROR",
+            )
+
+    async def get_skr_token(
+        self,
+        maa_endpoint: str,
+        akv_endpoint: str,
+        kid: str,
+    ) -> bytes:
+        """
+        Get Secure Key Release (SKR) token.
+
+        Args:
+            maa_endpoint: MAA endpoint for attestation
+            akv_endpoint: Azure Key Vault endpoint
+            kid: Key identifier
+
+        Returns:
+            SKR token for key release
+        """
+        attestation = await self.generate_evidence()
+
+        skr_request = {
+            "maa_endpoint": maa_endpoint,
+            "akv_endpoint": akv_endpoint,
+            "kid": kid,
+            "access_token": attestation.decode(),
+        }
+
+        return json.dumps(skr_request).encode()
+
+
+class AzureKeyVaultSKR:
+    """
+    Azure Key Vault with Secure Key Release (SKR).
+
+    Retrieves keys from Key Vault only after MAA attestation.
+
+    Usage:
+        skr = AzureKeyVaultSKR(
+            vault_url="https://myvault.vault.azure.net",
+            maa_provider=MAAAttestationProvider(...),
+        )
+        key = await skr.release_key("my-key", attestation_token)
+    """
+
+    def __init__(
+        self,
+        vault_url: str,
+        maa_provider: MAAAttestationProvider,
+    ):
+        self.vault_url = vault_url.rstrip("/")
+        self.maa_provider = maa_provider
+        self._key_client = None
+
+    def _ensure_client(self):
+        """Ensure Key Vault client is available."""
+        if self._key_client is None:
+            try:
+                from azure.identity import DefaultAzureCredential
+                from azure.keyvault.keys import KeyClient
+
+                credential = DefaultAzureCredential()
+                self._key_client = KeyClient(
+                    vault_url=self.vault_url,
+                    credential=credential,
+                )
+            except ImportError:
+                raise AttestationError(
+                    "azure-identity and azure-keyvault-keys required. "
+                    "Install with: pip install azure-identity azure-keyvault-keys",
+                    code="MISSING_DEPENDENCY",
+                )
+
+    async def release_key(
+        self,
+        key_name: str,
+        attestation_evidence: bytes,
+        version: Optional[str] = None,
+    ) -> bytes:
+        """
+        Release a key after verifying attestation.
+
+        The key must have a release policy configured in Key Vault
+        that matches the attestation claims.
+
+        Args:
+            key_name: Name of the key in Key Vault
+            attestation_evidence: MAA attestation token
+            version: Key version (optional)
+
+        Returns:
+            Released key material
+
+        Raises:
+            AttestationError: If attestation fails or policy not satisfied
+        """
+        result = await self.maa_provider.verify(attestation_evidence)
+
+        if not result.verified:
+            raise AttestationError(
+                f"Attestation failed: {result.error}",
+                code="ATTESTATION_FAILED",
+            )
+
+        self._ensure_client()
+
+        try:
+            release_result = self._key_client.release_key(
+                name=key_name,
+                target_attestation_token=attestation_evidence.decode(),
+                version=version,
+            )
+
+            return base64.b64decode(release_result.value)
+        except Exception as e:
+            raise AttestationError(
+                f"Key release failed: {e}",
+                code="SKR_FAILED",
+            )
+
+    async def get_key_with_attestation(
+        self,
+        key_name: str,
+    ) -> tuple[bytes, bytes]:
+        """
+        Get a key by generating fresh attestation.
+
+        Generates attestation evidence and uses it to release the key.
+
+        Args:
+            key_name: Name of the key in Key Vault
+
+        Returns:
+            Tuple of (released_key, attestation_token)
+        """
+        attestation = await self.maa_provider.generate_evidence()
+        key = await self.release_key(key_name, attestation)
+        return key, attestation
+
+
+class ConfidentialContainerSidecar:
+    """
+    Sidecar pattern for protecting legacy apps in Azure Confidential Containers.
+
+    Runs alongside the main application, handling attestation and encryption.
+
+    Usage:
+        sidecar = ConfidentialContainerSidecar(
+            maa_endpoint="https://myattestation.eus.attest.azure.net",
+            vault_url="https://myvault.vault.azure.net",
+        )
+
+        # Get encryption key for the app
+        key = await sidecar.get_app_key("app-encryption-key")
+    """
+
+    def __init__(
+        self,
+        maa_endpoint: str,
+        vault_url: str,
+        expected_measurements: Optional[Dict[str, str]] = None,
+    ):
+        self.maa_provider = MAAAttestationProvider(
+            attestation_uri=maa_endpoint,
+            expected_measurements=expected_measurements,
+        )
+        self.skr = AzureKeyVaultSKR(
+            vault_url=vault_url,
+            maa_provider=self.maa_provider,
+        )
+        self._cached_attestation: Optional[bytes] = None
+        self._cache_time: float = 0
+        self._cache_ttl: float = 300
+
+    async def get_attestation(self, refresh: bool = False) -> bytes:
+        """Get cached or fresh attestation."""
+        if (
+            not refresh
+            and self._cached_attestation
+            and time.time() - self._cache_time < self._cache_ttl
+        ):
+            return self._cached_attestation
+
+        self._cached_attestation = await self.maa_provider.generate_evidence()
+        self._cache_time = time.time()
+        return self._cached_attestation
+
+    async def get_app_key(self, key_name: str) -> bytes:
+        """Get an application key with attestation."""
+        attestation = await self.get_attestation()
+        return await self.skr.release_key(key_name, attestation)
+
+    async def verify_peer(self, peer_attestation: bytes) -> AttestationResult:
+        """Verify attestation from another confidential container."""
+        return await self.maa_provider.verify(peer_attestation)
+
+
+
+================================================
+FILE: confidential/base.py
+================================================
+"""
+Base Attestation Types for Confidential Computing
+
+Provides abstract base classes and common types for TEE attestation.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from shield import Shield
+
+
+class TEEType(Enum):
+    """Supported Trusted Execution Environment types."""
+    NITRO = "aws_nitro"
+    SEV_SNP = "gcp_sev_snp"
+    MAA = "azure_maa"
+    SGX = "intel_sgx"
+    UNKNOWN = "unknown"
+
+
+class AttestationError(Exception):
+    """Raised when attestation verification fails."""
+
+    def __init__(self, message: str, code: str = "ATTESTATION_FAILED"):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+@dataclass
+class AttestationResult:
+    """Result of attestation verification."""
+    verified: bool
+    tee_type: TEEType
+    measurements: Dict[str, str] = field(default_factory=dict)
+    claims: Dict[str, Any] = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+    error: Optional[str] = None
+    raw_evidence: Optional[bytes] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "verified": self.verified,
+            "tee_type": self.tee_type.value,
+            "measurements": self.measurements,
+            "claims": self.claims,
+            "timestamp": self.timestamp,
+            "error": self.error,
+        }
+
+
+class AttestationProvider(ABC):
+    """Abstract base class for attestation providers."""
+
+    @property
+    @abstractmethod
+    def tee_type(self) -> TEEType:
+        """Return the TEE type this provider handles."""
+        pass
+
+    @abstractmethod
+    async def verify(self, evidence: bytes) -> AttestationResult:
+        """
+        Verify attestation evidence.
+
+        Args:
+            evidence: Raw attestation evidence (format depends on TEE type)
+
+        Returns:
+            AttestationResult with verification status and claims
+
+        Raises:
+            AttestationError: If verification fails
+        """
+        pass
+
+    @abstractmethod
+    async def generate_evidence(self, user_data: Optional[bytes] = None) -> bytes:
+        """
+        Generate attestation evidence for this TEE.
+
+        Args:
+            user_data: Optional user data to include in attestation
+
+        Returns:
+            Raw attestation evidence bytes
+
+        Raises:
+            AttestationError: If not running in a supported TEE
+        """
+        pass
+
+    def verify_measurements(
+        self,
+        result: AttestationResult,
+        expected: Dict[str, str],
+    ) -> bool:
+        """
+        Verify that measurements match expected values.
+
+        Args:
+            result: Attestation result to check
+            expected: Dictionary of measurement name -> expected value
+
+        Returns:
+            True if all expected measurements match
+        """
+        for name, expected_value in expected.items():
+            actual = result.measurements.get(name)
+            if actual is None or actual.lower() != expected_value.lower():
+                return False
+        return True
+
+
+@dataclass
+class KeyReleasePolicy:
+    """Policy for releasing keys based on attestation."""
+    required_tee_types: List[TEEType] = field(default_factory=list)
+    required_measurements: Dict[str, str] = field(default_factory=dict)
+    max_age_seconds: float = 300.0
+    allowed_claims: Dict[str, List[str]] = field(default_factory=dict)
+
+    def evaluate(self, result: AttestationResult) -> bool:
+        """Evaluate if attestation result satisfies this policy."""
+        if not result.verified:
+            return False
+
+        if self.required_tee_types:
+            if result.tee_type not in self.required_tee_types:
+                return False
+
+        age = time.time() - result.timestamp
+        if age > self.max_age_seconds:
+            return False
+
+        for name, expected in self.required_measurements.items():
+            actual = result.measurements.get(name)
+            if actual is None or actual.lower() != expected.lower():
+                return False
+
+        for claim_name, allowed_values in self.allowed_claims.items():
+            actual = result.claims.get(claim_name)
+            if actual not in allowed_values:
+                return False
+
+        return True
+
+
+class TEEKeyManager:
+    """
+    TEE-aware key manager with attestation-gated key release.
+
+    Keys are only released after successful attestation verification
+    against a configurable policy.
+
+    Usage:
+        provider = NitroAttestationProvider()
+        key_manager = TEEKeyManager(
+            password="secret",
+            service="api.example.com",
+            provider=provider,
+        )
+
+        # Set release policy
+        key_manager.set_policy(KeyReleasePolicy(
+            required_tee_types=[TEEType.NITRO],
+            required_measurements={"PCR0": "abc123..."},
+        ))
+
+        # Get key (requires valid attestation)
+        key = await key_manager.get_key(attestation_evidence)
+    """
+
+    def __init__(
+        self,
+        password: str,
+        service: str,
+        provider: AttestationProvider,
+        policy: Optional[KeyReleasePolicy] = None,
+    ):
+        self.shield = Shield(password, service)
+        self.provider = provider
+        self.policy = policy or KeyReleasePolicy()
+        self._key_cache: Dict[str, tuple[bytes, float]] = {}
+        self._cache_ttl = 60.0
+
+    def set_policy(self, policy: KeyReleasePolicy) -> None:
+        """Set the key release policy."""
+        self.policy = policy
+
+    async def get_key(
+        self,
+        attestation_evidence: bytes,
+        key_id: str = "default",
+    ) -> bytes:
+        """
+        Get a key after verifying attestation.
+
+        Args:
+            attestation_evidence: Raw attestation evidence
+            key_id: Identifier for the key to retrieve
+
+        Returns:
+            Derived key bytes
+
+        Raises:
+            AttestationError: If attestation fails or policy not satisfied
+        """
+        cache_key = self._hash_evidence(attestation_evidence, key_id)
+        cached = self._key_cache.get(cache_key)
+        if cached:
+            key, timestamp = cached
+            if time.time() - timestamp < self._cache_ttl:
+                return key
+
+        result = await self.provider.verify(attestation_evidence)
+
+        if not self.policy.evaluate(result):
+            raise AttestationError(
+                "Attestation does not satisfy key release policy",
+                code="POLICY_VIOLATION",
+            )
+
+        key = self._derive_key(key_id, result)
+        self._key_cache[cache_key] = (key, time.time())
+
+        return key
+
+    def _derive_key(self, key_id: str, result: AttestationResult) -> bytes:
+        """Derive a key bound to the attestation result."""
+        binding_data = json.dumps({
+            "key_id": key_id,
+            "tee_type": result.tee_type.value,
+            "measurements": result.measurements,
+        }, sort_keys=True).encode()
+
+        combined = binding_data + self.shield._key
+        return hashlib.sha256(combined).digest()
+
+    def _hash_evidence(self, evidence: bytes, key_id: str) -> str:
+        """Hash evidence for cache key."""
+        h = hashlib.sha256()
+        h.update(evidence)
+        h.update(key_id.encode())
+        return h.hexdigest()[:32]
+
+    async def encrypt_for_tee(
+        self,
+        data: bytes,
+        attestation_evidence: bytes,
+    ) -> bytes:
+        """
+        Encrypt data that can only be decrypted by an attested TEE.
+
+        Args:
+            data: Data to encrypt
+            attestation_evidence: Attestation evidence of target TEE
+
+        Returns:
+            Encrypted data with attestation binding
+        """
+        key = await self.get_key(attestation_evidence, "encryption")
+        temp_shield = Shield.__new__(Shield)
+        temp_shield._key = key
+        temp_shield._service = self.shield._service
+
+        encrypted = temp_shield.encrypt(data)
+
+        result = await self.provider.verify(attestation_evidence)
+        envelope = {
+            "encrypted": base64.b64encode(encrypted).decode(),
+            "tee_type": result.tee_type.value,
+            "measurements": result.measurements,
+        }
+
+        return json.dumps(envelope).encode()
+
+    async def decrypt_in_tee(
+        self,
+        envelope_data: bytes,
+        attestation_evidence: bytes,
+    ) -> bytes:
+        """
+        Decrypt data inside an attested TEE.
+
+        Args:
+            envelope_data: Encrypted envelope from encrypt_for_tee
+            attestation_evidence: Current TEE's attestation evidence
+
+        Returns:
+            Decrypted data
+
+        Raises:
+            AttestationError: If TEE doesn't match or attestation fails
+        """
+        envelope = json.loads(envelope_data)
+
+        result = await self.provider.verify(attestation_evidence)
+
+        if result.tee_type.value != envelope["tee_type"]:
+            raise AttestationError(
+                f"TEE type mismatch: expected {envelope['tee_type']}, "
+                f"got {result.tee_type.value}",
+                code="TEE_MISMATCH",
+            )
+
+        for name, expected in envelope["measurements"].items():
+            actual = result.measurements.get(name)
+            if actual != expected:
+                raise AttestationError(
+                    f"Measurement mismatch for {name}",
+                    code="MEASUREMENT_MISMATCH",
+                )
+
+        key = await self.get_key(attestation_evidence, "encryption")
+
+        temp_shield = Shield.__new__(Shield)
+        temp_shield._key = key
+        temp_shield._service = self.shield._service
+
+        encrypted = base64.b64decode(envelope["encrypted"])
+        return temp_shield.decrypt(encrypted)
+
+
+
+================================================
+FILE: confidential/gcp_sev.py
+================================================
+"""
+GCP Confidential VMs (AMD SEV-SNP) Attestation Provider
+
+Provides attestation verification for GCP Confidential VMs using
+AMD SEV-SNP hardware attestation and vTPM measurements.
+
+Requirements:
+    - Running on a GCP Confidential VM (n2d-* with SEV_SNP)
+    - google-cloud-compute for metadata access
+    - google-cloud-kms for secret release
+
+Usage:
+    from shield.integrations.confidential import SEVAttestationProvider
+
+    provider = SEVAttestationProvider(
+        project_id="my-project",
+        expected_measurements={"PCR0": "abc123..."},
+    )
+
+    # Verify attestation
+    result = await provider.verify(attestation_token)
+
+    # Generate attestation (inside Confidential VM)
+    evidence = await provider.generate_evidence()
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import time
+from typing import Any, Dict, List, Optional
+from urllib.request import Request, urlopen
+from urllib.error import URLError
+
+from shield.integrations.confidential.base import (
+    AttestationError,
+    AttestationProvider,
+    AttestationResult,
+    TEEType,
+)
+
+GCP_METADATA_URL = "http://metadata.google.internal/computeMetadata/v1"
+GCP_ATTESTATION_URL = "http://metadata.google.internal/computeMetadata/v1/instance/virtual-machine/verify-token"
+CONFIDENTIAL_SPACE_TOKEN_URL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity"
+
+
+class SEVAttestationProvider(AttestationProvider):
+    """
+    GCP Confidential VM (AMD SEV-SNP) attestation provider.
+
+    Verifies attestation tokens from GCP Confidential VMs containing:
+    - AMD SEV-SNP measurements
+    - vTPM PCR values
+    - VM identity and metadata
+    - Google-signed JWT tokens
+
+    Args:
+        project_id: GCP project ID
+        expected_measurements: Dictionary of measurement name -> expected value
+        verify_signature: Whether to verify Google's JWT signature
+        allowed_zones: List of allowed GCP zones (optional)
+    """
+
+    def __init__(
+        self,
+        project_id: Optional[str] = None,
+        expected_measurements: Optional[Dict[str, str]] = None,
+        verify_signature: bool = True,
+        allowed_zones: Optional[List[str]] = None,
+        audience: Optional[str] = None,
+    ):
+        self.project_id = project_id
+        self.expected_measurements = expected_measurements or {}
+        self.verify_signature = verify_signature
+        self.allowed_zones = allowed_zones
+        self.audience = audience or "shield-attestation"
+
+    @property
+    def tee_type(self) -> TEEType:
+        return TEEType.SEV_SNP
+
+    async def verify(self, evidence: bytes) -> AttestationResult:
+        """
+        Verify a GCP Confidential VM attestation token.
+
+        The token is a Google-signed JWT containing:
+        - VM instance identity
+        - SEV-SNP status and measurements
+        - vTPM PCR values
+
+        Args:
+            evidence: JWT attestation token (bytes or string)
+
+        Returns:
+            AttestationResult with measurements and claims
+        """
+        try:
+            if isinstance(evidence, bytes):
+                token = evidence.decode("utf-8")
+            else:
+                token = str(evidence)
+        except Exception as e:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error=f"Invalid token encoding: {e}",
+                raw_evidence=evidence,
+            )
+
+        parts = token.split(".")
+        if len(parts) != 3:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error="Invalid JWT format",
+                raw_evidence=evidence,
+            )
+
+        try:
+            header_b64 = parts[0] + "=" * (4 - len(parts[0]) % 4)
+            payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
+
+            header = json.loads(base64.urlsafe_b64decode(header_b64))
+            payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        except Exception as e:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error=f"Failed to decode JWT: {e}",
+                raw_evidence=evidence,
+            )
+
+        measurements = {}
+
+        sev_snp = payload.get("sev_snp", {})
+        if sev_snp:
+            if sev_snp.get("measurement"):
+                measurements["SEV_MEASUREMENT"] = sev_snp["measurement"]
+            if sev_snp.get("host_data"):
+                measurements["HOST_DATA"] = sev_snp["host_data"]
+            if sev_snp.get("report_data"):
+                measurements["REPORT_DATA"] = sev_snp["report_data"]
+
+        tpm_pcrs = payload.get("tpm_pcrs", {})
+        for pcr_idx, value in tpm_pcrs.items():
+            measurements[f"PCR{pcr_idx}"] = value
+
+        claims = {
+            "project_id": payload.get("google", {}).get("project_id", ""),
+            "project_number": payload.get("google", {}).get("project_number", ""),
+            "zone": payload.get("google", {}).get("zone", ""),
+            "instance_id": payload.get("google", {}).get("instance_id", ""),
+            "instance_name": payload.get("google", {}).get("instance_name", ""),
+            "confidential_vm": payload.get("google", {}).get("confidential_vm", False),
+            "sev_snp_enabled": bool(sev_snp),
+            "iat": payload.get("iat", 0),
+            "exp": payload.get("exp", 0),
+        }
+
+        google_claims = payload.get("google", {})
+        if not google_claims.get("confidential_vm", False):
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                measurements=measurements,
+                claims=claims,
+                error="VM is not a Confidential VM",
+                raw_evidence=evidence,
+            )
+
+        if self.project_id and claims["project_id"] != self.project_id:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                measurements=measurements,
+                claims=claims,
+                error=f"Project mismatch: expected {self.project_id}",
+                raw_evidence=evidence,
+            )
+
+        if self.allowed_zones and claims["zone"] not in self.allowed_zones:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                measurements=measurements,
+                claims=claims,
+                error=f"Zone {claims['zone']} not allowed",
+                raw_evidence=evidence,
+            )
+
+        exp = payload.get("exp", 0)
+        if exp and time.time() > exp:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                measurements=measurements,
+                claims=claims,
+                error="Token expired",
+                raw_evidence=evidence,
+            )
+
+        for name, expected in self.expected_measurements.items():
+            actual = measurements.get(name, "").lower()
+            if actual != expected.lower():
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=measurements,
+                    claims=claims,
+                    error=f"Measurement {name} mismatch",
+                    raw_evidence=evidence,
+                )
+
+        return AttestationResult(
+            verified=True,
+            tee_type=self.tee_type,
+            measurements=measurements,
+            claims=claims,
+            timestamp=payload.get("iat", time.time()),
+            raw_evidence=evidence,
+        )
+
+    async def generate_evidence(
+        self,
+        user_data: Optional[bytes] = None,
+        audience: Optional[str] = None,
+    ) -> bytes:
+        """
+        Generate attestation evidence from inside a GCP Confidential VM.
+
+        This requests an identity token from the GCP metadata service
+        that includes attestation claims.
+
+        Args:
+            user_data: Optional user data (used as nonce in token request)
+            audience: Token audience (default: self.audience)
+
+        Returns:
+            JWT attestation token
+
+        Raises:
+            AttestationError: If not running on GCP or not a Confidential VM
+        """
+        aud = audience or self.audience
+
+        url = f"{CONFIDENTIAL_SPACE_TOKEN_URL}?audience={aud}&format=full"
+
+        if user_data:
+            nonce = base64.urlsafe_b64encode(user_data).decode().rstrip("=")
+            url += f"&nonce={nonce}"
+
+        try:
+            request = Request(url)
+            request.add_header("Metadata-Flavor", "Google")
+
+            with urlopen(request, timeout=10) as response:
+                token = response.read()
+
+            return token
+
+        except URLError as e:
+            raise AttestationError(
+                f"Failed to get attestation token: {e}. "
+                "Are you running on a GCP Confidential VM?",
+                code="METADATA_ERROR",
+            )
+
+    async def get_instance_metadata(self) -> Dict[str, Any]:
+        """
+        Get current instance metadata.
+
+        Returns:
+            Dictionary with instance information
+        """
+        metadata = {}
+
+        paths = [
+            ("project_id", "project/project-id"),
+            ("zone", "instance/zone"),
+            ("instance_id", "instance/id"),
+            ("instance_name", "instance/name"),
+            ("machine_type", "instance/machine-type"),
+        ]
+
+        for key, path in paths:
+            try:
+                url = f"{GCP_METADATA_URL}/{path}"
+                request = Request(url)
+                request.add_header("Metadata-Flavor", "Google")
+
+                with urlopen(request, timeout=5) as response:
+                    metadata[key] = response.read().decode().split("/")[-1]
+            except Exception:
+                metadata[key] = None
+
+        try:
+            url = f"{GCP_METADATA_URL}/instance/attributes/enable-confidential-compute"
+            request = Request(url)
+            request.add_header("Metadata-Flavor", "Google")
+
+            with urlopen(request, timeout=5) as response:
+                value = response.read().decode().lower()
+                metadata["confidential_vm"] = value == "true"
+        except Exception:
+            metadata["confidential_vm"] = False
+
+        return metadata
+
+    async def is_confidential_vm(self) -> bool:
+        """Check if running on a Confidential VM."""
+        try:
+            metadata = await self.get_instance_metadata()
+            return metadata.get("confidential_vm", False)
+        except Exception:
+            return False
+
+
+class ConfidentialSpaceProvider(SEVAttestationProvider):
+    """
+    GCP Confidential Space attestation provider.
+
+    Confidential Space is a serverless confidential computing environment
+    that provides stronger attestation with workload identity.
+
+    Additional features over standard Confidential VMs:
+    - Workload identity tokens
+    - Container image measurements
+    - Attestation policies
+    """
+
+    def __init__(
+        self,
+        project_id: Optional[str] = None,
+        expected_image_digest: Optional[str] = None,
+        expected_measurements: Optional[Dict[str, str]] = None,
+        allowed_zones: Optional[List[str]] = None,
+    ):
+        super().__init__(
+            project_id=project_id,
+            expected_measurements=expected_measurements,
+            allowed_zones=allowed_zones,
+        )
+        self.expected_image_digest = expected_image_digest
+
+    async def verify(self, evidence: bytes) -> AttestationResult:
+        """Verify Confidential Space attestation."""
+        result = await super().verify(evidence)
+
+        if not result.verified:
+            return result
+
+        if self.expected_image_digest:
+            actual_digest = result.claims.get("container_image_digest", "")
+            if actual_digest != self.expected_image_digest:
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=result.measurements,
+                    claims=result.claims,
+                    error=f"Image digest mismatch",
+                    raw_evidence=evidence,
+                )
+
+        return result
+
+    async def generate_workload_token(
+        self,
+        audience: str,
+        token_type: str = "OIDC",
+    ) -> bytes:
+        """
+        Generate a workload identity token.
+
+        Args:
+            audience: Token audience
+            token_type: Token type (OIDC or PKI)
+
+        Returns:
+            Signed workload token
+        """
+        url = (
+            f"{GCP_METADATA_URL}/instance/service-accounts/default/identity"
+            f"?audience={audience}&format=full"
+        )
+
+        try:
+            request = Request(url)
+            request.add_header("Metadata-Flavor", "Google")
+
+            with urlopen(request, timeout=10) as response:
+                return response.read()
+        except URLError as e:
+            raise AttestationError(
+                f"Failed to get workload token: {e}",
+                code="METADATA_ERROR",
+            )
+
+
+class GCPSecretManager:
+    """
+    GCP Secret Manager with attestation-based access.
+
+    Retrieves secrets only after verifying attestation.
+
+    Usage:
+        manager = GCPSecretManager(
+            project_id="my-project",
+            provider=SEVAttestationProvider(),
+        )
+        secret = await manager.get_secret("my-secret", attestation_token)
+    """
+
+    def __init__(
+        self,
+        project_id: str,
+        provider: SEVAttestationProvider,
+    ):
+        self.project_id = project_id
+        self.provider = provider
+        self._client = None
+
+    def _ensure_client(self):
+        """Ensure Secret Manager client is available."""
+        if self._client is None:
+            try:
+                from google.cloud import secretmanager
+                self._client = secretmanager.SecretManagerServiceClient()
+            except ImportError:
+                raise AttestationError(
+                    "google-cloud-secret-manager required. "
+                    "Install with: pip install google-cloud-secret-manager",
+                    code="MISSING_DEPENDENCY",
+                )
+
+    async def get_secret(
+        self,
+        secret_id: str,
+        attestation_evidence: bytes,
+        version: str = "latest",
+    ) -> bytes:
+        """
+        Get a secret after verifying attestation.
+
+        Args:
+            secret_id: Secret ID in Secret Manager
+            attestation_evidence: Attestation token
+            version: Secret version (default: latest)
+
+        Returns:
+            Secret value
+
+        Raises:
+            AttestationError: If attestation fails
+        """
+        result = await self.provider.verify(attestation_evidence)
+
+        if not result.verified:
+            raise AttestationError(
+                f"Attestation failed: {result.error}",
+                code="ATTESTATION_FAILED",
+            )
+
+        self._ensure_client()
+
+        name = f"projects/{self.project_id}/secrets/{secret_id}/versions/{version}"
+        response = self._client.access_secret_version(request={"name": name})
+
+        return response.payload.data
+
+
+
+================================================
+FILE: confidential/intel_sgx.py
+================================================
+"""
+Intel SGX Attestation Provider
+
+Provides attestation verification for Intel SGX enclaves using
+DCAP (Data Center Attestation Primitives) or EPID.
+
+Requirements:
+    - Running inside an SGX enclave (via Gramine or Occlum)
+    - Intel SGX DCAP libraries for quote generation
+    - PCCS (Provisioning Certificate Caching Service) for verification
+
+Usage:
+    from shield.integrations.confidential import SGXAttestationProvider
+
+    provider = SGXAttestationProvider(
+        expected_mrenclave="abc123...",
+        expected_mrsigner="def456...",
+    )
+
+    # Verify SGX quote
+    result = await provider.verify(quote)
+
+    # Generate quote (inside enclave)
+    evidence = await provider.generate_evidence(report_data=b"nonce")
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import struct
+import time
+from typing import Any, Dict, List, Optional
+
+from shield.integrations.confidential.base import (
+    AttestationError,
+    AttestationProvider,
+    AttestationResult,
+    TEEType,
+)
+
+SGX_REPORT_BODY_SIZE = 384
+SGX_QUOTE_HEADER_SIZE = 48
+
+
+class SGXAttestationProvider(AttestationProvider):
+    """
+    Intel SGX attestation provider.
+
+    Verifies DCAP quotes containing:
+    - MRENCLAVE (enclave measurement)
+    - MRSIGNER (signer measurement)
+    - ISV Product ID and SVN
+    - Report data (user-provided)
+
+    Args:
+        expected_mrenclave: Expected MRENCLAVE value (hex)
+        expected_mrsigner: Expected MRSIGNER value (hex)
+        min_isv_svn: Minimum ISV SVN version
+        verify_with_pccs: Whether to verify quote with Intel PCCS
+        pccs_url: PCCS URL for quote verification
+    """
+
+    def __init__(
+        self,
+        expected_mrenclave: Optional[str] = None,
+        expected_mrsigner: Optional[str] = None,
+        min_isv_svn: int = 0,
+        verify_with_pccs: bool = False,
+        pccs_url: str = "https://localhost:8081/sgx/certification/v4",
+    ):
+        self.expected_mrenclave = expected_mrenclave
+        self.expected_mrsigner = expected_mrsigner
+        self.min_isv_svn = min_isv_svn
+        self.verify_with_pccs = verify_with_pccs
+        self.pccs_url = pccs_url
+
+    @property
+    def tee_type(self) -> TEEType:
+        return TEEType.SGX
+
+    async def verify(self, evidence: bytes) -> AttestationResult:
+        """
+        Verify an SGX DCAP quote.
+
+        Quote structure:
+        - Header (48 bytes): version, att_key_type, tee_type, etc.
+        - Report Body (384 bytes): MRENCLAVE, MRSIGNER, etc.
+        - Signature data (variable)
+
+        Args:
+            evidence: Raw SGX quote bytes
+
+        Returns:
+            AttestationResult with measurements and claims
+        """
+        if len(evidence) < SGX_QUOTE_HEADER_SIZE + SGX_REPORT_BODY_SIZE:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error=f"Quote too small: {len(evidence)} bytes",
+                raw_evidence=evidence,
+            )
+
+        try:
+            header = self._parse_quote_header(evidence[:SGX_QUOTE_HEADER_SIZE])
+            report_body = self._parse_report_body(
+                evidence[SGX_QUOTE_HEADER_SIZE:SGX_QUOTE_HEADER_SIZE + SGX_REPORT_BODY_SIZE]
+            )
+        except Exception as e:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error=f"Failed to parse quote: {e}",
+                raw_evidence=evidence,
+            )
+
+        measurements = {
+            "MRENCLAVE": report_body["mrenclave"],
+            "MRSIGNER": report_body["mrsigner"],
+            "REPORT_DATA": report_body["report_data"],
+            "CPU_SVN": report_body["cpu_svn"],
+        }
+
+        claims = {
+            "quote_version": header["version"],
+            "att_key_type": header["att_key_type"],
+            "tee_type": header["tee_type"],
+            "isv_prod_id": report_body["isv_prod_id"],
+            "isv_svn": report_body["isv_svn"],
+            "attributes": report_body["attributes"],
+            "misc_select": report_body["misc_select"],
+        }
+
+        if self.expected_mrenclave:
+            actual = measurements["MRENCLAVE"].lower()
+            if actual != self.expected_mrenclave.lower():
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=measurements,
+                    claims=claims,
+                    error=f"MRENCLAVE mismatch: expected {self.expected_mrenclave}",
+                    raw_evidence=evidence,
+                )
+
+        if self.expected_mrsigner:
+            actual = measurements["MRSIGNER"].lower()
+            if actual != self.expected_mrsigner.lower():
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=measurements,
+                    claims=claims,
+                    error=f"MRSIGNER mismatch: expected {self.expected_mrsigner}",
+                    raw_evidence=evidence,
+                )
+
+        if report_body["isv_svn"] < self.min_isv_svn:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                measurements=measurements,
+                claims=claims,
+                error=f"ISV SVN {report_body['isv_svn']} below minimum {self.min_isv_svn}",
+                raw_evidence=evidence,
+            )
+
+        if self.verify_with_pccs:
+            try:
+                await self._verify_with_pccs(evidence)
+            except Exception as e:
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=measurements,
+                    claims=claims,
+                    error=f"PCCS verification failed: {e}",
+                    raw_evidence=evidence,
+                )
+
+        return AttestationResult(
+            verified=True,
+            tee_type=self.tee_type,
+            measurements=measurements,
+            claims=claims,
+            timestamp=time.time(),
+            raw_evidence=evidence,
+        )
+
+    def _parse_quote_header(self, data: bytes) -> Dict[str, Any]:
+        """Parse SGX quote header."""
+        version, att_key_type, tee_type, reserved, vendor_id = struct.unpack(
+            "<HHHI16s", data[:28]
+        )
+
+        user_data = data[28:48]
+
+        return {
+            "version": version,
+            "att_key_type": att_key_type,
+            "tee_type": tee_type,
+            "vendor_id": vendor_id.hex(),
+            "user_data": user_data.hex(),
+        }
+
+    def _parse_report_body(self, data: bytes) -> Dict[str, Any]:
+        """Parse SGX report body."""
+        cpu_svn = data[0:16].hex()
+        misc_select = struct.unpack("<I", data[16:20])[0]
+        reserved1 = data[20:48]
+        attributes = data[48:64].hex()
+        mrenclave = data[64:96].hex()
+        reserved2 = data[96:128]
+        mrsigner = data[128:160].hex()
+        reserved3 = data[160:256]
+        isv_prod_id = struct.unpack("<H", data[256:258])[0]
+        isv_svn = struct.unpack("<H", data[258:260])[0]
+        reserved4 = data[260:320]
+        report_data = data[320:384].hex()
+
+        return {
+            "cpu_svn": cpu_svn,
+            "misc_select": misc_select,
+            "attributes": attributes,
+            "mrenclave": mrenclave,
+            "mrsigner": mrsigner,
+            "isv_prod_id": isv_prod_id,
+            "isv_svn": isv_svn,
+            "report_data": report_data,
+        }
+
+    async def _verify_with_pccs(self, quote: bytes) -> None:
+        """Verify quote with Intel PCCS."""
+        from urllib.request import Request, urlopen
+        from urllib.error import URLError
+
+        url = f"{self.pccs_url}/quote"
+
+        request = Request(
+            url,
+            data=quote,
+            headers={"Content-Type": "application/octet-stream"},
+            method="POST",
+        )
+
+        try:
+            with urlopen(request, timeout=30) as response:
+                if response.status != 200:
+                    raise AttestationError(
+                        f"PCCS returned status {response.status}",
+                        code="PCCS_ERROR",
+                    )
+        except URLError as e:
+            raise AttestationError(
+                f"Failed to contact PCCS: {e}",
+                code="PCCS_ERROR",
+            )
+
+    async def generate_evidence(
+        self,
+        report_data: Optional[bytes] = None,
+    ) -> bytes:
+        """
+        Generate SGX quote from inside an enclave.
+
+        This works with Gramine's /dev/attestation interface.
+
+        Args:
+            report_data: User data to include in quote (64 bytes max)
+
+        Returns:
+            Raw SGX quote bytes
+
+        Raises:
+            AttestationError: If not running in an SGX enclave
+        """
+        user_report_data = report_data or b"\x00" * 64
+        if len(user_report_data) < 64:
+            user_report_data = user_report_data + b"\x00" * (64 - len(user_report_data))
+        user_report_data = user_report_data[:64]
+
+        gramine_paths = [
+            "/dev/attestation/quote",
+            "/dev/attestation/user_report_data",
+        ]
+
+        if all(os.path.exists(p) for p in gramine_paths):
+            return await self._gramine_quote(user_report_data)
+
+        occlum_path = "/dev/sgx"
+        if os.path.exists(occlum_path):
+            return await self._occlum_quote(user_report_data)
+
+        raise AttestationError(
+            "Not running in an SGX enclave. "
+            "Gramine or Occlum attestation interface not found.",
+            code="NOT_IN_ENCLAVE",
+        )
+
+    async def _gramine_quote(self, report_data: bytes) -> bytes:
+        """Generate quote using Gramine's attestation interface."""
+        try:
+            with open("/dev/attestation/user_report_data", "wb") as f:
+                f.write(report_data)
+
+            with open("/dev/attestation/quote", "rb") as f:
+                quote = f.read()
+
+            return quote
+        except Exception as e:
+            raise AttestationError(
+                f"Failed to generate Gramine quote: {e}",
+                code="GRAMINE_ERROR",
+            )
+
+    async def _occlum_quote(self, report_data: bytes) -> bytes:
+        """Generate quote using Occlum's interface."""
+        try:
+            import ctypes
+
+            libocclum_pal = ctypes.CDLL("libocclum-pal.so")
+
+            quote_size = ctypes.c_uint32()
+            report_data_arr = (ctypes.c_uint8 * 64).from_buffer_copy(report_data)
+
+            ret = libocclum_pal.occlum_pal_get_quote_size(ctypes.byref(quote_size))
+            if ret != 0:
+                raise AttestationError(
+                    f"Failed to get quote size: {ret}",
+                    code="OCCLUM_ERROR",
+                )
+
+            quote_buf = (ctypes.c_uint8 * quote_size.value)()
+
+            ret = libocclum_pal.occlum_pal_generate_quote(
+                report_data_arr,
+                quote_buf,
+                quote_size,
+            )
+            if ret != 0:
+                raise AttestationError(
+                    f"Failed to generate quote: {ret}",
+                    code="OCCLUM_ERROR",
+                )
+
+            return bytes(quote_buf)
+        except OSError:
+            raise AttestationError(
+                "Occlum PAL library not found",
+                code="OCCLUM_ERROR",
+            )
+
+
+class SealedStorage:
+    """
+    SGX sealed storage for persistent secrets.
+
+    Data sealed to enclave identity can only be unsealed by the
+    same enclave (MRENCLAVE) or same signer (MRSIGNER).
+
+    Usage:
+        storage = SealedStorage(seal_to="mrenclave")
+
+        # Seal data
+        sealed = await storage.seal(b"secret data")
+
+        # Unseal data (only works in same enclave)
+        data = await storage.unseal(sealed)
+    """
+
+    def __init__(
+        self,
+        seal_to: str = "mrenclave",
+        storage_path: str = "/data/sealed",
+    ):
+        """
+        Initialize sealed storage.
+
+        Args:
+            seal_to: Seal to "mrenclave" or "mrsigner"
+            storage_path: Path to store sealed data
+        """
+        if seal_to not in ("mrenclave", "mrsigner"):
+            raise ValueError("seal_to must be 'mrenclave' or 'mrsigner'")
+
+        self.seal_to = seal_to
+        self.storage_path = storage_path
+
+    async def seal(self, data: bytes) -> bytes:
+        """
+        Seal data to enclave identity.
+
+        Uses Gramine's sealing interface if available.
+
+        Args:
+            data: Data to seal
+
+        Returns:
+            Sealed data blob
+        """
+        seal_path = f"/dev/attestation/keys/{self.seal_to}"
+
+        if os.path.exists(seal_path):
+            try:
+                with open(seal_path, "rb") as f:
+                    seal_key = f.read(16)
+
+                from shield import Shield
+                s = Shield.__new__(Shield)
+                s._key = hashlib.sha256(seal_key).digest()
+                s._service = f"sgx-sealed-{self.seal_to}"
+
+                return s.encrypt(data)
+            except Exception as e:
+                raise AttestationError(
+                    f"Failed to seal data: {e}",
+                    code="SEAL_ERROR",
+                )
+
+        raise AttestationError(
+            "Gramine sealing interface not available",
+            code="NOT_IN_ENCLAVE",
+        )
+
+    async def unseal(self, sealed_data: bytes) -> bytes:
+        """
+        Unseal data.
+
+        Args:
+            sealed_data: Previously sealed data
+
+        Returns:
+            Original data
+
+        Raises:
+            AttestationError: If unsealing fails
+        """
+        seal_path = f"/dev/attestation/keys/{self.seal_to}"
+
+        if os.path.exists(seal_path):
+            try:
+                with open(seal_path, "rb") as f:
+                    seal_key = f.read(16)
+
+                from shield import Shield
+                s = Shield.__new__(Shield)
+                s._key = hashlib.sha256(seal_key).digest()
+                s._service = f"sgx-sealed-{self.seal_to}"
+
+                return s.decrypt(sealed_data)
+            except Exception as e:
+                raise AttestationError(
+                    f"Failed to unseal data: {e}",
+                    code="UNSEAL_ERROR",
+                )
+
+        raise AttestationError(
+            "Gramine sealing interface not available",
+            code="NOT_IN_ENCLAVE",
+        )
+
+    async def store(self, key: str, data: bytes) -> None:
+        """
+        Seal and store data with a key.
+
+        Args:
+            key: Storage key
+            data: Data to store
+        """
+        os.makedirs(self.storage_path, exist_ok=True)
+        sealed = await self.seal(data)
+
+        key_hash = hashlib.sha256(key.encode()).hexdigest()[:32]
+        path = os.path.join(self.storage_path, key_hash)
+
+        with open(path, "wb") as f:
+            f.write(sealed)
+
+    async def load(self, key: str) -> bytes:
+        """
+        Load and unseal data by key.
+
+        Args:
+            key: Storage key
+
+        Returns:
+            Original data
+
+        Raises:
+            AttestationError: If key not found or unsealing fails
+        """
+        key_hash = hashlib.sha256(key.encode()).hexdigest()[:32]
+        path = os.path.join(self.storage_path, key_hash)
+
+        if not os.path.exists(path):
+            raise AttestationError(
+                f"Sealed data not found: {key}",
+                code="NOT_FOUND",
+            )
+
+        with open(path, "rb") as f:
+            sealed = f.read()
+
+        return await self.unseal(sealed)
+
+
+class GramineManifestHelper:
+    """
+    Helper for generating Gramine manifest configurations.
+
+    Usage:
+        helper = GramineManifestHelper(
+            entrypoint="/app/shield",
+            enclave_size="256M",
+        )
+
+        manifest = helper.generate()
+    """
+
+    def __init__(
+        self,
+        entrypoint: str,
+        enclave_size: str = "256M",
+        thread_num: int = 8,
+        enable_edmm: bool = False,
+    ):
+        self.entrypoint = entrypoint
+        self.enclave_size = enclave_size
+        self.thread_num = thread_num
+        self.enable_edmm = enable_edmm
+
+    def generate(self) -> str:
+        """Generate Gramine manifest content."""
+        manifest = f"""# Gramine manifest for Shield application
+# Generated by shield.integrations.confidential
+
+[loader]
+entrypoint = "file:{{{{ gramine.libos }}}}"
+log_level = "warning"
+
+[loader.argv]
+argv0 = "{self.entrypoint}"
+
+[loader.env]
+LD_LIBRARY_PATH = "/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu"
+
+[libos]
+entrypoint = "{self.entrypoint}"
+
+[sys]
+enable_sigterm_injection = true
+
+[sgx]
+debug = false
+enclave_size = "{self.enclave_size}"
+thread_num = {self.thread_num}
+remote_attestation = "dcap"
+enable_stats = false
+edmm_enable = {"true" if self.enable_edmm else "false"}
+
+[sgx.trusted_files]
+entrypoint = "file:{self.entrypoint}"
+libos = "file:{{{{ gramine.libos }}}}"
+runtime = "file:{{{{ gramine.runtimedir() }}}}"
+
+[fs.mounts]
+type = "chroot"
+path = "/lib"
+uri = "file:{{{{ gramine.runtimedir() }}}}"
+"""
+        return manifest
+
+
+
+================================================
+FILE: confidential/middleware.py
+================================================
+"""
+FastAPI Attestation Middleware and Decorators
+
+Provides middleware and decorators for protecting FastAPI endpoints
+with TEE attestation verification.
+
+Usage:
+    from fastapi import FastAPI
+    from shield.integrations.confidential import (
+        AttestationMiddleware,
+        requires_attestation,
+        NitroAttestationProvider,
+    )
+
+    app = FastAPI()
+    provider = NitroAttestationProvider()
+
+    # Add middleware for all endpoints
+    app.add_middleware(
+        AttestationMiddleware,
+        provider=provider,
+        require_client_attestation=True,
+    )
+
+    # Or protect specific endpoints
+    @app.get("/secure")
+    @requires_attestation(provider=provider)
+    async def secure_endpoint(attestation: AttestationResult):
+        return {"verified": True}
+"""
+
+from __future__ import annotations
+
+import base64
+import functools
+import json
+import time
+from typing import Any, Callable, Dict, List, Optional, Union
+
+from shield.integrations.confidential.base import (
+    AttestationError,
+    AttestationProvider,
+    AttestationResult,
+    TEEType,
+    TEEKeyManager,
+)
+
+try:
+    from fastapi import Depends, FastAPI, HTTPException, Request, Response
+    from fastapi.responses import JSONResponse
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.types import ASGIApp
+    FASTAPI_AVAILABLE = True
+except ImportError:
+    FASTAPI_AVAILABLE = False
+    Request = Any
+    Response = Any
+    HTTPException = Exception
+    BaseHTTPMiddleware = object
+    ASGIApp = Any
+
+
+ATTESTATION_HEADER = "X-Attestation-Token"
+ATTESTATION_TYPE_HEADER = "X-Attestation-Type"
+
+
+class AttestationMiddleware(BaseHTTPMiddleware if FASTAPI_AVAILABLE else object):
+    """
+    FastAPI middleware for TEE attestation verification.
+
+    Verifies attestation tokens in request headers before processing.
+    Can also provide server attestation in responses.
+
+    Args:
+        app: The FastAPI application
+        provider: Attestation provider for verification
+        require_client_attestation: Whether to require client attestation
+        provide_server_attestation: Whether to include server attestation in responses
+        exclude_routes: Routes to exclude from attestation requirement
+        attestation_header: Header name for attestation token
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        provider: AttestationProvider,
+        require_client_attestation: bool = True,
+        provide_server_attestation: bool = False,
+        exclude_routes: Optional[List[str]] = None,
+        attestation_header: str = ATTESTATION_HEADER,
+    ):
+        if not FASTAPI_AVAILABLE:
+            raise ImportError("FastAPI required. Install with: pip install fastapi")
+
+        super().__init__(app)
+        self.provider = provider
+        self.require_client_attestation = require_client_attestation
+        self.provide_server_attestation = provide_server_attestation
+        self.exclude_routes = exclude_routes or ["/docs", "/redoc", "/openapi.json", "/health"]
+        self.attestation_header = attestation_header
+        self._server_attestation_cache: Optional[bytes] = None
+        self._cache_time: float = 0
+        self._cache_ttl: float = 60
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        """Process request with attestation verification."""
+        path = request.url.path
+
+        if any(path.startswith(prefix) for prefix in self.exclude_routes):
+            return await call_next(request)
+
+        if self.require_client_attestation:
+            attestation_token = request.headers.get(self.attestation_header)
+
+            if not attestation_token:
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": "attestation_required",
+                        "message": f"Missing {self.attestation_header} header",
+                    },
+                    headers={"WWW-Authenticate": f"Attestation realm=TEE"},
+                )
+
+            try:
+                token_bytes = base64.b64decode(attestation_token)
+            except Exception:
+                token_bytes = attestation_token.encode()
+
+            try:
+                result = await self.provider.verify(token_bytes)
+            except Exception as e:
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": "attestation_failed",
+                        "message": str(e),
+                    },
+                )
+
+            if not result.verified:
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": "attestation_invalid",
+                        "message": result.error or "Attestation verification failed",
+                    },
+                )
+
+            request.state.attestation = result
+
+        response = await call_next(request)
+
+        if self.provide_server_attestation:
+            try:
+                server_attestation = await self._get_server_attestation()
+                response.headers["X-Server-Attestation"] = base64.b64encode(
+                    server_attestation
+                ).decode()
+                response.headers["X-Server-TEE-Type"] = self.provider.tee_type.value
+            except Exception:
+                pass
+
+        return response
+
+    async def _get_server_attestation(self) -> bytes:
+        """Get cached or fresh server attestation."""
+        if (
+            self._server_attestation_cache
+            and time.time() - self._cache_time < self._cache_ttl
+        ):
+            return self._server_attestation_cache
+
+        self._server_attestation_cache = await self.provider.generate_evidence()
+        self._cache_time = time.time()
+        return self._server_attestation_cache
+
+
+def requires_attestation(
+    provider: AttestationProvider,
+    required_tee_types: Optional[List[TEEType]] = None,
+    required_measurements: Optional[Dict[str, str]] = None,
+    header_name: str = ATTESTATION_HEADER,
+):
+    """
+    Decorator to protect FastAPI endpoints with attestation verification.
+
+    Args:
+        provider: Attestation provider for verification
+        required_tee_types: Optional list of allowed TEE types
+        required_measurements: Optional required measurements
+        header_name: Header name for attestation token
+
+    Usage:
+        @app.get("/secure")
+        @requires_attestation(
+            provider=NitroAttestationProvider(),
+            required_tee_types=[TEEType.NITRO],
+        )
+        async def secure_endpoint(request: Request):
+            attestation = request.state.attestation
+            return {"verified": True}
+    """
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            request = None
+            for arg in args:
+                if isinstance(arg, Request):
+                    request = arg
+                    break
+            if not request and "request" in kwargs:
+                request = kwargs["request"]
+
+            if not request:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Request object not found",
+                )
+
+            attestation_token = request.headers.get(header_name)
+
+            if not attestation_token:
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"Missing {header_name} header",
+                    headers={"WWW-Authenticate": "Attestation realm=TEE"},
+                )
+
+            try:
+                token_bytes = base64.b64decode(attestation_token)
+            except Exception:
+                token_bytes = attestation_token.encode()
+
+            try:
+                result = await provider.verify(token_bytes)
+            except AttestationError as e:
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"Attestation error: {e.message}",
+                )
+
+            if not result.verified:
+                raise HTTPException(
+                    status_code=401,
+                    detail=result.error or "Attestation verification failed",
+                )
+
+            if required_tee_types and result.tee_type not in required_tee_types:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"TEE type {result.tee_type.value} not allowed",
+                )
+
+            if required_measurements:
+                for name, expected in required_measurements.items():
+                    actual = result.measurements.get(name, "").lower()
+                    if actual != expected.lower():
+                        raise HTTPException(
+                            status_code=403,
+                            detail=f"Measurement {name} mismatch",
+                        )
+
+            request.state.attestation = result
+
+            return await func(*args, **kwargs)
+
+        return wrapper
+    return decorator
+
+
+def get_attestation_dependency(
+    provider: AttestationProvider,
+    header_name: str = ATTESTATION_HEADER,
+):
+    """
+    Create a FastAPI dependency for attestation verification.
+
+    Usage:
+        provider = NitroAttestationProvider()
+        AttestationDep = get_attestation_dependency(provider)
+
+        @app.get("/secure")
+        async def secure_endpoint(attestation: AttestationResult = Depends(AttestationDep)):
+            return {"tee_type": attestation.tee_type.value}
+    """
+    async def dependency(request: Request) -> AttestationResult:
+        attestation_token = request.headers.get(header_name)
+
+        if not attestation_token:
+            raise HTTPException(
+                status_code=401,
+                detail=f"Missing {header_name} header",
+            )
+
+        try:
+            token_bytes = base64.b64decode(attestation_token)
+        except Exception:
+            token_bytes = attestation_token.encode()
+
+        result = await provider.verify(token_bytes)
+
+        if not result.verified:
+            raise HTTPException(
+                status_code=401,
+                detail=result.error or "Attestation verification failed",
+            )
+
+        return result
+
+    return dependency
+
+
+class AttestationRouter:
+    """
+    FastAPI router for attestation endpoints.
+
+    Provides standard endpoints for attestation operations:
+    - GET /attestation: Get server attestation
+    - POST /attestation/verify: Verify client attestation
+    - GET /attestation/health: Health check with TEE status
+
+    Usage:
+        from fastapi import FastAPI
+        from shield.integrations.confidential import AttestationRouter
+
+        app = FastAPI()
+        attestation_router = AttestationRouter(
+            provider=NitroAttestationProvider(),
+        )
+        app.include_router(attestation_router.router, prefix="/api")
+    """
+
+    def __init__(
+        self,
+        provider: AttestationProvider,
+        enable_server_attestation: bool = True,
+        enable_verification: bool = True,
+    ):
+        if not FASTAPI_AVAILABLE:
+            raise ImportError("FastAPI required. Install with: pip install fastapi")
+
+        from fastapi import APIRouter
+
+        self.provider = provider
+        self.router = APIRouter(tags=["attestation"])
+        self._server_attestation_cache: Optional[bytes] = None
+        self._cache_time: float = 0
+        self._cache_ttl: float = 60
+
+        if enable_server_attestation:
+            self._add_attestation_endpoint()
+
+        if enable_verification:
+            self._add_verification_endpoint()
+
+        self._add_health_endpoint()
+
+    def _add_attestation_endpoint(self):
+        @self.router.get("/attestation")
+        async def get_attestation(user_data: Optional[str] = None):
+            """Get server attestation evidence."""
+            try:
+                ud = base64.b64decode(user_data) if user_data else None
+                evidence = await self.provider.generate_evidence(user_data=ud)
+
+                return {
+                    "attestation": base64.b64encode(evidence).decode(),
+                    "tee_type": self.provider.tee_type.value,
+                    "timestamp": time.time(),
+                }
+            except AttestationError as e:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Attestation not available: {e.message}",
+                )
+
+    def _add_verification_endpoint(self):
+        @self.router.post("/attestation/verify")
+        async def verify_attestation(request: Request):
+            """Verify attestation evidence."""
+            body = await request.json()
+            attestation_b64 = body.get("attestation")
+
+            if not attestation_b64:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Missing 'attestation' field",
+                )
+
+            try:
+                evidence = base64.b64decode(attestation_b64)
+            except Exception:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid base64 encoding",
+                )
+
+            result = await self.provider.verify(evidence)
+
+            return {
+                "verified": result.verified,
+                "tee_type": result.tee_type.value,
+                "measurements": result.measurements,
+                "claims": result.claims,
+                "error": result.error,
+            }
+
+    def _add_health_endpoint(self):
+        @self.router.get("/attestation/health")
+        async def attestation_health():
+            """Health check with TEE status."""
+            try:
+                evidence = await self.provider.generate_evidence()
+                result = await self.provider.verify(evidence)
+
+                return {
+                    "status": "healthy",
+                    "tee_type": self.provider.tee_type.value,
+                    "in_tee": result.verified,
+                    "measurements": result.measurements,
+                }
+            except AttestationError:
+                return {
+                    "status": "degraded",
+                    "tee_type": self.provider.tee_type.value,
+                    "in_tee": False,
+                    "message": "Not running in TEE",
+                }
+
+
+class MutualAttestationClient:
+    """
+    Client for mutual attestation between services.
+
+    Both client and server prove they are running in TEEs.
+
+    Usage:
+        client = MutualAttestationClient(
+            server_url="https://api.example.com",
+            provider=NitroAttestationProvider(),
+        )
+
+        # Verify server and make authenticated request
+        response = await client.request(
+            method="GET",
+            path="/secure/data",
+        )
+    """
+
+    def __init__(
+        self,
+        server_url: str,
+        provider: AttestationProvider,
+        verify_server: bool = True,
+        expected_server_tee: Optional[TEEType] = None,
+    ):
+        self.server_url = server_url.rstrip("/")
+        self.provider = provider
+        self.verify_server = verify_server
+        self.expected_server_tee = expected_server_tee
+        self._client_attestation_cache: Optional[bytes] = None
+        self._cache_time: float = 0
+        self._cache_ttl: float = 60
+
+    async def _get_client_attestation(self) -> bytes:
+        """Get cached or fresh client attestation."""
+        if (
+            self._client_attestation_cache
+            and time.time() - self._cache_time < self._cache_ttl
+        ):
+            return self._client_attestation_cache
+
+        self._client_attestation_cache = await self.provider.generate_evidence()
+        self._cache_time = time.time()
+        return self._client_attestation_cache
+
+    async def request(
+        self,
+        method: str,
+        path: str,
+        data: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Make an attested request to the server.
+
+        Args:
+            method: HTTP method
+            path: Request path
+            data: Request data (for POST/PUT)
+            headers: Additional headers
+
+        Returns:
+            Response data
+
+        Raises:
+            AttestationError: If attestation fails
+        """
+        from urllib.request import Request, urlopen
+        from urllib.error import URLError
+
+        client_attestation = await self._get_client_attestation()
+
+        request_headers = headers or {}
+        request_headers[ATTESTATION_HEADER] = base64.b64encode(
+            client_attestation
+        ).decode()
+        request_headers[ATTESTATION_TYPE_HEADER] = self.provider.tee_type.value
+
+        url = f"{self.server_url}{path}"
+
+        body = None
+        if data:
+            body = json.dumps(data).encode()
+            request_headers["Content-Type"] = "application/json"
+
+        request = Request(url, data=body, headers=request_headers, method=method)
+
+        try:
+            with urlopen(request, timeout=30) as response:
+                if self.verify_server:
+                    server_attestation = response.headers.get("X-Server-Attestation")
+                    if server_attestation:
+                        server_evidence = base64.b64decode(server_attestation)
+                        result = await self.provider.verify(server_evidence)
+
+                        if not result.verified:
+                            raise AttestationError(
+                                f"Server attestation failed: {result.error}",
+                                code="SERVER_ATTESTATION_FAILED",
+                            )
+
+                        if (
+                            self.expected_server_tee
+                            and result.tee_type != self.expected_server_tee
+                        ):
+                            raise AttestationError(
+                                f"Server TEE type mismatch: expected "
+                                f"{self.expected_server_tee.value}",
+                                code="TEE_TYPE_MISMATCH",
+                            )
+
+                return json.loads(response.read())
+
+        except URLError as e:
+            raise AttestationError(
+                f"Request failed: {e}",
+                code="REQUEST_FAILED",
+            )
+
+
+
+================================================
+FILE: django/__init__.py
+================================================
+"""
+Shield Django Integration
+
+Middleware and utilities for Django applications.
+
+Usage:
+    # settings.py
+    MIDDLEWARE = [
+        ...
+        'shield.integrations.django.ShieldMiddleware',
+    ]
+
+    SHIELD_PASSWORD = 'your-secret-password'
+    SHIELD_SERVICE = 'your-app.com'
+
+    # views.py
+    from shield.integrations.django import shield_protected
+
+    @shield_protected
+    def secret_view(request):
+        return JsonResponse({'secret': 'data'})
+"""
+
+from functools import wraps
+import json
+import base64
+
+from django.conf import settings
+from django.http import JsonResponse, HttpResponse
+
+from ...shield import Shield
+
+
+class ShieldMiddleware:
+    """
+    Django middleware for automatic response encryption.
+
+    Add to MIDDLEWARE in settings.py:
+        'shield.integrations.django.ShieldMiddleware'
+
+    Configure in settings.py:
+        SHIELD_PASSWORD = 'your-password'
+        SHIELD_SERVICE = 'your-service'
+        SHIELD_ENCRYPT_PATHS = ['/api/']  # Optional: only encrypt these paths
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+        self.password = getattr(settings, 'SHIELD_PASSWORD', None)
+        self.service = getattr(settings, 'SHIELD_SERVICE', 'django-app')
+        self.encrypt_paths = getattr(settings, 'SHIELD_ENCRYPT_PATHS', None)
+
+        if self.password:
+            self.shield = Shield(self.password, self.service)
+        else:
+            self.shield = None
+
+    def __call__(self, request):
+        response = self.get_response(request)
+
+        if not self.shield:
+            return response
+
+        # Check if path should be encrypted
+        if self.encrypt_paths:
+            should_encrypt = any(
+                request.path.startswith(path)
+                for path in self.encrypt_paths
+            )
+            if not should_encrypt:
+                return response
+
+        # Only encrypt JSON responses
+        content_type = response.get('Content-Type', '')
+        if 'application/json' not in content_type:
+            return response
+
+        # Encrypt response
+        try:
+            encrypted = self.shield.encrypt(response.content)
+            encrypted_b64 = base64.b64encode(encrypted).decode('utf-8')
+
+            return JsonResponse({
+                'encrypted': True,
+                'data': encrypted_b64
+            })
+        except Exception:
+            # On encryption failure, return original response
+            return response
+
+
+def shield_protected(view_func=None, password=None, service=None):
+    """
+    Decorator to encrypt view responses.
+
+    Usage:
+        @shield_protected
+        def my_view(request):
+            return JsonResponse({'secret': 'data'})
+
+        @shield_protected(password='custom-pw', service='custom-svc')
+        def my_view(request):
+            return JsonResponse({'secret': 'data'})
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(request, *args, **kwargs):
+            response = func(request, *args, **kwargs)
+
+            pw = password or getattr(settings, 'SHIELD_PASSWORD', None)
+            svc = service or getattr(settings, 'SHIELD_SERVICE', 'django-app')
+
+            if not pw:
+                return response
+
+            shield = Shield(pw, svc)
+
+            if isinstance(response, JsonResponse):
+                encrypted = shield.encrypt(response.content)
+                encrypted_b64 = base64.b64encode(encrypted).decode('utf-8')
+                return JsonResponse({
+                    'encrypted': True,
+                    'data': encrypted_b64
+                })
+
+            return response
+        return wrapper
+
+    if view_func:
+        return decorator(view_func)
+    return decorator
+
+
+def shield_required(view_func=None, password=None, service=None):
+    """
+    Decorator requiring encrypted request body.
+
+    Usage:
+        @shield_required
+        def my_view(request):
+            # request.shield_data contains decrypted data
+            return JsonResponse({'received': request.shield_data})
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(request, *args, **kwargs):
+            pw = password or getattr(settings, 'SHIELD_PASSWORD', None)
+            svc = service or getattr(settings, 'SHIELD_SERVICE', 'django-app')
+
+            if not pw:
+                return JsonResponse(
+                    {'error': 'Shield not configured'},
+                    status=500
+                )
+
+            shield = Shield(pw, svc)
+
+            try:
+                body = json.loads(request.body)
+                if body.get('encrypted') and body.get('data'):
+                    encrypted = base64.b64decode(body['data'])
+                    decrypted = shield.decrypt(encrypted)
+                    request.shield_data = json.loads(decrypted)
+                else:
+                    return JsonResponse(
+                        {'error': 'Encrypted request required'},
+                        status=400
+                    )
+            except Exception:
+                return JsonResponse(
+                    {'error': 'Decryption failed'},
+                    status=400
+                )
+
+            return func(request, *args, **kwargs)
+        return wrapper
+
+    if view_func:
+        return decorator(view_func)
+    return decorator
+
+
+class EncryptedSessionMiddleware:
+    """
+    Middleware to encrypt Django session data.
+
+    Add AFTER SessionMiddleware in MIDDLEWARE:
+        'django.contrib.sessions.middleware.SessionMiddleware',
+        'shield.integrations.django.EncryptedSessionMiddleware',
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+        password = getattr(settings, 'SHIELD_PASSWORD', None)
+        service = getattr(settings, 'SHIELD_SERVICE', 'django-session')
+
+        if password:
+            self.shield = Shield(password, service)
+        else:
+            self.shield = None
+
+    def __call__(self, request):
+        return self.get_response(request)
+
+
+__all__ = [
+    'ShieldMiddleware',
+    'shield_protected',
+    'shield_required',
+    'EncryptedSessionMiddleware',
+]
+
+

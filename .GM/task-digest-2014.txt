@@ -1,0 +1,1958 @@
+//! Shield Secure Channel - TLS/SSH-like secure transport using symmetric crypto.
+//!
+//! Provides encrypted bidirectional communication with:
+//! - PAKE-based handshake (no certificates needed)
+//! - Forward secrecy via key ratcheting
+//! - Message authentication and replay protection
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use shield_core::channel::{ShieldChannel, ChannelConfig};
+//!
+//! // Both parties share a password
+//! let config = ChannelConfig::new("shared-secret", "my-service");
+//!
+//! // Server side
+//! let mut server = ShieldChannel::accept(stream, &config)?;
+//!
+//! // Client side
+//! let mut client = ShieldChannel::connect(stream, &config)?;
+//!
+//! // Send/receive with forward secrecy
+//! client.send(b"Hello server!")?;
+//! let msg = server.recv()?;
+//! ```
+
+// Crypto block counters are intentionally u32
+#![allow(clippy::cast_possible_truncation)]
+
+use ring::hmac;
+use std::io::{Read, Write};
+use subtle::ConstantTimeEq;
+
+use crate::error::{Result, ShieldError};
+use crate::exchange::PAKEExchange;
+use crate::ratchet::RatchetSession;
+
+/// Channel protocol version.
+const PROTOCOL_VERSION: u8 = 1;
+
+/// Maximum message size (16 MB).
+const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+/// Handshake message types.
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum HandshakeType {
+    ClientHello = 1,
+    ServerHello = 2,
+    Finished = 3,
+}
+
+/// Channel configuration.
+#[derive(Clone)]
+pub struct ChannelConfig {
+    /// Shared password for PAKE.
+    password: String,
+    /// Service identifier (domain binding).
+    service: String,
+    /// PBKDF2 iterations for key derivation.
+    iterations: u32,
+    /// Handshake timeout in milliseconds.
+    handshake_timeout_ms: u64,
+}
+
+impl ChannelConfig {
+    /// Create new channel configuration.
+    ///
+    /// # Arguments
+    /// * `password` - Shared secret between parties
+    /// * `service` - Service identifier for domain separation
+    #[must_use]
+    pub fn new(password: &str, service: &str) -> Self {
+        Self {
+            password: password.to_string(),
+            service: service.to_string(),
+            iterations: PAKEExchange::ITERATIONS,
+            handshake_timeout_ms: 30_000,
+        }
+    }
+
+    /// Set custom PBKDF2 iterations.
+    #[must_use]
+    pub fn with_iterations(mut self, iterations: u32) -> Self {
+        self.iterations = iterations;
+        self
+    }
+
+    /// Set handshake timeout.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout_ms: u64) -> Self {
+        self.handshake_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Get password (for internal use by async channel).
+    #[cfg(feature = "async")]
+    #[must_use]
+    pub(crate) fn password(&self) -> &str {
+        &self.password
+    }
+
+    /// Get service identifier.
+    #[must_use]
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+
+    /// Get iterations count (for internal use by async channel).
+    #[cfg(feature = "async")]
+    #[must_use]
+    pub(crate) fn iterations(&self) -> u32 {
+        self.iterations
+    }
+}
+
+/// Handshake state for key exchange.
+struct HandshakeState {
+    salt: [u8; 16],
+    local_contribution: [u8; 32],
+    remote_contribution: Option<[u8; 32]>,
+    is_initiator: bool,
+}
+
+impl HandshakeState {
+    fn new(is_initiator: bool) -> Result<Self> {
+        let salt: [u8; 16] = crate::random::random_bytes()?;
+
+        Ok(Self {
+            salt,
+            local_contribution: [0u8; 32],
+            remote_contribution: None,
+            is_initiator,
+        })
+    }
+
+    fn derive_contribution(&mut self, config: &ChannelConfig) {
+        let role = if self.is_initiator {
+            "client"
+        } else {
+            "server"
+        };
+        self.local_contribution =
+            PAKEExchange::derive(&config.password, &self.salt, role, Some(config.iterations));
+    }
+
+    fn compute_session_key(&self, config: &ChannelConfig) -> Result<[u8; 32]> {
+        let remote = self
+            .remote_contribution
+            .ok_or_else(|| ShieldError::ChannelError("handshake incomplete".into()))?;
+
+        // CRITICAL: Include password-derived key in session key computation
+        // This ensures different passwords produce different session keys
+        // even though contributions are exchanged.
+        let base_key = PAKEExchange::combine(&[self.local_contribution, remote]);
+
+        // Mix in the password-derived secret that wasn't exchanged
+        let password_key = PAKEExchange::derive(
+            &config.password,
+            &self.salt,
+            "session",
+            Some(config.iterations),
+        );
+
+        // Final session key = hash(base_key || password_key)
+        let mut combined = Vec::with_capacity(64);
+        combined.extend_from_slice(&base_key);
+        combined.extend_from_slice(&password_key);
+
+        let hash = ring::digest::digest(&ring::digest::SHA256, &combined);
+        let mut result = [0u8; 32];
+        result.copy_from_slice(hash.as_ref());
+        Ok(result)
+    }
+}
+
+/// Shield secure channel for encrypted communication.
+///
+/// Provides TLS-like security using only symmetric cryptography:
+/// - PAKE handshake establishes shared key from password
+/// - `RatchetSession` provides forward secrecy
+/// - All messages authenticated with HMAC
+pub struct ShieldChannel<S> {
+    stream: S,
+    session: RatchetSession,
+    service: String,
+}
+
+impl<S: Read + Write> ShieldChannel<S> {
+    /// Connect as client (initiator).
+    ///
+    /// Performs PAKE handshake and establishes encrypted channel.
+    ///
+    /// # Arguments
+    /// * `stream` - Underlying transport (TCP, etc.)
+    /// * `config` - Channel configuration with shared password
+    pub fn connect(mut stream: S, config: &ChannelConfig) -> Result<Self> {
+        let mut state = HandshakeState::new(true)?;
+
+        // Step 1: Send ClientHello (salt)
+        Self::send_handshake(&mut stream, HandshakeType::ClientHello, &state.salt)?;
+
+        // Step 2: Receive ServerHello (server's salt + contribution)
+        let server_hello = Self::recv_handshake(&mut stream, HandshakeType::ServerHello)?;
+        if server_hello.len() != 48 {
+            return Err(ShieldError::ChannelError("invalid ServerHello".into()));
+        }
+
+        // Use server's salt for key derivation
+        state.salt.copy_from_slice(&server_hello[..16]);
+        state.derive_contribution(config);
+
+        let mut remote = [0u8; 32];
+        remote.copy_from_slice(&server_hello[16..48]);
+        state.remote_contribution = Some(remote);
+
+        // Step 3: Send client contribution
+        Self::send_handshake(
+            &mut stream,
+            HandshakeType::Finished,
+            &state.local_contribution,
+        )?;
+
+        // Derive session key and create ratchet
+        let session_key = state.compute_session_key(config)?;
+        let session = RatchetSession::new(&session_key, true);
+
+        // Verify handshake with confirmation message
+        Self::send_confirmation(&mut stream, &session_key, true)?;
+        Self::verify_confirmation(&mut stream, &session_key, false)?;
+
+        Ok(Self {
+            stream,
+            session,
+            service: config.service.clone(),
+        })
+    }
+
+    /// Accept connection as server.
+    ///
+    /// Waits for client handshake and establishes encrypted channel.
+    ///
+    /// # Arguments
+    /// * `stream` - Underlying transport (TCP, etc.)
+    /// * `config` - Channel configuration with shared password
+    pub fn accept(mut stream: S, config: &ChannelConfig) -> Result<Self> {
+        let mut state = HandshakeState::new(false)?;
+
+        // Step 1: Receive ClientHello (client's proposed salt)
+        let client_hello = Self::recv_handshake(&mut stream, HandshakeType::ClientHello)?;
+        if client_hello.len() != 16 {
+            return Err(ShieldError::ChannelError("invalid ClientHello".into()));
+        }
+
+        // Mix client salt with server salt for freshness
+        for (i, &b) in client_hello.iter().enumerate() {
+            state.salt[i] ^= b;
+        }
+
+        state.derive_contribution(config);
+
+        // Step 2: Send ServerHello (final salt + server contribution)
+        let mut server_hello = Vec::with_capacity(48);
+        server_hello.extend_from_slice(&state.salt);
+        server_hello.extend_from_slice(&state.local_contribution);
+        Self::send_handshake(&mut stream, HandshakeType::ServerHello, &server_hello)?;
+
+        // Step 3: Receive client contribution
+        let client_finished = Self::recv_handshake(&mut stream, HandshakeType::Finished)?;
+        if client_finished.len() != 32 {
+            return Err(ShieldError::ChannelError("invalid Finished".into()));
+        }
+
+        let mut remote = [0u8; 32];
+        remote.copy_from_slice(&client_finished);
+        state.remote_contribution = Some(remote);
+
+        // Derive session key and create ratchet
+        let session_key = state.compute_session_key(config)?;
+        let session = RatchetSession::new(&session_key, false);
+
+        // Verify handshake with confirmation message
+        Self::verify_confirmation(&mut stream, &session_key, true)?;
+        Self::send_confirmation(&mut stream, &session_key, false)?;
+
+        Ok(Self {
+            stream,
+            session,
+            service: config.service.clone(),
+        })
+    }
+
+    /// Send encrypted message.
+    ///
+    /// Message is encrypted with current ratchet key, then key advances.
+    pub fn send(&mut self, data: &[u8]) -> Result<()> {
+        if data.len() > MAX_MESSAGE_SIZE {
+            return Err(ShieldError::ChannelError(format!(
+                "message too large: {} > {}",
+                data.len(),
+                MAX_MESSAGE_SIZE
+            )));
+        }
+
+        let encrypted = self.session.encrypt(data)?;
+        Self::write_frame(&mut self.stream, &encrypted)
+    }
+
+    /// Receive and decrypt message.
+    ///
+    /// Verifies authentication and advances receive ratchet.
+    pub fn recv(&mut self) -> Result<Vec<u8>> {
+        let encrypted = Self::read_frame(&mut self.stream)?;
+        self.session.decrypt(&encrypted)
+    }
+
+    /// Get service identifier.
+    #[must_use]
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+
+    /// Get send message count.
+    #[must_use]
+    pub fn messages_sent(&self) -> u64 {
+        self.session.send_counter()
+    }
+
+    /// Get receive message count.
+    #[must_use]
+    pub fn messages_received(&self) -> u64 {
+        self.session.recv_counter()
+    }
+
+    /// Get underlying stream (for shutdown, etc.)
+    pub fn into_inner(self) -> S {
+        self.stream
+    }
+
+    // --- Internal handshake helpers ---
+
+    fn send_handshake(stream: &mut S, msg_type: HandshakeType, data: &[u8]) -> Result<()> {
+        let mut frame = Vec::with_capacity(1 + 1 + 2 + data.len());
+        frame.push(PROTOCOL_VERSION);
+        frame.push(msg_type as u8);
+        frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        frame.extend_from_slice(data);
+
+        stream
+            .write_all(&frame)
+            .map_err(|e| ShieldError::ChannelError(e.to_string()))?;
+        stream
+            .flush()
+            .map_err(|e| ShieldError::ChannelError(e.to_string()))?;
+        Ok(())
+    }
+
+    fn recv_handshake(stream: &mut S, expected_type: HandshakeType) -> Result<Vec<u8>> {
+        let mut header = [0u8; 4];
+        stream
+            .read_exact(&mut header)
+            .map_err(|e| ShieldError::ChannelError(e.to_string()))?;
+
+        if header[0] != PROTOCOL_VERSION {
+            return Err(ShieldError::ChannelError(format!(
+                "unsupported protocol version: {}",
+                header[0]
+            )));
+        }
+
+        if header[1] != expected_type as u8 {
+            return Err(ShieldError::ChannelError(format!(
+                "unexpected message type: expected {}, got {}",
+                expected_type as u8, header[1]
+            )));
+        }
+
+        let len = u16::from_be_bytes([header[2], header[3]]) as usize;
+        if len > 1024 {
+            return Err(ShieldError::ChannelError(
+                "handshake message too large".into(),
+            ));
+        }
+
+        let mut data = vec![0u8; len];
+        stream
+            .read_exact(&mut data)
+            .map_err(|e| ShieldError::ChannelError(e.to_string()))?;
+
+        Ok(data)
+    }
+
+    fn send_confirmation(stream: &mut S, session_key: &[u8; 32], is_client: bool) -> Result<()> {
+        let label = if is_client {
+            b"client-confirm"
+        } else {
+            b"server-confirm"
+        };
+        let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, session_key);
+        let confirm = hmac::sign(&hmac_key, label);
+
+        Self::write_frame(stream, &confirm.as_ref()[..16])
+    }
+
+    fn verify_confirmation(
+        stream: &mut S,
+        session_key: &[u8; 32],
+        expect_client: bool,
+    ) -> Result<()> {
+        let received = Self::read_frame(stream)?;
+        if received.len() != 16 {
+            return Err(ShieldError::ChannelError("invalid confirmation".into()));
+        }
+
+        let label = if expect_client {
+            b"client-confirm"
+        } else {
+            b"server-confirm"
+        };
+        let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, session_key);
+        let expected = hmac::sign(&hmac_key, label);
+
+        if received.ct_eq(&expected.as_ref()[..16]).unwrap_u8() != 1 {
+            return Err(ShieldError::AuthenticationFailed);
+        }
+
+        Ok(())
+    }
+
+    // --- Frame helpers ---
+
+    fn write_frame(stream: &mut S, data: &[u8]) -> Result<()> {
+        let len = data.len() as u32;
+        stream
+            .write_all(&len.to_be_bytes())
+            .map_err(|e| ShieldError::ChannelError(e.to_string()))?;
+        stream
+            .write_all(data)
+            .map_err(|e| ShieldError::ChannelError(e.to_string()))?;
+        stream
+            .flush()
+            .map_err(|e| ShieldError::ChannelError(e.to_string()))?;
+        Ok(())
+    }
+
+    fn read_frame(stream: &mut S) -> Result<Vec<u8>> {
+        let mut len_buf = [0u8; 4];
+        stream
+            .read_exact(&mut len_buf)
+            .map_err(|e| ShieldError::ChannelError(e.to_string()))?;
+
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_MESSAGE_SIZE {
+            return Err(ShieldError::ChannelError(format!(
+                "frame too large: {len} > {MAX_MESSAGE_SIZE}"
+            )));
+        }
+
+        let mut data = vec![0u8; len];
+        stream
+            .read_exact(&mut data)
+            .map_err(|e| ShieldError::ChannelError(e.to_string()))?;
+
+        Ok(data)
+    }
+}
+
+/// Channel listener for accepting multiple connections.
+pub struct ShieldListener<L> {
+    listener: L,
+    config: ChannelConfig,
+}
+
+impl<L> ShieldListener<L> {
+    /// Create a new listener with the given configuration.
+    #[must_use]
+    pub fn new(listener: L, config: ChannelConfig) -> Self {
+        Self { listener, config }
+    }
+
+    /// Get the underlying listener.
+    pub fn into_inner(self) -> L {
+        self.listener
+    }
+
+    /// Get a reference to the configuration.
+    #[must_use]
+    pub fn config(&self) -> &ChannelConfig {
+        &self.config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+
+    /// Mock bidirectional stream for testing.
+    struct MockStream {
+        tx: mpsc::Sender<u8>,
+        rx: mpsc::Receiver<u8>,
+    }
+
+    impl MockStream {
+        fn pair() -> (Self, Self) {
+            let (tx1, rx1) = mpsc::channel();
+            let (tx2, rx2) = mpsc::channel();
+
+            (Self { tx: tx1, rx: rx2 }, Self { tx: tx2, rx: rx1 })
+        }
+    }
+
+    impl Read for MockStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            for byte in buf.iter_mut() {
+                *byte = self.rx.recv().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "channel closed")
+                })?;
+            }
+            Ok(buf.len())
+        }
+    }
+
+    impl Write for MockStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            for &byte in buf {
+                self.tx.send(byte).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "channel closed")
+                })?;
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_channel_handshake() {
+        let (client_stream, server_stream) = MockStream::pair();
+        let config = ChannelConfig::new("test-password", "test.service");
+
+        let server_config = config.clone();
+        let server_handle =
+            thread::spawn(move || ShieldChannel::accept(server_stream, &server_config));
+
+        let client = ShieldChannel::connect(client_stream, &config).unwrap();
+        let server = server_handle.join().unwrap().unwrap();
+
+        assert_eq!(client.service(), "test.service");
+        assert_eq!(server.service(), "test.service");
+    }
+
+    #[test]
+    fn test_channel_message_exchange() {
+        let (client_stream, server_stream) = MockStream::pair();
+        let config = ChannelConfig::new("secret", "messaging.app");
+
+        let server_config = config.clone();
+        let server_handle = thread::spawn(move || {
+            let mut server = ShieldChannel::accept(server_stream, &server_config).unwrap();
+            let msg = server.recv().unwrap();
+            server.send(b"Hello client!").unwrap();
+            msg
+        });
+
+        let mut client = ShieldChannel::connect(client_stream, &config).unwrap();
+        client.send(b"Hello server!").unwrap();
+        let response = client.recv().unwrap();
+
+        let server_received = server_handle.join().unwrap();
+
+        assert_eq!(server_received, b"Hello server!");
+        assert_eq!(response, b"Hello client!");
+    }
+
+    #[test]
+    fn test_channel_forward_secrecy() {
+        let (client_stream, server_stream) = MockStream::pair();
+        let config = ChannelConfig::new("password", "service");
+
+        let server_config = config.clone();
+        let server_handle = thread::spawn(move || {
+            let mut server = ShieldChannel::accept(server_stream, &server_config).unwrap();
+            for _ in 0..3 {
+                let _ = server.recv().unwrap();
+            }
+            server.messages_received()
+        });
+
+        let mut client = ShieldChannel::connect(client_stream, &config).unwrap();
+
+        // Send multiple messages
+        client.send(b"message 1").unwrap();
+        client.send(b"message 2").unwrap();
+        client.send(b"message 3").unwrap();
+
+        assert_eq!(client.messages_sent(), 3);
+
+        let server_count = server_handle.join().unwrap();
+        assert_eq!(server_count, 3);
+    }
+
+    #[test]
+    fn test_channel_wrong_password() {
+        let (client_stream, server_stream) = MockStream::pair();
+        let client_config = ChannelConfig::new("password1", "service");
+        let server_config = ChannelConfig::new("password2", "service");
+
+        let server_handle =
+            thread::spawn(move || ShieldChannel::accept(server_stream, &server_config));
+
+        let client_result = ShieldChannel::connect(client_stream, &client_config);
+        let server_result = server_handle.join().unwrap();
+
+        // At least one side should fail authentication
+        assert!(client_result.is_err() || server_result.is_err());
+    }
+
+    #[test]
+    fn test_config_builder() {
+        let config = ChannelConfig::new("password", "service")
+            .with_iterations(100_000)
+            .with_timeout(5_000);
+
+        assert_eq!(config.iterations, 100_000);
+        assert_eq!(config.handshake_timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn test_empty_message() {
+        let (client_stream, server_stream) = MockStream::pair();
+        let config = ChannelConfig::new("password", "service");
+
+        let server_config = config.clone();
+        let server_handle = thread::spawn(move || {
+            let mut server = ShieldChannel::accept(server_stream, &server_config).unwrap();
+            server.recv().unwrap()
+        });
+
+        let mut client = ShieldChannel::connect(client_stream, &config).unwrap();
+        client.send(b"").unwrap();
+
+        let received = server_handle.join().unwrap();
+        assert_eq!(received, b"");
+    }
+
+    #[test]
+    fn test_large_message() {
+        let (client_stream, server_stream) = MockStream::pair();
+        let config = ChannelConfig::new("password", "service");
+
+        // 64KB message
+        let large_data: Vec<u8> = (0..65536).map(|i| (i % 256) as u8).collect();
+
+        let server_config = config.clone();
+        let expected_data = large_data.clone();
+        let server_handle = thread::spawn(move || {
+            let mut server = ShieldChannel::accept(server_stream, &server_config).unwrap();
+            let received = server.recv().unwrap();
+            assert_eq!(received.len(), expected_data.len());
+            assert_eq!(received, expected_data);
+        });
+
+        let mut client = ShieldChannel::connect(client_stream, &config).unwrap();
+        client.send(&large_data).unwrap();
+
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_bidirectional_exchange() {
+        let (client_stream, server_stream) = MockStream::pair();
+        let config = ChannelConfig::new("password", "service");
+
+        let server_config = config.clone();
+        let server_handle = thread::spawn(move || {
+            let mut server = ShieldChannel::accept(server_stream, &server_config).unwrap();
+
+            // Server sends first
+            server.send(b"Server says hello").unwrap();
+
+            // Then receives
+            let msg = server.recv().unwrap();
+            assert_eq!(msg, b"Client responds");
+
+            // Send another
+            server.send(b"Server acknowledges").unwrap();
+        });
+
+        let mut client = ShieldChannel::connect(client_stream, &config).unwrap();
+
+        // Client receives first
+        let msg1 = client.recv().unwrap();
+        assert_eq!(msg1, b"Server says hello");
+
+        // Client responds
+        client.send(b"Client responds").unwrap();
+
+        // Client receives acknowledgment
+        let msg2 = client.recv().unwrap();
+        assert_eq!(msg2, b"Server acknowledges");
+
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_different_services_same_password() {
+        let (client_stream, server_stream) = MockStream::pair();
+        let client_config = ChannelConfig::new("password", "service1");
+        let server_config = ChannelConfig::new("password", "service2");
+
+        let server_handle =
+            thread::spawn(move || ShieldChannel::accept(server_stream, &server_config));
+
+        let client_result = ShieldChannel::connect(client_stream, &client_config);
+        let server_result = server_handle.join().unwrap();
+
+        // Different services should still connect (service is metadata, not part of key)
+        // But they will have different session keys due to different service in PAKE
+        // This test verifies the behavior - adjust based on actual design
+        if client_result.is_ok() && server_result.is_ok() {
+            // If both succeed, verify services are different
+            assert_eq!(client_result.unwrap().service(), "service1");
+            assert_eq!(server_result.unwrap().service(), "service2");
+        }
+    }
+
+    #[test]
+    fn test_unique_ciphertext_per_message() {
+        let (client_stream, server_stream) = MockStream::pair();
+        let config = ChannelConfig::new("password", "service");
+
+        let server_config = config.clone();
+        let server_handle = thread::spawn(move || {
+            let mut server = ShieldChannel::accept(server_stream, &server_config).unwrap();
+            let msg1 = server.recv().unwrap();
+            let msg2 = server.recv().unwrap();
+            // Same plaintext should decrypt correctly
+            assert_eq!(msg1, msg2);
+            assert_eq!(msg1, b"same message");
+        });
+
+        let mut client = ShieldChannel::connect(client_stream, &config).unwrap();
+
+        // Send same message twice - due to ratcheting, ciphertext will differ
+        client.send(b"same message").unwrap();
+        client.send(b"same message").unwrap();
+
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_listener_config() {
+        let config = ChannelConfig::new("password", "service");
+        let listener = ShieldListener::new((), config.clone());
+
+        assert_eq!(listener.config().service(), "service");
+
+        let _ = listener.into_inner();
+    }
+
+    #[test]
+    fn test_channel_counters() {
+        let (client_stream, server_stream) = MockStream::pair();
+        let config = ChannelConfig::new("password", "service");
+
+        let server_config = config.clone();
+        let server_handle = thread::spawn(move || {
+            let mut server = ShieldChannel::accept(server_stream, &server_config).unwrap();
+            assert_eq!(server.messages_sent(), 0);
+            assert_eq!(server.messages_received(), 0);
+
+            let _ = server.recv().unwrap();
+            assert_eq!(server.messages_received(), 1);
+
+            server.send(b"response").unwrap();
+            assert_eq!(server.messages_sent(), 1);
+        });
+
+        let mut client = ShieldChannel::connect(client_stream, &config).unwrap();
+        assert_eq!(client.messages_sent(), 0);
+
+        client.send(b"hello").unwrap();
+        assert_eq!(client.messages_sent(), 1);
+
+        let _ = client.recv().unwrap();
+        assert_eq!(client.messages_received(), 1);
+
+        server_handle.join().unwrap();
+    }
+}
+//! Async Shield Channel - Tokio-based async secure transport.
+//!
+//! Provides the same security as [`crate::channel::ShieldChannel`] but with async I/O.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use shield_core::channel_async::{AsyncShieldChannel, ChannelConfig};
+//! use tokio::net::TcpStream;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let config = ChannelConfig::new("shared-secret", "my-service");
+//!
+//!     // Client
+//!     let stream = TcpStream::connect("127.0.0.1:8080").await?;
+//!     let mut channel = AsyncShieldChannel::connect(stream, &config).await?;
+//!
+//!     channel.send(b"Hello!").await?;
+//!     let response = channel.recv().await?;
+//!
+//!     Ok(())
+//! }
+//! ```
+
+// Crypto block counters are intentionally u32
+#![allow(clippy::cast_possible_truncation)]
+
+use ring::hmac;
+use subtle::ConstantTimeEq;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::error::{Result, ShieldError};
+use crate::exchange::PAKEExchange;
+use crate::ratchet::RatchetSession;
+
+// Re-export config from sync module
+pub use crate::channel::ChannelConfig;
+
+/// Channel protocol version.
+const PROTOCOL_VERSION: u8 = 1;
+
+/// Maximum message size (16 MB).
+const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+/// Handshake message types.
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum HandshakeType {
+    ClientHello = 1,
+    ServerHello = 2,
+    Finished = 3,
+}
+
+/// Handshake state for key exchange.
+struct HandshakeState {
+    salt: [u8; 16],
+    local_contribution: [u8; 32],
+    remote_contribution: Option<[u8; 32]>,
+    is_initiator: bool,
+}
+
+impl HandshakeState {
+    fn new(is_initiator: bool) -> Result<Self> {
+        let salt: [u8; 16] = crate::random::random_bytes()?;
+
+        Ok(Self {
+            salt,
+            local_contribution: [0u8; 32],
+            remote_contribution: None,
+            is_initiator,
+        })
+    }
+
+    fn derive_contribution(&mut self, config: &ChannelConfig) {
+        let role = if self.is_initiator {
+            "client"
+        } else {
+            "server"
+        };
+        self.local_contribution = PAKEExchange::derive(
+            config.password(),
+            &self.salt,
+            role,
+            Some(config.iterations()),
+        );
+    }
+
+    fn compute_session_key(&self, config: &ChannelConfig) -> Result<[u8; 32]> {
+        let remote = self
+            .remote_contribution
+            .ok_or_else(|| ShieldError::ChannelError("handshake incomplete".into()))?;
+
+        // Include password-derived key in session key computation
+        let base_key = PAKEExchange::combine(&[self.local_contribution, remote]);
+
+        let password_key = PAKEExchange::derive(
+            config.password(),
+            &self.salt,
+            "session",
+            Some(config.iterations()),
+        );
+
+        let mut combined = Vec::with_capacity(64);
+        combined.extend_from_slice(&base_key);
+        combined.extend_from_slice(&password_key);
+
+        let hash = ring::digest::digest(&ring::digest::SHA256, &combined);
+        let mut result = [0u8; 32];
+        result.copy_from_slice(hash.as_ref());
+        Ok(result)
+    }
+}
+
+/// Async Shield secure channel for encrypted communication.
+///
+/// Tokio-based async version of [`crate::channel::ShieldChannel`].
+pub struct AsyncShieldChannel<S> {
+    stream: S,
+    session: RatchetSession,
+    service: String,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncShieldChannel<S> {
+    /// Connect as client (initiator).
+    ///
+    /// Performs async PAKE handshake and establishes encrypted channel.
+    pub async fn connect(mut stream: S, config: &ChannelConfig) -> Result<Self> {
+        let mut state = HandshakeState::new(true)?;
+
+        // Step 1: Send ClientHello (salt)
+        Self::send_handshake(&mut stream, HandshakeType::ClientHello, &state.salt).await?;
+
+        // Step 2: Receive ServerHello (server's salt + contribution)
+        let server_hello = Self::recv_handshake(&mut stream, HandshakeType::ServerHello).await?;
+        if server_hello.len() != 48 {
+            return Err(ShieldError::ChannelError("invalid ServerHello".into()));
+        }
+
+        // Use server's salt for key derivation
+        state.salt.copy_from_slice(&server_hello[..16]);
+        state.derive_contribution(config);
+
+        let mut remote = [0u8; 32];
+        remote.copy_from_slice(&server_hello[16..48]);
+        state.remote_contribution = Some(remote);
+
+        // Step 3: Send client contribution
+        Self::send_handshake(
+            &mut stream,
+            HandshakeType::Finished,
+            &state.local_contribution,
+        )
+        .await?;
+
+        // Derive session key and create ratchet
+        let session_key = state.compute_session_key(config)?;
+        let session = RatchetSession::new(&session_key, true);
+
+        // Verify handshake with confirmation message
+        Self::send_confirmation(&mut stream, &session_key, true).await?;
+        Self::verify_confirmation(&mut stream, &session_key, false).await?;
+
+        Ok(Self {
+            stream,
+            session,
+            service: config.service().to_string(),
+        })
+    }
+
+    /// Accept connection as server.
+    ///
+    /// Waits for client handshake and establishes encrypted channel.
+    pub async fn accept(mut stream: S, config: &ChannelConfig) -> Result<Self> {
+        let mut state = HandshakeState::new(false)?;
+
+        // Step 1: Receive ClientHello
+        let client_hello = Self::recv_handshake(&mut stream, HandshakeType::ClientHello).await?;
+        if client_hello.len() != 16 {
+            return Err(ShieldError::ChannelError("invalid ClientHello".into()));
+        }
+
+        // Mix client salt with server salt
+        for (i, &b) in client_hello.iter().enumerate() {
+            state.salt[i] ^= b;
+        }
+
+        state.derive_contribution(config);
+
+        // Step 2: Send ServerHello
+        let mut server_hello = Vec::with_capacity(48);
+        server_hello.extend_from_slice(&state.salt);
+        server_hello.extend_from_slice(&state.local_contribution);
+        Self::send_handshake(&mut stream, HandshakeType::ServerHello, &server_hello).await?;
+
+        // Step 3: Receive client contribution
+        let client_finished = Self::recv_handshake(&mut stream, HandshakeType::Finished).await?;
+        if client_finished.len() != 32 {
+            return Err(ShieldError::ChannelError("invalid Finished".into()));
+        }
+
+        let mut remote = [0u8; 32];
+        remote.copy_from_slice(&client_finished);
+        state.remote_contribution = Some(remote);
+
+        // Derive session key and create ratchet
+        let session_key = state.compute_session_key(config)?;
+        let session = RatchetSession::new(&session_key, false);
+
+        // Verify handshake with confirmation message
+        Self::verify_confirmation(&mut stream, &session_key, true).await?;
+        Self::send_confirmation(&mut stream, &session_key, false).await?;
+
+        Ok(Self {
+            stream,
+            session,
+            service: config.service().to_string(),
+        })
+    }
+
+    /// Send encrypted message.
+    pub async fn send(&mut self, data: &[u8]) -> Result<()> {
+        if data.len() > MAX_MESSAGE_SIZE {
+            return Err(ShieldError::ChannelError(format!(
+                "message too large: {} > {}",
+                data.len(),
+                MAX_MESSAGE_SIZE
+            )));
+        }
+
+        let encrypted = self.session.encrypt(data)?;
+        Self::write_frame(&mut self.stream, &encrypted).await
+    }
+
+    /// Receive and decrypt message.
+    pub async fn recv(&mut self) -> Result<Vec<u8>> {
+        let encrypted = Self::read_frame(&mut self.stream).await?;
+        self.session.decrypt(&encrypted)
+    }
+
+    /// Get service identifier.
+    #[must_use]
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+
+    /// Get send message count.
+    #[must_use]
+    pub fn messages_sent(&self) -> u64 {
+        self.session.send_counter()
+    }
+
+    /// Get receive message count.
+    #[must_use]
+    pub fn messages_received(&self) -> u64 {
+        self.session.recv_counter()
+    }
+
+    /// Get underlying stream.
+    pub fn into_inner(self) -> S {
+        self.stream
+    }
+
+    // --- Internal async helpers ---
+
+    async fn send_handshake(stream: &mut S, msg_type: HandshakeType, data: &[u8]) -> Result<()> {
+        let mut frame = Vec::with_capacity(1 + 1 + 2 + data.len());
+        frame.push(PROTOCOL_VERSION);
+        frame.push(msg_type as u8);
+        frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        frame.extend_from_slice(data);
+
+        stream
+            .write_all(&frame)
+            .await
+            .map_err(|e| ShieldError::ChannelError(e.to_string()))?;
+        stream
+            .flush()
+            .await
+            .map_err(|e| ShieldError::ChannelError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn recv_handshake(stream: &mut S, expected_type: HandshakeType) -> Result<Vec<u8>> {
+        let mut header = [0u8; 4];
+        stream
+            .read_exact(&mut header)
+            .await
+            .map_err(|e| ShieldError::ChannelError(e.to_string()))?;
+
+        if header[0] != PROTOCOL_VERSION {
+            return Err(ShieldError::ChannelError(format!(
+                "unsupported protocol version: {}",
+                header[0]
+            )));
+        }
+
+        if header[1] != expected_type as u8 {
+            return Err(ShieldError::ChannelError(format!(
+                "unexpected message type: expected {}, got {}",
+                expected_type as u8, header[1]
+            )));
+        }
+
+        let len = u16::from_be_bytes([header[2], header[3]]) as usize;
+        if len > 1024 {
+            return Err(ShieldError::ChannelError(
+                "handshake message too large".into(),
+            ));
+        }
+
+        let mut data = vec![0u8; len];
+        stream
+            .read_exact(&mut data)
+            .await
+            .map_err(|e| ShieldError::ChannelError(e.to_string()))?;
+
+        Ok(data)
+    }
+
+    async fn send_confirmation(
+        stream: &mut S,
+        session_key: &[u8; 32],
+        is_client: bool,
+    ) -> Result<()> {
+        let label = if is_client {
+            b"client-confirm"
+        } else {
+            b"server-confirm"
+        };
+        let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, session_key);
+        let confirm = hmac::sign(&hmac_key, label);
+
+        Self::write_frame(stream, &confirm.as_ref()[..16]).await
+    }
+
+    async fn verify_confirmation(
+        stream: &mut S,
+        session_key: &[u8; 32],
+        expect_client: bool,
+    ) -> Result<()> {
+        let received = Self::read_frame(stream).await?;
+        if received.len() != 16 {
+            return Err(ShieldError::ChannelError("invalid confirmation".into()));
+        }
+
+        let label = if expect_client {
+            b"client-confirm"
+        } else {
+            b"server-confirm"
+        };
+        let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, session_key);
+        let expected = hmac::sign(&hmac_key, label);
+
+        if received.ct_eq(&expected.as_ref()[..16]).unwrap_u8() != 1 {
+            return Err(ShieldError::AuthenticationFailed);
+        }
+
+        Ok(())
+    }
+
+    async fn write_frame(stream: &mut S, data: &[u8]) -> Result<()> {
+        let len = data.len() as u32;
+        stream
+            .write_all(&len.to_be_bytes())
+            .await
+            .map_err(|e| ShieldError::ChannelError(e.to_string()))?;
+        stream
+            .write_all(data)
+            .await
+            .map_err(|e| ShieldError::ChannelError(e.to_string()))?;
+        stream
+            .flush()
+            .await
+            .map_err(|e| ShieldError::ChannelError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn read_frame(stream: &mut S) -> Result<Vec<u8>> {
+        let mut len_buf = [0u8; 4];
+        stream
+            .read_exact(&mut len_buf)
+            .await
+            .map_err(|e| ShieldError::ChannelError(e.to_string()))?;
+
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_MESSAGE_SIZE {
+            return Err(ShieldError::ChannelError(format!(
+                "frame too large: {len} > {MAX_MESSAGE_SIZE}"
+            )));
+        }
+
+        let mut data = vec![0u8; len];
+        stream
+            .read_exact(&mut data)
+            .await
+            .map_err(|e| ShieldError::ChannelError(e.to_string()))?;
+
+        Ok(data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    type DuplexChannel = AsyncShieldChannel<tokio::io::DuplexStream>;
+
+    #[tokio::test]
+    async fn test_async_channel_handshake() {
+        let (client_stream, server_stream) = duplex(1024);
+        let config = ChannelConfig::new("test-password", "test.service");
+
+        let server_config = config.clone();
+        let server_handle =
+            tokio::spawn(async move { DuplexChannel::accept(server_stream, &server_config).await });
+
+        let client = DuplexChannel::connect(client_stream, &config)
+            .await
+            .unwrap();
+        let server = server_handle.await.unwrap().unwrap();
+
+        assert_eq!(client.service(), "test.service");
+        assert_eq!(server.service(), "test.service");
+    }
+
+    #[tokio::test]
+    async fn test_async_channel_message_exchange() {
+        let (client_stream, server_stream) = duplex(4096);
+        let config = ChannelConfig::new("secret", "messaging.app");
+
+        let server_config = config.clone();
+        let server_handle = tokio::spawn(async move {
+            let mut server = DuplexChannel::accept(server_stream, &server_config)
+                .await
+                .unwrap();
+            let msg = server.recv().await.unwrap();
+            server.send(b"Hello client!").await.unwrap();
+            msg
+        });
+
+        let mut client = DuplexChannel::connect(client_stream, &config)
+            .await
+            .unwrap();
+        client.send(b"Hello server!").await.unwrap();
+        let response = client.recv().await.unwrap();
+
+        let server_received = server_handle.await.unwrap();
+
+        assert_eq!(server_received, b"Hello server!");
+        assert_eq!(response, b"Hello client!");
+    }
+
+    #[tokio::test]
+    async fn test_async_channel_wrong_password() {
+        let (client_stream, server_stream) = duplex(1024);
+        let client_config = ChannelConfig::new("password1", "service");
+        let server_config = ChannelConfig::new("password2", "service");
+
+        let server_handle =
+            tokio::spawn(async move { DuplexChannel::accept(server_stream, &server_config).await });
+
+        let client_result = DuplexChannel::connect(client_stream, &client_config).await;
+        let server_result = server_handle.await.unwrap();
+
+        // At least one side should fail authentication
+        assert!(client_result.is_err() || server_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_async_empty_message() {
+        let (client_stream, server_stream) = duplex(1024);
+        let config = ChannelConfig::new("password", "service");
+
+        let server_config = config.clone();
+        let server_handle = tokio::spawn(async move {
+            let mut server = DuplexChannel::accept(server_stream, &server_config)
+                .await
+                .unwrap();
+            server.recv().await.unwrap()
+        });
+
+        let mut client = DuplexChannel::connect(client_stream, &config)
+            .await
+            .unwrap();
+        client.send(b"").await.unwrap();
+
+        let received = server_handle.await.unwrap();
+        assert_eq!(received, b"");
+    }
+
+    #[tokio::test]
+    async fn test_async_large_message() {
+        let (client_stream, server_stream) = duplex(128 * 1024);
+        let config = ChannelConfig::new("password", "service");
+
+        // 64KB message
+        let large_data: Vec<u8> = (0..65536).map(|i| (i % 256) as u8).collect();
+
+        let server_config = config.clone();
+        let expected_len = large_data.len();
+        let server_handle = tokio::spawn(async move {
+            let mut server = DuplexChannel::accept(server_stream, &server_config)
+                .await
+                .unwrap();
+            let received = server.recv().await.unwrap();
+            assert_eq!(received.len(), expected_len);
+            received
+        });
+
+        let mut client = DuplexChannel::connect(client_stream, &config)
+            .await
+            .unwrap();
+        client.send(&large_data).await.unwrap();
+
+        let received = server_handle.await.unwrap();
+        assert_eq!(received, large_data);
+    }
+
+    #[tokio::test]
+    async fn test_async_bidirectional() {
+        let (client_stream, server_stream) = duplex(4096);
+        let config = ChannelConfig::new("password", "service");
+
+        let server_config = config.clone();
+        let server_handle = tokio::spawn(async move {
+            let mut server = DuplexChannel::accept(server_stream, &server_config)
+                .await
+                .unwrap();
+
+            server.send(b"Server first").await.unwrap();
+            let msg = server.recv().await.unwrap();
+            server.send(b"Server ack").await.unwrap();
+            msg
+        });
+
+        let mut client = DuplexChannel::connect(client_stream, &config)
+            .await
+            .unwrap();
+
+        let msg1 = client.recv().await.unwrap();
+        assert_eq!(msg1, b"Server first");
+
+        client.send(b"Client response").await.unwrap();
+
+        let msg2 = client.recv().await.unwrap();
+        assert_eq!(msg2, b"Server ack");
+
+        let server_received = server_handle.await.unwrap();
+        assert_eq!(server_received, b"Client response");
+    }
+
+    #[tokio::test]
+    async fn test_async_multiple_messages() {
+        let (client_stream, server_stream) = duplex(4096);
+        let config = ChannelConfig::new("password", "service");
+
+        let server_config = config.clone();
+        let server_handle = tokio::spawn(async move {
+            let mut server = DuplexChannel::accept(server_stream, &server_config)
+                .await
+                .unwrap();
+            let mut messages = Vec::new();
+            for _ in 0..5 {
+                messages.push(server.recv().await.unwrap());
+            }
+            messages
+        });
+
+        let mut client = DuplexChannel::connect(client_stream, &config)
+            .await
+            .unwrap();
+
+        for i in 0..5 {
+            client
+                .send(format!("Message {}", i).as_bytes())
+                .await
+                .unwrap();
+        }
+
+        let messages = server_handle.await.unwrap();
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[0], b"Message 0");
+        assert_eq!(messages[4], b"Message 4");
+    }
+
+    #[tokio::test]
+    async fn test_async_counters() {
+        let (client_stream, server_stream) = duplex(4096);
+        let config = ChannelConfig::new("password", "service");
+
+        let server_config = config.clone();
+        let server_handle = tokio::spawn(async move {
+            let mut server = DuplexChannel::accept(server_stream, &server_config)
+                .await
+                .unwrap();
+            assert_eq!(server.messages_received(), 0);
+            let _ = server.recv().await.unwrap();
+            assert_eq!(server.messages_received(), 1);
+            server.send(b"reply").await.unwrap();
+            assert_eq!(server.messages_sent(), 1);
+        });
+
+        let mut client = DuplexChannel::connect(client_stream, &config)
+            .await
+            .unwrap();
+        assert_eq!(client.messages_sent(), 0);
+
+        client.send(b"hello").await.unwrap();
+        assert_eq!(client.messages_sent(), 1);
+
+        let _ = client.recv().await.unwrap();
+        assert_eq!(client.messages_received(), 1);
+
+        server_handle.await.unwrap();
+    }
+}
+//! Key exchange without public-key cryptography.
+//!
+//! Provides PAKE, QR exchange, and key splitting.
+
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use serde::{Deserialize, Serialize};
+use std::num::NonZeroU32;
+
+use crate::error::{Result, ShieldError};
+
+/// Password-Authenticated Key Exchange.
+pub struct PAKEExchange;
+
+impl PAKEExchange {
+    /// Default PBKDF2 iterations.
+    pub const ITERATIONS: u32 = 200_000;
+
+    /// Derive key contribution from password.
+    #[must_use]
+    pub fn derive(password: &str, salt: &[u8], role: &str, iterations: Option<u32>) -> [u8; 32] {
+        let iters = iterations.unwrap_or(Self::ITERATIONS);
+
+        let mut base_key = [0u8; 32];
+        ring::pbkdf2::derive(
+            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            NonZeroU32::new(iters).unwrap(),
+            salt,
+            password.as_bytes(),
+            &mut base_key,
+        );
+
+        let mut data = Vec::with_capacity(32 + role.len());
+        data.extend_from_slice(&base_key);
+        data.extend_from_slice(role.as_bytes());
+
+        let hash = ring::digest::digest(&ring::digest::SHA256, &data);
+        let mut result = [0u8; 32];
+        result.copy_from_slice(hash.as_ref());
+        result
+    }
+
+    /// Combine key contributions into session key.
+    #[must_use]
+    pub fn combine(contributions: &[[u8; 32]]) -> [u8; 32] {
+        let mut sorted: Vec<&[u8; 32]> = contributions.iter().collect();
+        sorted.sort();
+
+        let mut combined = Vec::with_capacity(contributions.len() * 32);
+        for c in sorted {
+            combined.extend_from_slice(c);
+        }
+
+        let hash = ring::digest::digest(&ring::digest::SHA256, &combined);
+        let mut result = [0u8; 32];
+        result.copy_from_slice(hash.as_ref());
+        result
+    }
+
+    /// Generate random salt.
+    pub fn generate_salt() -> Result<[u8; 16]> {
+        crate::random::random_bytes()
+    }
+}
+
+/// Key exchange via QR codes or manual transfer.
+pub struct QRExchange;
+
+#[derive(Serialize, Deserialize)]
+struct ExchangeData {
+    v: u8,
+    k: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    m: Option<serde_json::Value>,
+}
+
+impl QRExchange {
+    /// Encode key for QR code.
+    #[must_use]
+    pub fn encode(key: &[u8]) -> String {
+        URL_SAFE_NO_PAD.encode(key)
+    }
+
+    /// Decode key from QR code.
+    pub fn decode(encoded: &str) -> Result<Vec<u8>> {
+        URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| ShieldError::InvalidFormat)
+    }
+
+    /// Generate complete exchange data with metadata.
+    #[must_use]
+    pub fn generate_exchange_data(key: &[u8], metadata: Option<serde_json::Value>) -> String {
+        let data = ExchangeData {
+            v: 1,
+            k: URL_SAFE_NO_PAD.encode(key),
+            m: metadata,
+        };
+        serde_json::to_string(&data).unwrap()
+    }
+
+    /// Parse exchange data.
+    pub fn parse_exchange_data(data: &str) -> Result<(Vec<u8>, Option<serde_json::Value>)> {
+        let parsed: ExchangeData =
+            serde_json::from_str(data).map_err(|_| ShieldError::InvalidFormat)?;
+        let key = URL_SAFE_NO_PAD
+            .decode(&parsed.k)
+            .map_err(|_| ShieldError::InvalidFormat)?;
+        Ok((key, parsed.m))
+    }
+}
+
+/// Split keys into shares (all required to reconstruct).
+pub struct KeySplitter;
+
+impl KeySplitter {
+    /// Split key into shares.
+    pub fn split(key: &[u8], num_shares: usize) -> Result<Vec<Vec<u8>>> {
+        if num_shares < 2 {
+            return Err(ShieldError::InvalidShareCount);
+        }
+
+        let mut shares = Vec::with_capacity(num_shares);
+
+        for _ in 0..num_shares - 1 {
+            let share = crate::random::random_vec(key.len())?;
+            shares.push(share);
+        }
+
+        // Final share = XOR of key with all others
+        let mut final_share = key.to_vec();
+        for share in &shares {
+            for (i, &b) in share.iter().enumerate() {
+                final_share[i] ^= b;
+            }
+        }
+        shares.push(final_share);
+
+        Ok(shares)
+    }
+
+    /// Combine shares to recover key.
+    pub fn combine(shares: &[Vec<u8>]) -> Result<Vec<u8>> {
+        if shares.len() < 2 {
+            return Err(ShieldError::InvalidShareCount);
+        }
+
+        let len = shares[0].len();
+        let mut result = vec![0u8; len];
+
+        for share in shares {
+            if share.len() != len {
+                return Err(ShieldError::InvalidFormat);
+            }
+            for (i, &b) in share.iter().enumerate() {
+                result[i] ^= b;
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pake_derive() {
+        let salt = PAKEExchange::generate_salt().unwrap();
+        let key = PAKEExchange::derive("password", &salt, "client", None);
+        assert_eq!(key.len(), 32);
+    }
+
+    #[test]
+    fn test_pake_deterministic() {
+        let salt = PAKEExchange::generate_salt().unwrap();
+        let key1 = PAKEExchange::derive("password", &salt, "client", None);
+        let key2 = PAKEExchange::derive("password", &salt, "client", None);
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_pake_combine_order_independent() {
+        let salt = PAKEExchange::generate_salt().unwrap();
+        let client = PAKEExchange::derive("password", &salt, "client", None);
+        let server = PAKEExchange::derive("password", &salt, "server", None);
+
+        let shared1 = PAKEExchange::combine(&[client, server]);
+        let shared2 = PAKEExchange::combine(&[server, client]);
+        assert_eq!(shared1, shared2);
+    }
+
+    #[test]
+    fn test_qr_roundtrip() {
+        let key = [42u8; 32];
+        let encoded = QRExchange::encode(&key);
+        let decoded = QRExchange::decode(&encoded).unwrap();
+        assert_eq!(key.as_slice(), decoded.as_slice());
+    }
+
+    #[test]
+    fn test_qr_exchange_data() {
+        let key = [1u8; 32];
+        let metadata = serde_json::json!({"name": "test"});
+        let data = QRExchange::generate_exchange_data(&key, Some(metadata.clone()));
+        let (parsed_key, parsed_meta) = QRExchange::parse_exchange_data(&data).unwrap();
+        assert_eq!(key.as_slice(), parsed_key.as_slice());
+        assert_eq!(parsed_meta, Some(metadata));
+    }
+
+    #[test]
+    fn test_key_splitter() {
+        let key = [42u8; 32];
+        let shares = KeySplitter::split(&key, 3).unwrap();
+        assert_eq!(shares.len(), 3);
+
+        let recovered = KeySplitter::combine(&shares).unwrap();
+        assert_eq!(key.as_slice(), recovered.as_slice());
+    }
+
+    #[test]
+    fn test_key_splitter_partial() {
+        let key = [42u8; 32];
+        let shares = KeySplitter::split(&key, 3).unwrap();
+
+        // Partial shares don't recover key
+        let partial = KeySplitter::combine(&shares[..2]).unwrap();
+        assert_ne!(key.as_slice(), partial.as_slice());
+    }
+
+    #[test]
+    fn test_key_splitter_min_shares() {
+        let key = [42u8; 32];
+        assert!(KeySplitter::split(&key, 1).is_err());
+    }
+}
+//! Forward secrecy through key ratcheting.
+//!
+//! Each message uses a new key derived from previous.
+//! Compromise of current key doesn't reveal past messages.
+//!
+//! Based on Signal's Double Ratchet (simplified symmetric version).
+
+// Crypto block counters are intentionally u32 - data >4GB would have other issues
+#![allow(clippy::cast_possible_truncation)]
+
+use ring::{digest, hmac};
+use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+use crate::error::{Result, ShieldError};
+
+/// Ratcheting session for forward secrecy.
+///
+/// Each encrypt/decrypt advances the key chain,
+/// destroying previous keys automatically.
+///
+/// Chain keys are securely zeroized from memory when dropped.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct RatchetSession {
+    send_chain: [u8; 32],
+    recv_chain: [u8; 32],
+    #[zeroize(skip)]
+    send_counter: u64,
+    #[zeroize(skip)]
+    recv_counter: u64,
+}
+
+impl RatchetSession {
+    /// Create a new ratchet session from shared root key.
+    ///
+    /// # Arguments
+    /// * `root_key` - Shared secret from key exchange
+    /// * `is_initiator` - True if this party initiated the session
+    #[must_use]
+    pub fn new(root_key: &[u8; 32], is_initiator: bool) -> Self {
+        // Derive separate send/receive chains
+        let (send_label, recv_label) = if is_initiator {
+            (b"send", b"recv")
+        } else {
+            (b"recv", b"send")
+        };
+
+        let send_chain = derive_chain_key(root_key, send_label);
+        let recv_chain = derive_chain_key(root_key, recv_label);
+
+        Self {
+            send_chain,
+            recv_chain,
+            send_counter: 0,
+            recv_counter: 0,
+        }
+    }
+
+    /// Encrypt a message with forward secrecy.
+    ///
+    /// Advances the send chain - previous keys are destroyed.
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        // Ratchet send chain
+        let (new_chain, msg_key) = ratchet_chain(&self.send_chain);
+        self.send_chain = new_chain;
+
+        // Counter for ordering
+        let counter = self.send_counter;
+        self.send_counter += 1;
+
+        // Encrypt with message key
+        encrypt_with_key(&msg_key, plaintext, counter)
+    }
+
+    /// Decrypt a message with forward secrecy.
+    ///
+    /// Advances the receive chain - previous keys are destroyed.
+    pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        // Ratchet receive chain
+        let (new_chain, msg_key) = ratchet_chain(&self.recv_chain);
+        self.recv_chain = new_chain;
+
+        // Decrypt with message key
+        let (plaintext, counter) = decrypt_with_key(&msg_key, ciphertext)?;
+
+        // Verify counter (replay protection)
+        if counter != self.recv_counter {
+            return Err(ShieldError::RatchetError(format!(
+                "out of order message: expected {}, got {}",
+                self.recv_counter, counter
+            )));
+        }
+        self.recv_counter += 1;
+
+        Ok(plaintext)
+    }
+
+    /// Get send counter (for diagnostics).
+    #[must_use]
+    pub fn send_counter(&self) -> u64 {
+        self.send_counter
+    }
+
+    /// Get receive counter (for diagnostics).
+    #[must_use]
+    pub fn recv_counter(&self) -> u64 {
+        self.recv_counter
+    }
+}
+
+/// Derive chain key from root and label.
+fn derive_chain_key(root: &[u8; 32], label: &[u8]) -> [u8; 32] {
+    let mut data = Vec::with_capacity(root.len() + label.len());
+    data.extend_from_slice(root);
+    data.extend_from_slice(label);
+
+    let hash = digest::digest(&digest::SHA256, &data);
+    let mut result = [0u8; 32];
+    result.copy_from_slice(hash.as_ref());
+    result
+}
+
+/// Ratchet chain forward, returning (`new_chain`, `message_key`).
+fn ratchet_chain(chain_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    // New chain key
+    let mut chain_data = Vec::with_capacity(chain_key.len() + 5);
+    chain_data.extend_from_slice(chain_key);
+    chain_data.extend_from_slice(b"chain");
+    let new_chain_hash = digest::digest(&digest::SHA256, &chain_data);
+    let mut new_chain = [0u8; 32];
+    new_chain.copy_from_slice(new_chain_hash.as_ref());
+
+    // Message key
+    let mut msg_data = Vec::with_capacity(chain_key.len() + 7);
+    msg_data.extend_from_slice(chain_key);
+    msg_data.extend_from_slice(b"message");
+    let msg_hash = digest::digest(&digest::SHA256, &msg_data);
+    let mut msg_key = [0u8; 32];
+    msg_key.copy_from_slice(msg_hash.as_ref());
+
+    (new_chain, msg_key)
+}
+
+/// Encrypt with message key (includes counter).
+fn encrypt_with_key(key: &[u8; 32], plaintext: &[u8], counter: u64) -> Result<Vec<u8>> {
+    // Generate nonce
+    let nonce: [u8; 16] = crate::random::random_bytes()?;
+
+    // Counter header
+    let counter_bytes = counter.to_le_bytes();
+
+    // Data: counter || plaintext
+    let mut data = Vec::with_capacity(8 + plaintext.len());
+    data.extend_from_slice(&counter_bytes);
+    data.extend_from_slice(plaintext);
+
+    // Generate keystream
+    let mut keystream = Vec::with_capacity(data.len().div_ceil(32) * 32);
+    for i in 0..data.len().div_ceil(32) {
+        let block_counter = (i as u32).to_le_bytes();
+        let mut hash_input = Vec::with_capacity(key.len() + nonce.len() + 4);
+        hash_input.extend_from_slice(key);
+        hash_input.extend_from_slice(&nonce);
+        hash_input.extend_from_slice(&block_counter);
+        let hash = digest::digest(&digest::SHA256, &hash_input);
+        keystream.extend_from_slice(hash.as_ref());
+    }
+
+    // XOR encrypt
+    let ciphertext: Vec<u8> = data
+        .iter()
+        .zip(keystream.iter())
+        .map(|(p, k)| p ^ k)
+        .collect();
+
+    // HMAC
+    let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, key);
+    let mut hmac_data = Vec::with_capacity(16 + ciphertext.len());
+    hmac_data.extend_from_slice(&nonce);
+    hmac_data.extend_from_slice(&ciphertext);
+    let tag = hmac::sign(&hmac_key, &hmac_data);
+
+    // Format: nonce(16) || ciphertext || mac(16)
+    let mut result = Vec::with_capacity(16 + ciphertext.len() + 16);
+    result.extend_from_slice(&nonce);
+    result.extend_from_slice(&ciphertext);
+    result.extend_from_slice(&tag.as_ref()[..16]);
+
+    Ok(result)
+}
+
+/// Decrypt with message key, returns (plaintext, counter).
+fn decrypt_with_key(key: &[u8; 32], encrypted: &[u8]) -> Result<(Vec<u8>, u64)> {
+    if encrypted.len() < 40 {
+        return Err(ShieldError::RatchetError("ciphertext too short".into()));
+    }
+
+    let nonce = &encrypted[..16];
+    let ciphertext = &encrypted[16..encrypted.len() - 16];
+    let mac = &encrypted[encrypted.len() - 16..];
+
+    // Verify MAC
+    let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, key);
+    let mut hmac_data = Vec::with_capacity(16 + ciphertext.len());
+    hmac_data.extend_from_slice(nonce);
+    hmac_data.extend_from_slice(ciphertext);
+    let expected = hmac::sign(&hmac_key, &hmac_data);
+
+    if mac.ct_eq(&expected.as_ref()[..16]).unwrap_u8() != 1 {
+        return Err(ShieldError::AuthenticationFailed);
+    }
+
+    // Generate keystream
+    let mut keystream = Vec::with_capacity(ciphertext.len().div_ceil(32) * 32);
+    for i in 0..ciphertext.len().div_ceil(32) {
+        let block_counter = (i as u32).to_le_bytes();
+        let mut hash_input = Vec::with_capacity(key.len() + nonce.len() + 4);
+        hash_input.extend_from_slice(key);
+        hash_input.extend_from_slice(nonce);
+        hash_input.extend_from_slice(&block_counter);
+        let hash = digest::digest(&digest::SHA256, &hash_input);
+        keystream.extend_from_slice(hash.as_ref());
+    }
+
+    // XOR decrypt
+    let decrypted: Vec<u8> = ciphertext
+        .iter()
+        .zip(keystream.iter())
+        .map(|(c, k)| c ^ k)
+        .collect();
+
+    // Parse counter
+    let counter = u64::from_le_bytes([
+        decrypted[0],
+        decrypted[1],
+        decrypted[2],
+        decrypted[3],
+        decrypted[4],
+        decrypted[5],
+        decrypted[6],
+        decrypted[7],
+    ]);
+
+    Ok((decrypted[8..].to_vec(), counter))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ratchet_roundtrip() {
+        let root = [0x42u8; 32];
+        let mut alice = RatchetSession::new(&root, true);
+        let mut bob = RatchetSession::new(&root, false);
+
+        let msg1 = b"Hello Bob!";
+        let enc1 = alice.encrypt(msg1).unwrap();
+        let dec1 = bob.decrypt(&enc1).unwrap();
+        assert_eq!(msg1.as_slice(), dec1.as_slice());
+
+        let msg2 = b"Second message";
+        let enc2 = alice.encrypt(msg2).unwrap();
+        let dec2 = bob.decrypt(&enc2).unwrap();
+        assert_eq!(msg2.as_slice(), dec2.as_slice());
+    }
+
+    #[test]
+    fn test_ratchet_counters() {
+        let root = [0x42u8; 32];
+        let mut alice = RatchetSession::new(&root, true);
+        let mut bob = RatchetSession::new(&root, false);
+
+        assert_eq!(alice.send_counter(), 0);
+        assert_eq!(bob.recv_counter(), 0);
+
+        let enc = alice.encrypt(b"test").unwrap();
+        assert_eq!(alice.send_counter(), 1);
+
+        bob.decrypt(&enc).unwrap();
+        assert_eq!(bob.recv_counter(), 1);
+    }
+
+    #[test]
+    fn test_ratchet_different_ciphertexts() {
+        let root = [0x42u8; 32];
+        let mut alice = RatchetSession::new(&root, true);
+
+        let enc1 = alice.encrypt(b"same message").unwrap();
+        let enc2 = alice.encrypt(b"same message").unwrap();
+
+        // Different ciphertext for same plaintext (forward secrecy)
+        assert_ne!(enc1, enc2);
+    }
+
+    #[test]
+    fn test_ratchet_replay_detection() {
+        let root = [0x42u8; 32];
+        let mut alice = RatchetSession::new(&root, true);
+        let mut bob = RatchetSession::new(&root, false);
+
+        // Send two messages
+        let _enc1 = alice.encrypt(b"first").unwrap();
+        let enc2 = alice.encrypt(b"second").unwrap();
+
+        // Try to decrypt second message first (out of order)
+        // This should fail because Bob expects counter 0, but gets counter 1
+        assert!(bob.decrypt(&enc2).is_err());
+    }
+}

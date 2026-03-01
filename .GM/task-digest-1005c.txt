@@ -1,0 +1,3207 @@
+Directory structure:
+└── src/
+    ├── channel.js
+    ├── exchange.js
+    ├── fingerprint.js
+    ├── group.js
+    ├── identity.js
+    ├── index.d.ts
+    ├── index.js
+    ├── ratchet.js
+    ├── rotation.js
+    ├── shield.js
+    ├── signatures.js
+    ├── stream.js
+    └── totp.js
+
+================================================
+FILE: channel.js
+================================================
+/**
+ * Shield Secure Channel - TLS/SSH-like secure transport using symmetric crypto.
+ *
+ * Provides encrypted bidirectional communication with:
+ * - PAKE-based handshake (no certificates needed)
+ * - Forward secrecy via key ratcheting
+ * - Message authentication and replay protection
+ *
+ * @example
+ * const { ShieldChannel, ChannelConfig } = require('@guard8/shield');
+ * const net = require('net');
+ *
+ * // Both parties share a password
+ * const config = new ChannelConfig('shared-secret', 'my-service');
+ *
+ * // Client side
+ * const socket = net.connect(8080, 'localhost');
+ * const client = await ShieldChannel.connect(socket, config);
+ * await client.send(Buffer.from('Hello server!'));
+ */
+
+const crypto = require('crypto');
+const { PAKEExchange } = require('./exchange');
+const { RatchetSession } = require('./ratchet');
+
+// Protocol constants
+const PROTOCOL_VERSION = 1;
+const MAX_MESSAGE_SIZE = 16 * 1024 * 1024; // 16 MB
+
+// Handshake message types
+const HANDSHAKE_CLIENT_HELLO = 1;
+const HANDSHAKE_SERVER_HELLO = 2;
+const HANDSHAKE_FINISHED = 3;
+
+/**
+ * Channel configuration.
+ */
+class ChannelConfig {
+    /**
+     * Create channel configuration.
+     * @param {string} password - Shared password for PAKE
+     * @param {string} service - Service identifier for domain separation
+     * @param {number} iterations - PBKDF2 iterations (default: 200000)
+     * @param {number} handshakeTimeoutMs - Handshake timeout (default: 30000)
+     */
+    constructor(password, service, iterations = 200000, handshakeTimeoutMs = 30000) {
+        this.password = password;
+        this.service = service;
+        this.iterations = iterations;
+        this.handshakeTimeoutMs = handshakeTimeoutMs;
+    }
+
+    /**
+     * Set custom iterations.
+     * @param {number} iterations
+     * @returns {ChannelConfig}
+     */
+    withIterations(iterations) {
+        this.iterations = iterations;
+        return this;
+    }
+
+    /**
+     * Set handshake timeout.
+     * @param {number} timeoutMs
+     * @returns {ChannelConfig}
+     */
+    withTimeout(timeoutMs) {
+        this.handshakeTimeoutMs = timeoutMs;
+        return this;
+    }
+}
+
+/**
+ * Shield secure channel for encrypted communication.
+ *
+ * Provides TLS-like security using only symmetric cryptography:
+ * - PAKE handshake establishes shared key from password
+ * - RatchetSession provides forward secrecy
+ * - All messages authenticated with HMAC
+ */
+class ShieldChannel {
+    constructor(stream, session, service) {
+        this._stream = stream;
+        this._session = session;
+        this._service = service;
+        this._readBuffer = Buffer.alloc(0);
+    }
+
+    /**
+     * Connect as client (initiator).
+     * @param {net.Socket} stream - Underlying transport
+     * @param {ChannelConfig} config - Channel configuration
+     * @returns {Promise<ShieldChannel>}
+     */
+    static async connect(stream, config) {
+        const channel = new ShieldChannel(stream, null, config.service);
+
+        // Step 1: Generate client salt and send ClientHello
+        const clientSalt = crypto.randomBytes(16);
+        await channel._sendHandshake(HANDSHAKE_CLIENT_HELLO, clientSalt);
+
+        // Step 2: Receive ServerHello
+        const serverHello = await channel._recvHandshake(HANDSHAKE_SERVER_HELLO);
+        if (serverHello.length !== 48) {
+            throw new Error('Invalid ServerHello');
+        }
+
+        const finalSalt = serverHello.slice(0, 16);
+        const serverContribution = serverHello.slice(16, 48);
+
+        // Step 3: Derive our contribution and send it
+        const clientContribution = PAKEExchange.derive(
+            config.password, finalSalt, 'client', config.iterations
+        );
+        await channel._sendHandshake(HANDSHAKE_FINISHED, clientContribution);
+
+        // Compute session key
+        const sessionKey = channel._computeSessionKey(
+            config, finalSalt, clientContribution, serverContribution
+        );
+
+        // Create ratchet session
+        channel._session = new RatchetSession(sessionKey, true);
+
+        // Exchange confirmations
+        await channel._sendConfirmation(sessionKey, true);
+        await channel._verifyConfirmation(sessionKey, false);
+
+        return channel;
+    }
+
+    /**
+     * Accept connection as server.
+     * @param {net.Socket} stream - Underlying transport
+     * @param {ChannelConfig} config - Channel configuration
+     * @returns {Promise<ShieldChannel>}
+     */
+    static async accept(stream, config) {
+        const channel = new ShieldChannel(stream, null, config.service);
+
+        // Step 1: Receive ClientHello
+        const clientHello = await channel._recvHandshake(HANDSHAKE_CLIENT_HELLO);
+        if (clientHello.length !== 16) {
+            throw new Error('Invalid ClientHello');
+        }
+
+        // Mix salts
+        const serverSalt = crypto.randomBytes(16);
+        const finalSalt = Buffer.alloc(16);
+        for (let i = 0; i < 16; i++) {
+            finalSalt[i] = serverSalt[i] ^ clientHello[i];
+        }
+
+        // Derive server contribution
+        const serverContribution = PAKEExchange.derive(
+            config.password, finalSalt, 'server', config.iterations
+        );
+
+        // Step 2: Send ServerHello
+        const serverHello = Buffer.concat([finalSalt, serverContribution]);
+        await channel._sendHandshake(HANDSHAKE_SERVER_HELLO, serverHello);
+
+        // Step 3: Receive client contribution
+        const clientFinished = await channel._recvHandshake(HANDSHAKE_FINISHED);
+        if (clientFinished.length !== 32) {
+            throw new Error('Invalid Finished');
+        }
+
+        // Compute session key
+        const sessionKey = channel._computeSessionKey(
+            config, finalSalt, serverContribution, clientFinished
+        );
+
+        // Create ratchet session
+        channel._session = new RatchetSession(sessionKey, false);
+
+        // Exchange confirmations
+        await channel._verifyConfirmation(sessionKey, true);
+        await channel._sendConfirmation(sessionKey, false);
+
+        return channel;
+    }
+
+    /**
+     * Send encrypted message.
+     * @param {Buffer} data - Data to send
+     * @returns {Promise<void>}
+     */
+    async send(data) {
+        if (data.length > MAX_MESSAGE_SIZE) {
+            throw new Error(`Message too large: ${data.length} > ${MAX_MESSAGE_SIZE}`);
+        }
+
+        const encrypted = this._session.encrypt(data);
+        await this._writeFrame(encrypted);
+    }
+
+    /**
+     * Receive and decrypt message.
+     * @returns {Promise<Buffer>}
+     */
+    async recv() {
+        const encrypted = await this._readFrame();
+        return this._session.decrypt(encrypted);
+    }
+
+    /**
+     * Get service identifier.
+     * @returns {string}
+     */
+    get service() {
+        return this._service;
+    }
+
+    /**
+     * Get send message count.
+     * @returns {number}
+     */
+    get messagesSent() {
+        return this._session.sendCounter;
+    }
+
+    /**
+     * Get receive message count.
+     * @returns {number}
+     */
+    get messagesReceived() {
+        return this._session.recvCounter;
+    }
+
+    /**
+     * Close channel.
+     */
+    close() {
+        this._stream.destroy();
+    }
+
+    // --- Internal helpers ---
+
+    _computeSessionKey(config, salt, localContribution, remoteContribution) {
+        const baseKey = PAKEExchange.combine(localContribution, remoteContribution);
+        const passwordKey = PAKEExchange.derive(
+            config.password, salt, 'session', config.iterations
+        );
+
+        const combined = Buffer.concat([baseKey, passwordKey]);
+        return crypto.createHash('sha256').update(combined).digest();
+    }
+
+    async _sendHandshake(msgType, data) {
+        const frame = Buffer.alloc(4 + data.length);
+        frame[0] = PROTOCOL_VERSION;
+        frame[1] = msgType;
+        frame.writeUInt16BE(data.length, 2);
+        data.copy(frame, 4);
+
+        return new Promise((resolve, reject) => {
+            this._stream.write(frame, (err) => {
+                if (err) reject(err);
+                else resolve();
+            });
+        });
+    }
+
+    async _recvHandshake(expectedType) {
+        const header = await this._readBytes(4);
+
+        if (header[0] !== PROTOCOL_VERSION) {
+            throw new Error(`Unsupported protocol version: ${header[0]}`);
+        }
+
+        if (header[1] !== expectedType) {
+            throw new Error(`Unexpected message type: expected ${expectedType}, got ${header[1]}`);
+        }
+
+        const length = header.readUInt16BE(2);
+        if (length > 1024) {
+            throw new Error('Handshake message too large');
+        }
+
+        return this._readBytes(length);
+    }
+
+    async _sendConfirmation(sessionKey, isClient) {
+        const label = isClient ? 'client-confirm' : 'server-confirm';
+        const confirm = crypto.createHmac('sha256', sessionKey)
+            .update(label)
+            .digest()
+            .slice(0, 16);
+        await this._writeFrameRaw(confirm);
+    }
+
+    async _verifyConfirmation(sessionKey, expectClient) {
+        const received = await this._readFrameRaw();
+        if (received.length !== 16) {
+            throw new Error('Invalid confirmation');
+        }
+
+        const label = expectClient ? 'client-confirm' : 'server-confirm';
+        const expected = crypto.createHmac('sha256', sessionKey)
+            .update(label)
+            .digest()
+            .slice(0, 16);
+
+        if (!crypto.timingSafeEqual(received, expected)) {
+            throw new Error('Authentication failed');
+        }
+    }
+
+    async _writeFrame(data) {
+        return this._writeFrameRaw(data);
+    }
+
+    async _readFrame() {
+        return this._readFrameRaw();
+    }
+
+    async _writeFrameRaw(data) {
+        const header = Buffer.alloc(4);
+        header.writeUInt32BE(data.length, 0);
+
+        return new Promise((resolve, reject) => {
+            this._stream.write(Buffer.concat([header, data]), (err) => {
+                if (err) reject(err);
+                else resolve();
+            });
+        });
+    }
+
+    async _readFrameRaw() {
+        const lenBuf = await this._readBytes(4);
+        const length = lenBuf.readUInt32BE(0);
+
+        if (length > MAX_MESSAGE_SIZE) {
+            throw new Error(`Frame too large: ${length} > ${MAX_MESSAGE_SIZE}`);
+        }
+
+        return this._readBytes(length);
+    }
+
+    async _readBytes(count) {
+        return new Promise((resolve, reject) => {
+            const tryRead = () => {
+                if (this._readBuffer.length >= count) {
+                    const result = this._readBuffer.slice(0, count);
+                    this._readBuffer = this._readBuffer.slice(count);
+                    resolve(result);
+                    return;
+                }
+
+                this._stream.once('data', (chunk) => {
+                    this._readBuffer = Buffer.concat([this._readBuffer, chunk]);
+                    tryRead();
+                });
+
+                this._stream.once('error', reject);
+                this._stream.once('close', () => reject(new Error('Connection closed')));
+            };
+
+            tryRead();
+        });
+    }
+}
+
+/**
+ * Channel listener for accepting multiple connections.
+ */
+class ShieldListener {
+    /**
+     * Create listener.
+     * @param {net.Server} server - TCP server
+     * @param {ChannelConfig} config - Channel configuration
+     */
+    constructor(server, config) {
+        this._server = server;
+        this._config = config;
+    }
+
+    /**
+     * Accept next connection.
+     * @returns {Promise<ShieldChannel>}
+     */
+    async accept() {
+        return new Promise((resolve, reject) => {
+            this._server.once('connection', async (socket) => {
+                try {
+                    const channel = await ShieldChannel.accept(socket, this._config);
+                    resolve(channel);
+                } catch (err) {
+                    reject(err);
+                }
+            });
+
+            this._server.once('error', reject);
+        });
+    }
+
+    /**
+     * Get configuration.
+     * @returns {ChannelConfig}
+     */
+    get config() {
+        return this._config;
+    }
+
+    /**
+     * Close listener.
+     */
+    close() {
+        this._server.close();
+    }
+}
+
+module.exports = { ShieldChannel, ChannelConfig, ShieldListener };
+
+
+
+================================================
+FILE: exchange.js
+================================================
+/**
+ * Shield Key Exchange - Key exchange without public-key crypto.
+ */
+
+const crypto = require('crypto');
+
+/**
+ * Password-Authenticated Key Exchange.
+ */
+class PAKEExchange {
+    static ITERATIONS = 200000;
+
+    /**
+     * Derive key contribution from password.
+     * @param {string} password - Shared password
+     * @param {Buffer} salt - Public salt
+     * @param {string} role - Role identifier
+     * @param {number} iterations - PBKDF2 iterations
+     * @returns {Buffer}
+     */
+    static derive(password, salt, role, iterations = null) {
+        if (iterations === null) iterations = PAKEExchange.ITERATIONS;
+        const baseKey = crypto.pbkdf2Sync(password, salt, iterations, 32, 'sha256');
+        return crypto.createHash('sha256')
+            .update(Buffer.concat([baseKey, Buffer.from(role)]))
+            .digest();
+    }
+
+    /**
+     * Combine key contributions into session key.
+     * @param {...Buffer} contributions - Key contributions
+     * @returns {Buffer}
+     */
+    static combine(...contributions) {
+        const sorted = contributions.sort(Buffer.compare);
+        const combined = Buffer.concat(sorted);
+        return crypto.createHash('sha256').update(combined).digest();
+    }
+
+    /**
+     * Generate random salt.
+     * @returns {Buffer}
+     */
+    static generateSalt() {
+        return crypto.randomBytes(16);
+    }
+}
+
+/**
+ * Key exchange via QR codes or manual transfer.
+ */
+class QRExchange {
+    /**
+     * Encode key for QR code.
+     * @param {Buffer} key - Key bytes
+     * @returns {string}
+     */
+    static encode(key) {
+        return key.toString('base64url');
+    }
+
+    /**
+     * Decode key from QR code.
+     * @param {string} encoded - Base64 string
+     * @returns {Buffer}
+     */
+    static decode(encoded) {
+        return Buffer.from(encoded, 'base64url');
+    }
+
+    /**
+     * Generate complete exchange data with metadata.
+     * @param {Buffer} key - Key to exchange
+     * @param {Object} metadata - Optional metadata
+     * @returns {string}
+     */
+    static generateExchangeData(key, metadata = null) {
+        const data = {
+            v: 1,
+            k: key.toString('base64url')
+        };
+        if (metadata) data.m = metadata;
+        return JSON.stringify(data);
+    }
+
+    /**
+     * Parse exchange data.
+     * @param {string} data - JSON string
+     * @returns {Array} [key, metadata]
+     */
+    static parseExchangeData(data) {
+        const parsed = JSON.parse(data);
+        const key = Buffer.from(parsed.k, 'base64url');
+        return [key, parsed.m || null];
+    }
+}
+
+/**
+ * Split keys into shares.
+ */
+class KeySplitter {
+    /**
+     * Split key into shares (all required).
+     * @param {Buffer} key - Key to split
+     * @param {number} numShares - Number of shares
+     * @returns {Buffer[]}
+     */
+    static split(key, numShares) {
+        if (numShares < 2) throw new Error('Need at least 2 shares');
+
+        const shares = [];
+        for (let i = 0; i < numShares - 1; i++) {
+            shares.push(crypto.randomBytes(key.length));
+        }
+
+        // Final share = XOR of key with all others
+        let final = Buffer.from(key);
+        for (const share of shares) {
+            final = Buffer.from(final.map((b, i) => b ^ share[i]));
+        }
+        shares.push(final);
+
+        return shares;
+    }
+
+    /**
+     * Combine shares to recover key.
+     * @param {Buffer[]} shares - All shares
+     * @returns {Buffer}
+     */
+    static combine(shares) {
+        if (shares.length < 2) throw new Error('Need at least 2 shares');
+
+        let result = Buffer.from(shares[0]);
+        for (let i = 1; i < shares.length; i++) {
+            result = Buffer.from(result.map((b, j) => b ^ shares[i][j]));
+        }
+        return result;
+    }
+}
+
+module.exports = { PAKEExchange, QRExchange, KeySplitter };
+
+
+
+================================================
+FILE: fingerprint.js
+================================================
+/**
+ * Hardware fingerprinting for device-bound encryption.
+ *
+ * Collects platform-specific hardware identifiers to create device-bound keys.
+ * Adapted from SaaSClient-SideLicensingSystem.
+ *
+ * @module fingerprint
+ */
+
+const { execSync } = require('child_process');
+const crypto = require('crypto');
+const os = require('os');
+
+/**
+ * Fingerprint collection mode.
+ * @enum {string}
+ */
+const FingerprintMode = {
+    NONE: 'none',
+    MOTHERBOARD: 'motherboard',
+    CPU: 'cpu',
+    COMBINED: 'combined'
+};
+
+/**
+ * Collect hardware fingerprint.
+ *
+ * @param {string} mode - Fingerprint mode
+ * @returns {string} Fingerprint string (MD5 hex), or empty for NONE
+ * @throws {Error} If fingerprint unavailable
+ *
+ * @example
+ * const fp = collectFingerprint(FingerprintMode.COMBINED);
+ * console.log('Device fingerprint:', fp);
+ */
+function collectFingerprint(mode) {
+    if (mode === FingerprintMode.NONE) {
+        return '';
+    }
+
+    if (mode === FingerprintMode.MOTHERBOARD) {
+        return getMotherboardSerial();
+    }
+
+    if (mode === FingerprintMode.CPU) {
+        return getCpuId();
+    }
+
+    if (mode === FingerprintMode.COMBINED) {
+        const components = [];
+
+        try {
+            components.push(getMotherboardSerial());
+        } catch (e) {
+            // Continue without motherboard
+        }
+
+        try {
+            components.push(getCpuId());
+        } catch (e) {
+            // Continue without CPU
+        }
+
+        if (components.length === 0) {
+            throw new Error('Hardware fingerprint unavailable');
+        }
+
+        // Create MD5 hash of combined components
+        const combined = components.join('-');
+        return crypto.createHash('md5').update(combined).digest('hex');
+    }
+
+    throw new Error(`Unknown fingerprint mode: ${mode}`);
+}
+
+/**
+ * Get motherboard serial number (platform-specific).
+ *
+ * @returns {string} Motherboard serial
+ * @throws {Error} If unavailable
+ */
+function getMotherboardSerial() {
+    const platform = os.platform();
+
+    if (platform === 'win32') {
+        try {
+            const output = execSync('wmic baseboard get serialnumber /value', {
+                encoding: 'utf8',
+                timeout: 5000
+            });
+
+            for (const line of output.split('\n')) {
+                if (line.startsWith('SerialNumber=')) {
+                    const serial = line.replace('SerialNumber=', '').trim();
+                    if (serial && serial !== 'To be filled by O.E.M.') {
+                        return serial;
+                    }
+                }
+            }
+        } catch (e) {
+            // Fall through
+        }
+    } else if (platform === 'linux') {
+        // Try DMI sysfs first
+        try {
+            const fs = require('fs');
+            const serial = fs.readFileSync('/sys/class/dmi/id/board_serial', 'utf8').trim();
+            if (serial && serial !== 'To be filled by O.E.M.') {
+                return serial;
+            }
+        } catch (e) {
+            // Fall through to dmidecode
+        }
+
+        // Fallback to dmidecode
+        try {
+            const output = execSync('dmidecode -s baseboard-serial-number', {
+                encoding: 'utf8',
+                timeout: 5000
+            });
+            const serial = output.trim();
+            if (serial && serial !== 'To be filled by O.E.M.') {
+                return serial;
+            }
+        } catch (e) {
+            // Fall through
+        }
+    } else if (platform === 'darwin') {
+        try {
+            const output = execSync('system_profiler SPHardwareDataType', {
+                encoding: 'utf8',
+                timeout: 5000
+            });
+
+            for (const line of output.split('\n')) {
+                if (line.includes('Serial Number')) {
+                    const parts = line.split(':');
+                    if (parts.length >= 2) {
+                        return parts[1].trim();
+                    }
+                }
+            }
+        } catch (e) {
+            // Fall through
+        }
+    }
+
+    throw new Error('Motherboard serial number unavailable');
+}
+
+/**
+ * Get CPU identifier (platform-specific).
+ *
+ * @returns {string} CPU ID
+ * @throws {Error} If unavailable
+ */
+function getCpuId() {
+    const platform = os.platform();
+
+    if (platform === 'win32') {
+        try {
+            const output = execSync('wmic cpu get ProcessorId /value', {
+                encoding: 'utf8',
+                timeout: 5000
+            });
+
+            for (const line of output.split('\n')) {
+                if (line.startsWith('ProcessorId=')) {
+                    const cpuId = line.replace('ProcessorId=', '').trim();
+                    if (cpuId) {
+                        return cpuId;
+                    }
+                }
+            }
+        } catch (e) {
+            // Fall through
+        }
+    } else if (platform === 'linux') {
+        try {
+            const fs = require('fs');
+            const content = fs.readFileSync('/proc/cpuinfo', 'utf8');
+
+            for (const line of content.split('\n')) {
+                if (line.startsWith('processor') && line.includes('0')) {
+                    // Use first processor as identifier (hashed)
+                    return crypto.createHash('md5').update(line).digest('hex');
+                }
+            }
+        } catch (e) {
+            // Fall through
+        }
+    } else if (platform === 'darwin') {
+        try {
+            const output = execSync('sysctl -n machdep.cpu.brand_string', {
+                encoding: 'utf8',
+                timeout: 5000
+            });
+            const cpuInfo = output.trim();
+            if (cpuInfo) {
+                return crypto.createHash('md5').update(cpuInfo).digest('hex');
+            }
+        } catch (e) {
+            // Fall through
+        }
+    }
+
+    throw new Error('CPU identifier unavailable');
+}
+
+module.exports = {
+    FingerprintMode,
+    collectFingerprint
+};
+
+
+
+================================================
+FILE: group.js
+================================================
+/**
+ * Shield Group Encryption - Multi-recipient encryption.
+ *
+ * Encrypt once for multiple recipients, each can decrypt with their own key.
+ */
+
+const crypto = require('crypto');
+
+/**
+ * Generate keystream using SHA256.
+ */
+function generateKeystream(key, nonce, length) {
+    let keystream = Buffer.alloc(0);
+    for (let i = 0; i < Math.ceil(length / 32); i++) {
+        const counter = Buffer.alloc(4);
+        counter.writeUInt32LE(i);
+        const block = crypto.createHash('sha256')
+            .update(Buffer.concat([key, nonce, counter]))
+            .digest();
+        keystream = Buffer.concat([keystream, block]);
+    }
+    return keystream.slice(0, length);
+}
+
+/**
+ * Encrypt a block with HMAC authentication.
+ */
+function encryptBlock(key, data) {
+    const nonce = crypto.randomBytes(16);
+    const keystream = generateKeystream(key, nonce, data.length);
+    const ciphertext = Buffer.alloc(data.length);
+    for (let i = 0; i < data.length; i++) {
+        ciphertext[i] = data[i] ^ keystream[i];
+    }
+    const mac = crypto.createHmac('sha256', key)
+        .update(Buffer.concat([nonce, ciphertext]))
+        .digest()
+        .slice(0, 16);
+    return Buffer.concat([nonce, ciphertext, mac]);
+}
+
+/**
+ * Decrypt a block with HMAC verification.
+ */
+function decryptBlock(key, encrypted) {
+    if (encrypted.length < 32) return null;
+
+    const nonce = encrypted.slice(0, 16);
+    const ciphertext = encrypted.slice(16, -16);
+    const mac = encrypted.slice(-16);
+
+    const expectedMac = crypto.createHmac('sha256', key)
+        .update(Buffer.concat([nonce, ciphertext]))
+        .digest()
+        .slice(0, 16);
+
+    if (!crypto.timingSafeEqual(mac, expectedMac)) return null;
+
+    const keystream = generateKeystream(key, nonce, ciphertext.length);
+    const plaintext = Buffer.alloc(ciphertext.length);
+    for (let i = 0; i < ciphertext.length; i++) {
+        plaintext[i] = ciphertext[i] ^ keystream[i];
+    }
+    return plaintext;
+}
+
+/**
+ * Multi-recipient encryption.
+ *
+ * Uses a group key for message encryption, then encrypts
+ * the group key separately for each member.
+ */
+class GroupEncryption {
+    /**
+     * Initialize group encryption.
+     * @param {Buffer} groupKey - 32-byte group key (generated if not provided)
+     */
+    constructor(groupKey = null) {
+        this.groupKey = groupKey || crypto.randomBytes(32);
+        this._members = new Map();
+    }
+
+    /**
+     * Add a member to the group.
+     * @param {string} memberId - Unique member identifier
+     * @param {Buffer} sharedKey - Pre-shared key with this member
+     */
+    addMember(memberId, sharedKey) {
+        this._members.set(memberId, sharedKey);
+    }
+
+    /**
+     * Remove a member from the group.
+     * @param {string} memberId - Member to remove
+     * @returns {boolean} True if member was removed
+     */
+    removeMember(memberId) {
+        return this._members.delete(memberId);
+    }
+
+    /**
+     * Get list of member IDs.
+     * @returns {string[]}
+     */
+    get members() {
+        return Array.from(this._members.keys());
+    }
+
+    /**
+     * Encrypt for all group members.
+     * @param {Buffer} plaintext - Message to encrypt
+     * @returns {Object} Dictionary with ciphertext and per-member encrypted keys
+     */
+    encrypt(plaintext) {
+        // Encrypt message with group key
+        const ciphertext = encryptBlock(this.groupKey, plaintext);
+
+        // Encrypt group key for each member
+        const encryptedKeys = {};
+        for (const [memberId, memberKey] of this._members) {
+            encryptedKeys[memberId] = encryptBlock(memberKey, this.groupKey).toString('base64url');
+        }
+
+        return {
+            version: 1,
+            ciphertext: ciphertext.toString('base64url'),
+            keys: encryptedKeys
+        };
+    }
+
+    /**
+     * Decrypt as a group member.
+     * @param {Object} encrypted - Encrypted message from encrypt()
+     * @param {string} memberId - Your member ID
+     * @param {Buffer} memberKey - Your shared key
+     * @returns {Buffer|null} Decrypted message, or null if decryption fails
+     */
+    static decrypt(encrypted, memberId, memberKey) {
+        if (!encrypted.keys || !encrypted.keys[memberId]) {
+            return null;
+        }
+
+        // Decrypt group key
+        const encryptedGroupKey = Buffer.from(encrypted.keys[memberId], 'base64url');
+        const groupKey = decryptBlock(memberKey, encryptedGroupKey);
+        if (groupKey === null) return null;
+
+        // Decrypt message
+        const ciphertext = Buffer.from(encrypted.ciphertext, 'base64url');
+        return decryptBlock(groupKey, ciphertext);
+    }
+
+    /**
+     * Rotate the group key.
+     * @returns {Buffer} Old group key
+     */
+    rotateKey() {
+        const oldKey = this.groupKey;
+        this.groupKey = crypto.randomBytes(32);
+        return oldKey;
+    }
+}
+
+/**
+ * Efficient broadcast encryption for large groups.
+ *
+ * Uses a key hierarchy to reduce per-message overhead.
+ * Members are organized into subgroups with shared subgroup keys.
+ */
+class BroadcastEncryption {
+    /**
+     * Initialize broadcast encryption.
+     * @param {Buffer} masterKey - Master key for the broadcast
+     * @param {number} subgroupSize - Members per subgroup
+     */
+    constructor(masterKey = null, subgroupSize = 16) {
+        this.masterKey = masterKey || crypto.randomBytes(32);
+        this.subgroupSize = subgroupSize;
+        this._members = new Map(); // memberId -> {subgroupId, memberKey}
+        this._subgroupKeys = new Map();
+        this._nextSubgroup = 0;
+    }
+
+    /**
+     * Add member to broadcast group.
+     * @param {string} memberId - Unique member ID
+     * @param {Buffer} memberKey - Shared key with member
+     * @returns {number} Subgroup ID assigned
+     */
+    addMember(memberId, memberKey) {
+        // Find subgroup with space
+        let subgroupId = null;
+        for (const [sgId, sgKey] of this._subgroupKeys) {
+            let membersInSg = 0;
+            for (const [, data] of this._members) {
+                if (data.subgroupId === sgId) membersInSg++;
+            }
+            if (membersInSg < this.subgroupSize) {
+                subgroupId = sgId;
+                break;
+            }
+        }
+
+        if (subgroupId === null) {
+            subgroupId = this._nextSubgroup;
+            this._subgroupKeys.set(subgroupId, crypto.randomBytes(32));
+            this._nextSubgroup++;
+        }
+
+        this._members.set(memberId, { subgroupId, memberKey });
+        return subgroupId;
+    }
+
+    /**
+     * Encrypt for broadcast.
+     * @param {Buffer} plaintext - Message to encrypt
+     * @returns {Object} Encrypted broadcast message
+     */
+    encrypt(plaintext) {
+        const messageKey = crypto.randomBytes(32);
+
+        // Encrypt message
+        const ciphertext = encryptBlock(messageKey, plaintext);
+
+        // Encrypt message key for each subgroup
+        const subgroupKeysEnc = {};
+        for (const [sgId, sgKey] of this._subgroupKeys) {
+            subgroupKeysEnc[String(sgId)] = encryptBlock(sgKey, messageKey).toString('base64url');
+        }
+
+        // Encrypt subgroup keys for each member
+        const memberKeysEnc = {};
+        for (const [memberId, { subgroupId, memberKey }] of this._members) {
+            const sgKey = this._subgroupKeys.get(subgroupId);
+            memberKeysEnc[memberId] = {
+                sg: subgroupId,
+                key: encryptBlock(memberKey, sgKey).toString('base64url')
+            };
+        }
+
+        return {
+            version: 1,
+            ciphertext: ciphertext.toString('base64url'),
+            subgroups: subgroupKeysEnc,
+            members: memberKeysEnc
+        };
+    }
+
+    /**
+     * Decrypt broadcast as member.
+     * @param {Object} encrypted - Encrypted broadcast
+     * @param {string} memberId - Your member ID
+     * @param {Buffer} memberKey - Your shared key
+     * @returns {Buffer|null} Decrypted message
+     */
+    static decrypt(encrypted, memberId, memberKey) {
+        if (!encrypted.members || !encrypted.members[memberId]) {
+            return null;
+        }
+
+        const memberData = encrypted.members[memberId];
+        const sgId = memberData.sg;
+
+        // Decrypt subgroup key
+        const sgKeyEnc = Buffer.from(memberData.key, 'base64url');
+        const sgKey = decryptBlock(memberKey, sgKeyEnc);
+        if (sgKey === null) return null;
+
+        // Decrypt message key
+        const msgKeyEnc = Buffer.from(encrypted.subgroups[String(sgId)], 'base64url');
+        const msgKey = decryptBlock(sgKey, msgKeyEnc);
+        if (msgKey === null) return null;
+
+        // Decrypt message
+        const ciphertext = Buffer.from(encrypted.ciphertext, 'base64url');
+        return decryptBlock(msgKey, ciphertext);
+    }
+}
+
+module.exports = { GroupEncryption, BroadcastEncryption };
+
+
+
+================================================
+FILE: identity.js
+================================================
+/**
+ * Shield Identity - SSO/Identity Provider without public-key crypto.
+ *
+ * Provides secure identity management, session tokens, and service tokens
+ * using only symmetric cryptography.
+ */
+
+const crypto = require('crypto');
+
+/**
+ * Generate keystream using SHA256.
+ */
+function generateKeystream(key, nonce, length) {
+    let keystream = Buffer.alloc(0);
+    for (let i = 0; i < Math.ceil(length / 32); i++) {
+        const counter = Buffer.alloc(4);
+        counter.writeUInt32LE(i);
+        const block = crypto.createHash('sha256')
+            .update(Buffer.concat([key, nonce, counter]))
+            .digest();
+        keystream = Buffer.concat([keystream, block]);
+    }
+    return keystream.slice(0, length);
+}
+
+/**
+ * User identity.
+ */
+class Identity {
+    constructor(userId, displayName, verificationKey, attributes = {}) {
+        this.userId = userId;
+        this.displayName = displayName;
+        this.verificationKey = verificationKey;
+        this.attributes = attributes;
+        this.createdAt = Math.floor(Date.now() / 1000);
+    }
+}
+
+/**
+ * Session information.
+ */
+class Session {
+    constructor(userId, permissions = [], expiresAt = null, attributes = {}) {
+        this.userId = userId;
+        this.permissions = permissions;
+        this.expiresAt = expiresAt;
+        this.attributes = attributes;
+    }
+
+    get isExpired() {
+        if (this.expiresAt === null) return false;
+        return Math.floor(Date.now() / 1000) > this.expiresAt;
+    }
+
+    hasPermission(permission) {
+        return this.permissions.includes(permission);
+    }
+}
+
+/**
+ * Identity Provider - manages users and sessions.
+ */
+class IdentityProvider {
+    static ITERATIONS = 100000;
+
+    /**
+     * Initialize identity provider.
+     * @param {Buffer} masterKey - 32-byte master key
+     * @param {number} tokenTtl - Default token TTL in seconds
+     */
+    constructor(masterKey, tokenTtl = 3600) {
+        this._masterKey = masterKey;
+        this._tokenTtl = tokenTtl;
+        this._users = new Map(); // userId -> {passwordHash, salt, identity}
+    }
+
+    /**
+     * Derive key for specific purpose.
+     */
+    _deriveKey(purpose) {
+        return crypto.createHash('sha256')
+            .update(Buffer.concat([this._masterKey, Buffer.from(purpose)]))
+            .digest();
+    }
+
+    /**
+     * Register new user.
+     * @param {string} userId - Unique user ID
+     * @param {string} password - User's password
+     * @param {string} displayName - Display name
+     * @param {Object} attributes - Additional attributes
+     * @returns {Identity}
+     */
+    register(userId, password, displayName = null, attributes = {}) {
+        if (this._users.has(userId)) {
+            throw new Error(`User ${userId} already exists`);
+        }
+
+        const salt = crypto.randomBytes(16);
+        const passwordHash = crypto.pbkdf2Sync(
+            password, salt, IdentityProvider.ITERATIONS, 32, 'sha256'
+        );
+
+        // Generate verification key
+        const verificationKey = crypto.createHash('sha256')
+            .update(Buffer.concat([this._deriveKey('verify'), Buffer.from(userId)]))
+            .digest();
+
+        const identity = new Identity(
+            userId,
+            displayName || userId,
+            verificationKey,
+            attributes
+        );
+
+        this._users.set(userId, {
+            passwordHash,
+            salt,
+            identity
+        });
+
+        return identity;
+    }
+
+    /**
+     * Authenticate user.
+     * @param {string} userId - User ID
+     * @param {string} password - Password
+     * @param {string[]} permissions - Permissions to include
+     * @param {number} ttl - Token TTL
+     * @returns {string|null} Session token or null
+     */
+    authenticate(userId, password, permissions = [], ttl = null) {
+        const user = this._users.get(userId);
+        if (!user) return null;
+
+        const passwordHash = crypto.pbkdf2Sync(
+            password, user.salt, IdentityProvider.ITERATIONS, 32, 'sha256'
+        );
+
+        if (!crypto.timingSafeEqual(passwordHash, user.passwordHash)) {
+            return null;
+        }
+
+        return this._createToken(userId, permissions, ttl || this._tokenTtl);
+    }
+
+    /**
+     * Create session token.
+     */
+    _createToken(userId, permissions, ttl) {
+        const expiresAt = Math.floor(Date.now() / 1000) + ttl;
+        const nonce = crypto.randomBytes(16);
+
+        // Token data: userId length (2) + userId + permissions JSON + expires (8)
+        const userIdBuf = Buffer.from(userId);
+        const permsBuf = Buffer.from(JSON.stringify(permissions));
+        const expiresBuf = Buffer.alloc(8);
+        expiresBuf.writeBigUInt64LE(BigInt(expiresAt));
+
+        const userIdLen = Buffer.alloc(2);
+        userIdLen.writeUInt16LE(userIdBuf.length);
+
+        const permsLen = Buffer.alloc(2);
+        permsLen.writeUInt16LE(permsBuf.length);
+
+        const tokenData = Buffer.concat([userIdLen, userIdBuf, permsLen, permsBuf, expiresBuf]);
+
+        // Encrypt
+        const key = this._deriveKey('session');
+        const keystream = generateKeystream(key, nonce, tokenData.length);
+        const encrypted = Buffer.alloc(tokenData.length);
+        for (let i = 0; i < tokenData.length; i++) {
+            encrypted[i] = tokenData[i] ^ keystream[i];
+        }
+
+        // MAC
+        const mac = crypto.createHmac('sha256', key)
+            .update(Buffer.concat([nonce, encrypted]))
+            .digest()
+            .slice(0, 16);
+
+        return Buffer.concat([nonce, encrypted, mac]).toString('base64url');
+    }
+
+    /**
+     * Validate session token.
+     * @param {string} token - Session token
+     * @returns {Session|null}
+     */
+    validateToken(token) {
+        try {
+            const data = Buffer.from(token, 'base64url');
+            if (data.length < 34) return null;
+
+            const nonce = data.slice(0, 16);
+            const encrypted = data.slice(16, -16);
+            const mac = data.slice(-16);
+
+            const key = this._deriveKey('session');
+
+            // Verify MAC
+            const expectedMac = crypto.createHmac('sha256', key)
+                .update(Buffer.concat([nonce, encrypted]))
+                .digest()
+                .slice(0, 16);
+
+            if (!crypto.timingSafeEqual(mac, expectedMac)) return null;
+
+            // Decrypt
+            const keystream = generateKeystream(key, nonce, encrypted.length);
+            const tokenData = Buffer.alloc(encrypted.length);
+            for (let i = 0; i < encrypted.length; i++) {
+                tokenData[i] = encrypted[i] ^ keystream[i];
+            }
+
+            // Parse
+            const userIdLen = tokenData.readUInt16LE(0);
+            const userId = tokenData.slice(2, 2 + userIdLen).toString();
+            const permsLen = tokenData.readUInt16LE(2 + userIdLen);
+            const permissions = JSON.parse(tokenData.slice(4 + userIdLen, 4 + userIdLen + permsLen).toString());
+            const expiresAt = Number(tokenData.readBigUInt64LE(4 + userIdLen + permsLen));
+
+            const session = new Session(userId, permissions, expiresAt);
+            if (session.isExpired) return null;
+
+            return session;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    /**
+     * Create service-specific token.
+     * @param {string} sessionToken - Valid session token
+     * @param {string} service - Service identifier
+     * @param {string[]} permissions - Service permissions
+     * @param {number} ttl - Token TTL
+     * @returns {string|null}
+     */
+    createServiceToken(sessionToken, service, permissions = [], ttl = 300) {
+        const session = this.validateToken(sessionToken);
+        if (!session) return null;
+
+        const expiresAt = Math.floor(Date.now() / 1000) + ttl;
+        const nonce = crypto.randomBytes(16);
+
+        // Token data
+        const userIdBuf = Buffer.from(session.userId);
+        const serviceBuf = Buffer.from(service);
+        const permsBuf = Buffer.from(JSON.stringify(permissions));
+        const expiresBuf = Buffer.alloc(8);
+        expiresBuf.writeBigUInt64LE(BigInt(expiresAt));
+
+        const userIdLen = Buffer.alloc(2);
+        userIdLen.writeUInt16LE(userIdBuf.length);
+
+        const serviceLen = Buffer.alloc(2);
+        serviceLen.writeUInt16LE(serviceBuf.length);
+
+        const permsLen = Buffer.alloc(2);
+        permsLen.writeUInt16LE(permsBuf.length);
+
+        const tokenData = Buffer.concat([
+            userIdLen, userIdBuf,
+            serviceLen, serviceBuf,
+            permsLen, permsBuf,
+            expiresBuf
+        ]);
+
+        // Encrypt with service-specific key
+        const key = this._deriveKey(`service:${service}`);
+        const keystream = generateKeystream(key, nonce, tokenData.length);
+        const encrypted = Buffer.alloc(tokenData.length);
+        for (let i = 0; i < tokenData.length; i++) {
+            encrypted[i] = tokenData[i] ^ keystream[i];
+        }
+
+        const mac = crypto.createHmac('sha256', key)
+            .update(Buffer.concat([nonce, encrypted]))
+            .digest()
+            .slice(0, 16);
+
+        return Buffer.concat([nonce, encrypted, mac]).toString('base64url');
+    }
+
+    /**
+     * Validate service token.
+     * @param {string} token - Service token
+     * @param {string} service - Expected service
+     * @returns {Session|null}
+     */
+    validateServiceToken(token, service) {
+        try {
+            const data = Buffer.from(token, 'base64url');
+            if (data.length < 34) return null;
+
+            const nonce = data.slice(0, 16);
+            const encrypted = data.slice(16, -16);
+            const mac = data.slice(-16);
+
+            const key = this._deriveKey(`service:${service}`);
+
+            // Verify MAC
+            const expectedMac = crypto.createHmac('sha256', key)
+                .update(Buffer.concat([nonce, encrypted]))
+                .digest()
+                .slice(0, 16);
+
+            if (!crypto.timingSafeEqual(mac, expectedMac)) return null;
+
+            // Decrypt
+            const keystream = generateKeystream(key, nonce, encrypted.length);
+            const tokenData = Buffer.alloc(encrypted.length);
+            for (let i = 0; i < encrypted.length; i++) {
+                tokenData[i] = encrypted[i] ^ keystream[i];
+            }
+
+            // Parse
+            let offset = 0;
+            const userIdLen = tokenData.readUInt16LE(offset);
+            offset += 2;
+            const userId = tokenData.slice(offset, offset + userIdLen).toString();
+            offset += userIdLen;
+
+            const serviceLen = tokenData.readUInt16LE(offset);
+            offset += 2;
+            const tokenService = tokenData.slice(offset, offset + serviceLen).toString();
+            offset += serviceLen;
+
+            if (tokenService !== service) return null;
+
+            const permsLen = tokenData.readUInt16LE(offset);
+            offset += 2;
+            const permissions = JSON.parse(tokenData.slice(offset, offset + permsLen).toString());
+            offset += permsLen;
+
+            const expiresAt = Number(tokenData.readBigUInt64LE(offset));
+
+            const session = new Session(userId, permissions, expiresAt);
+            if (session.isExpired) return null;
+
+            return session;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    /**
+     * Refresh session token.
+     * @param {string} token - Current token
+     * @returns {string|null}
+     */
+    refreshToken(token) {
+        const session = this.validateToken(token);
+        if (!session) return null;
+        return this._createToken(session.userId, session.permissions, this._tokenTtl);
+    }
+
+    /**
+     * Get user identity.
+     * @param {string} userId - User ID
+     * @returns {Identity|null}
+     */
+    getIdentity(userId) {
+        const user = this._users.get(userId);
+        return user ? user.identity : null;
+    }
+
+    /**
+     * Revoke user.
+     * @param {string} userId - User ID
+     */
+    revokeUser(userId) {
+        this._users.delete(userId);
+    }
+}
+
+/**
+ * Secure session with automatic key rotation.
+ */
+class SecureSession {
+    /**
+     * Initialize secure session.
+     * @param {Buffer} masterKey - Master key
+     * @param {number} rotationInterval - Key rotation interval in seconds
+     * @param {number} maxOldKeys - Number of old keys to keep
+     */
+    constructor(masterKey, rotationInterval = 3600, maxOldKeys = 3) {
+        this._masterKey = masterKey;
+        this._rotationInterval = rotationInterval;
+        this._maxOldKeys = maxOldKeys;
+        this._keyVersion = 1;
+        this._keys = new Map([[1, this._deriveKey(1)]]);
+        this._lastRotation = Date.now();
+    }
+
+    _deriveKey(version) {
+        return crypto.createHash('sha256')
+            .update(Buffer.concat([
+                this._masterKey,
+                Buffer.from(`session:${version}`)
+            ]))
+            .digest();
+    }
+
+    _maybeRotate() {
+        const elapsed = (Date.now() - this._lastRotation) / 1000;
+        if (elapsed >= this._rotationInterval) {
+            this._keyVersion++;
+            this._keys.set(this._keyVersion, this._deriveKey(this._keyVersion));
+            this._lastRotation = Date.now();
+
+            // Prune old keys
+            const versions = Array.from(this._keys.keys()).sort((a, b) => b - a);
+            for (const v of versions.slice(this._maxOldKeys + 1)) {
+                this._keys.delete(v);
+            }
+        }
+    }
+
+    /**
+     * Encrypt session data.
+     * @param {Buffer} data - Data to encrypt
+     * @returns {Buffer}
+     */
+    encrypt(data) {
+        this._maybeRotate();
+
+        const key = this._keys.get(this._keyVersion);
+        const nonce = crypto.randomBytes(16);
+
+        const keystream = generateKeystream(key, nonce, data.length);
+        const ciphertext = Buffer.alloc(data.length);
+        for (let i = 0; i < data.length; i++) {
+            ciphertext[i] = data[i] ^ keystream[i];
+        }
+
+        const versionBuf = Buffer.alloc(4);
+        versionBuf.writeUInt32LE(this._keyVersion);
+
+        const mac = crypto.createHmac('sha256', key)
+            .update(Buffer.concat([versionBuf, nonce, ciphertext]))
+            .digest()
+            .slice(0, 16);
+
+        return Buffer.concat([versionBuf, nonce, ciphertext, mac]);
+    }
+
+    /**
+     * Decrypt session data.
+     * @param {Buffer} encrypted - Encrypted data
+     * @returns {Buffer|null}
+     */
+    decrypt(encrypted) {
+        this._maybeRotate();
+
+        if (encrypted.length < 36) return null;
+
+        const version = encrypted.readUInt32LE(0);
+        const nonce = encrypted.slice(4, 20);
+        const ciphertext = encrypted.slice(20, -16);
+        const mac = encrypted.slice(-16);
+
+        const key = this._keys.get(version);
+        if (!key) return null;
+
+        // Verify MAC
+        const expectedMac = crypto.createHmac('sha256', key)
+            .update(encrypted.slice(0, -16))
+            .digest()
+            .slice(0, 16);
+
+        if (!crypto.timingSafeEqual(mac, expectedMac)) return null;
+
+        const keystream = generateKeystream(key, nonce, ciphertext.length);
+        const plaintext = Buffer.alloc(ciphertext.length);
+        for (let i = 0; i < ciphertext.length; i++) {
+            plaintext[i] = ciphertext[i] ^ keystream[i];
+        }
+
+        return plaintext;
+    }
+}
+
+module.exports = { IdentityProvider, Identity, Session, SecureSession };
+
+
+
+================================================
+FILE: index.d.ts
+================================================
+/**
+ * Shield - EXPTIME-Secure Encryption Library
+ * TypeScript declarations
+ */
+
+export interface ShieldOptions {
+    salt?: Buffer;
+    iterations?: number;
+}
+
+export interface TOTPOptions {
+    digits?: number;
+    interval?: number;
+    algorithm?: 'sha1' | 'sha256';
+}
+
+/**
+ * Password-based symmetric encryption.
+ */
+export class Shield {
+    constructor(password: string, service: string, options?: ShieldOptions);
+    static withKey(key: Buffer): Shield;
+    encrypt(plaintext: Buffer): Buffer;
+    decrypt(encrypted: Buffer): Buffer | null;
+    readonly key: Buffer;
+}
+
+/**
+ * Streaming encryption for large files.
+ */
+export class StreamCipher {
+    constructor(key: Buffer, chunkSize?: number);
+    static fromPassword(password: string, salt: Buffer, chunkSize?: number): StreamCipher;
+    encrypt(data: Buffer): Buffer;
+    decrypt(encrypted: Buffer): Buffer;
+    encryptFile(inPath: string, outPath: string): void;
+    decryptFile(inPath: string, outPath: string): void;
+}
+
+/**
+ * Ratcheting session for forward secrecy.
+ */
+export class RatchetSession {
+    constructor(rootKey: Buffer, isInitiator: boolean);
+    encrypt(plaintext: Buffer): Buffer;
+    decrypt(ciphertext: Buffer): Buffer | null;
+    readonly sendCounter: number;
+    readonly recvCounter: number;
+}
+
+/**
+ * Time-based One-Time Password generator.
+ */
+export class TOTP {
+    constructor(secret: Buffer, options?: TOTPOptions);
+    static generateSecret(length?: number): Buffer;
+    static secretToBase32(secret: Buffer): string;
+    static secretFromBase32(b32: string): Buffer;
+    generate(timestamp?: number): string;
+    verify(code: string, timestamp?: number, window?: number): boolean;
+    provisioningUri(account: string, issuer?: string): string;
+}
+
+/**
+ * Recovery codes for 2FA backup.
+ */
+export class RecoveryCodes {
+    constructor(codes?: string[]);
+    static generateCodes(count?: number, length?: number): string[];
+    verify(code: string): boolean;
+    readonly remaining: number;
+    readonly codes: string[];
+}
+
+/**
+ * One-shot encrypt with pre-shared key.
+ */
+export function quickEncrypt(key: Buffer, data: Buffer): Buffer;
+
+/**
+ * One-shot decrypt with pre-shared key.
+ */
+export function quickDecrypt(key: Buffer, encrypted: Buffer): Buffer | null;
+
+
+
+================================================
+FILE: index.js
+================================================
+/**
+ * Shield - EXPTIME-Secure Encryption Library
+ *
+ * Symmetric cryptography with proven exponential-time security.
+ * Breaking requires 2^256 operations - no shortcut exists.
+ *
+ * @example
+ * const { Shield, quickEncrypt, quickDecrypt } = require('@guard8/shield');
+ *
+ * // Password-based encryption
+ * const s = new Shield('password', 'service.com');
+ * const encrypted = s.encrypt(Buffer.from('secret data'));
+ * const decrypted = s.decrypt(encrypted);
+ *
+ * // Pre-shared key encryption
+ * const key = crypto.randomBytes(32);
+ * const enc = quickEncrypt(key, Buffer.from('data'));
+ * const dec = quickDecrypt(key, enc);
+ */
+
+const { Shield, quickEncrypt, quickDecrypt } = require('./shield');
+const { StreamCipher } = require('./stream');
+const { RatchetSession } = require('./ratchet');
+const { TOTP, RecoveryCodes } = require('./totp');
+const { SymmetricSignature, LamportSignature } = require('./signatures');
+const { PAKEExchange, QRExchange, KeySplitter } = require('./exchange');
+const { KeyRotationManager } = require('./rotation');
+const { GroupEncryption, BroadcastEncryption } = require('./group');
+const { IdentityProvider, Identity, Session, SecureSession } = require('./identity');
+const { ShieldChannel, ChannelConfig, ShieldListener } = require('./channel');
+
+module.exports = {
+    // Core encryption
+    Shield,
+    quickEncrypt,
+    quickDecrypt,
+
+    // Streaming encryption
+    StreamCipher,
+
+    // Forward secrecy
+    RatchetSession,
+
+    // 2FA
+    TOTP,
+    RecoveryCodes,
+
+    // Digital signatures
+    SymmetricSignature,
+    LamportSignature,
+
+    // Key exchange
+    PAKEExchange,
+    QRExchange,
+    KeySplitter,
+
+    // Key rotation
+    KeyRotationManager,
+
+    // Group encryption
+    GroupEncryption,
+    BroadcastEncryption,
+
+    // Identity/SSO
+    IdentityProvider,
+    Identity,
+    Session,
+    SecureSession,
+
+    // Secure channel
+    ShieldChannel,
+    ChannelConfig,
+    ShieldListener
+};
+
+
+
+================================================
+FILE: ratchet.js
+================================================
+/**
+ * Shield Ratchet - Forward secrecy through key ratcheting.
+ *
+ * Each message uses a new key derived from previous.
+ * Compromise of current key doesn't reveal past messages.
+ *
+ * Based on Signal's Double Ratchet (simplified symmetric version).
+ */
+
+const crypto = require('crypto');
+
+/**
+ * Generate keystream using SHA256.
+ */
+function generateKeystream(key, nonce, length) {
+    let keystream = Buffer.alloc(0);
+    for (let i = 0; i < Math.ceil(length / 32); i++) {
+        const counter = Buffer.alloc(4);
+        counter.writeUInt32LE(i);
+        const block = crypto.createHash('sha256')
+            .update(Buffer.concat([key, nonce, counter]))
+            .digest();
+        keystream = Buffer.concat([keystream, block]);
+    }
+    return keystream.slice(0, length);
+}
+
+/**
+ * Ratcheting session for forward secrecy.
+ */
+class RatchetSession {
+    /**
+     * Create a new ratchet session from shared root key.
+     *
+     * @param {Buffer} rootKey - 32-byte shared secret from key exchange
+     * @param {boolean} isInitiator - True if this party initiated the session
+     */
+    constructor(rootKey, isInitiator) {
+        const sendLabel = isInitiator ? Buffer.from('send') : Buffer.from('recv');
+        const recvLabel = isInitiator ? Buffer.from('recv') : Buffer.from('send');
+
+        this._sendChain = this._deriveChainKey(rootKey, sendLabel);
+        this._recvChain = this._deriveChainKey(rootKey, recvLabel);
+        this._sendCounter = 0;
+        this._recvCounter = 0;
+    }
+
+    _deriveChainKey(root, label) {
+        return crypto.createHash('sha256')
+            .update(Buffer.concat([root, label]))
+            .digest();
+    }
+
+    _ratchetChain(chainKey) {
+        const newChain = crypto.createHash('sha256')
+            .update(Buffer.concat([chainKey, Buffer.from('chain')]))
+            .digest();
+        const msgKey = crypto.createHash('sha256')
+            .update(Buffer.concat([chainKey, Buffer.from('message')]))
+            .digest();
+        return [newChain, msgKey];
+    }
+
+    /**
+     * Encrypt a message with forward secrecy.
+     *
+     * @param {Buffer} plaintext - Message to encrypt
+     * @returns {Buffer} Encrypted message
+     */
+    encrypt(plaintext) {
+        // Ratchet send chain
+        const [newChain, msgKey] = this._ratchetChain(this._sendChain);
+        this._sendChain = newChain;
+
+        const counter = this._sendCounter;
+        this._sendCounter++;
+
+        return this._encryptWithKey(msgKey, plaintext, counter);
+    }
+
+    /**
+     * Decrypt a message with forward secrecy.
+     *
+     * @param {Buffer} ciphertext - Encrypted message
+     * @returns {Buffer|null} Decrypted message, or null if failed
+     */
+    decrypt(ciphertext) {
+        // Ratchet receive chain
+        const [newChain, msgKey] = this._ratchetChain(this._recvChain);
+        this._recvChain = newChain;
+
+        const result = this._decryptWithKey(msgKey, ciphertext);
+        if (result === null) {
+            return null;
+        }
+
+        const [plaintext, counter] = result;
+
+        // Verify counter (replay protection)
+        if (counter !== this._recvCounter) {
+            return null;
+        }
+
+        this._recvCounter++;
+        return plaintext;
+    }
+
+    _encryptWithKey(key, plaintext, counter) {
+        const nonce = crypto.randomBytes(16);
+        const counterBytes = Buffer.alloc(8);
+        counterBytes.writeBigUInt64LE(BigInt(counter));
+
+        // Data: counter || plaintext
+        const data = Buffer.concat([counterBytes, plaintext]);
+
+        // Generate keystream
+        const keystream = generateKeystream(key, nonce, data.length);
+
+        // XOR encrypt
+        const ciphertext = Buffer.alloc(data.length);
+        for (let i = 0; i < data.length; i++) {
+            ciphertext[i] = data[i] ^ keystream[i];
+        }
+
+        // HMAC authenticate
+        const mac = crypto.createHmac('sha256', key)
+            .update(Buffer.concat([nonce, ciphertext]))
+            .digest()
+            .slice(0, 16);
+
+        return Buffer.concat([nonce, ciphertext, mac]);
+    }
+
+    _decryptWithKey(key, encrypted) {
+        if (encrypted.length < 40) { // 16 nonce + 8 counter + 16 mac
+            return null;
+        }
+
+        const nonce = encrypted.slice(0, 16);
+        const ciphertext = encrypted.slice(16, -16);
+        const mac = encrypted.slice(-16);
+
+        // Verify MAC
+        const expectedMac = crypto.createHmac('sha256', key)
+            .update(Buffer.concat([nonce, ciphertext]))
+            .digest()
+            .slice(0, 16);
+
+        if (!crypto.timingSafeEqual(mac, expectedMac)) {
+            return null;
+        }
+
+        // Decrypt
+        const keystream = generateKeystream(key, nonce, ciphertext.length);
+        const decrypted = Buffer.alloc(ciphertext.length);
+        for (let i = 0; i < ciphertext.length; i++) {
+            decrypted[i] = ciphertext[i] ^ keystream[i];
+        }
+
+        // Parse counter
+        const counter = Number(decrypted.readBigUInt64LE(0));
+
+        return [decrypted.slice(8), counter];
+    }
+
+    /**
+     * Get current send counter.
+     * @returns {number}
+     */
+    get sendCounter() {
+        return this._sendCounter;
+    }
+
+    /**
+     * Get current receive counter.
+     * @returns {number}
+     */
+    get recvCounter() {
+        return this._recvCounter;
+    }
+}
+
+module.exports = { RatchetSession };
+
+
+
+================================================
+FILE: rotation.js
+================================================
+/**
+ * Shield Key Rotation - Version-based key management.
+ */
+
+const crypto = require('crypto');
+
+/**
+ * Generate keystream using SHA256.
+ */
+function generateKeystream(key, nonce, length) {
+    let keystream = Buffer.alloc(0);
+    for (let i = 0; i < Math.ceil(length / 32); i++) {
+        const counter = Buffer.alloc(4);
+        counter.writeUInt32LE(i);
+        const block = crypto.createHash('sha256')
+            .update(Buffer.concat([key, nonce, counter]))
+            .digest();
+        keystream = Buffer.concat([keystream, block]);
+    }
+    return keystream.slice(0, length);
+}
+
+/**
+ * Manages multiple key versions for seamless rotation.
+ */
+class KeyRotationManager {
+    /**
+     * Initialize with current key.
+     * @param {Buffer} key - 32-byte encryption key
+     * @param {number} version - Key version number
+     */
+    constructor(key, version = 1) {
+        this._keys = new Map([[version, key]]);
+        this._currentVersion = version;
+    }
+
+    /**
+     * Get current key version.
+     * @returns {number}
+     */
+    get currentVersion() {
+        return this._currentVersion;
+    }
+
+    /**
+     * Get all available versions.
+     * @returns {number[]}
+     */
+    get versions() {
+        return Array.from(this._keys.keys()).sort((a, b) => a - b);
+    }
+
+    /**
+     * Add historical key.
+     * @param {Buffer} key - 32-byte key
+     * @param {number} version - Version number
+     */
+    addKey(key, version) {
+        if (this._keys.has(version)) {
+            throw new Error(`Version ${version} already exists`);
+        }
+        this._keys.set(version, key);
+    }
+
+    /**
+     * Rotate to new key.
+     * @param {Buffer} newKey - New 32-byte key
+     * @param {number} newVersion - Version number
+     * @returns {number} New version
+     */
+    rotate(newKey, newVersion = null) {
+        if (newVersion === null) {
+            newVersion = this._currentVersion + 1;
+        }
+        if (newVersion <= this._currentVersion) {
+            throw new Error('New version must be greater than current');
+        }
+        this._keys.set(newVersion, newKey);
+        this._currentVersion = newVersion;
+        return newVersion;
+    }
+
+    /**
+     * Encrypt with current key.
+     * @param {Buffer} plaintext - Data to encrypt
+     * @returns {Buffer} Versioned ciphertext
+     */
+    encrypt(plaintext) {
+        const key = this._keys.get(this._currentVersion);
+        const nonce = crypto.randomBytes(16);
+
+        const keystream = generateKeystream(key, nonce, plaintext.length);
+        const ciphertext = Buffer.alloc(plaintext.length);
+        for (let i = 0; i < plaintext.length; i++) {
+            ciphertext[i] = plaintext[i] ^ keystream[i];
+        }
+
+        const versionBytes = Buffer.alloc(4);
+        versionBytes.writeUInt32LE(this._currentVersion);
+
+        const mac = crypto.createHmac('sha256', key)
+            .update(Buffer.concat([versionBytes, nonce, ciphertext]))
+            .digest()
+            .slice(0, 16);
+
+        return Buffer.concat([versionBytes, nonce, ciphertext, mac]);
+    }
+
+    /**
+     * Decrypt with appropriate key version.
+     * @param {Buffer} encrypted - Versioned ciphertext
+     * @returns {Buffer} Plaintext
+     */
+    decrypt(encrypted) {
+        if (encrypted.length < 36) {
+            throw new Error('Ciphertext too short');
+        }
+
+        const version = encrypted.readUInt32LE(0);
+        const nonce = encrypted.slice(4, 20);
+        const ciphertext = encrypted.slice(20, -16);
+        const mac = encrypted.slice(-16);
+
+        if (!this._keys.has(version)) {
+            throw new Error(`Unknown key version: ${version}`);
+        }
+
+        const key = this._keys.get(version);
+
+        const expectedMac = crypto.createHmac('sha256', key)
+            .update(encrypted.slice(0, -16))
+            .digest()
+            .slice(0, 16);
+
+        if (!crypto.timingSafeEqual(mac, expectedMac)) {
+            throw new Error('Authentication failed');
+        }
+
+        const keystream = generateKeystream(key, nonce, ciphertext.length);
+        const plaintext = Buffer.alloc(ciphertext.length);
+        for (let i = 0; i < ciphertext.length; i++) {
+            plaintext[i] = ciphertext[i] ^ keystream[i];
+        }
+
+        return plaintext;
+    }
+
+    /**
+     * Remove old keys.
+     * @param {number} keepVersions - Number to keep
+     * @returns {number[]} Pruned versions
+     */
+    pruneOldKeys(keepVersions = 2) {
+        if (keepVersions < 1) {
+            throw new Error('Must keep at least 1 version');
+        }
+
+        const versions = this.versions.reverse();
+        const toKeep = new Set(versions.slice(0, keepVersions));
+        toKeep.add(this._currentVersion);
+
+        const pruned = [];
+        for (const v of this._keys.keys()) {
+            if (!toKeep.has(v)) {
+                this._keys.delete(v);
+                pruned.push(v);
+            }
+        }
+
+        return pruned;
+    }
+
+    /**
+     * Re-encrypt with current key.
+     * @param {Buffer} encrypted - Old ciphertext
+     * @returns {Buffer} New ciphertext
+     */
+    reEncrypt(encrypted) {
+        const plaintext = this.decrypt(encrypted);
+        return this.encrypt(plaintext);
+    }
+}
+
+module.exports = { KeyRotationManager };
+
+
+
+================================================
+FILE: shield.js
+================================================
+/**
+ * Shield - EXPTIME-Secure Encryption (Node.js)
+ *
+ * INTEROPERABLE with Python shield package.
+ * Uses SHA256-based stream cipher with HMAC authentication.
+ * Breaking requires 2^256 operations - no shortcut exists.
+ */
+
+const crypto = require('crypto');
+
+// Constants
+const PBKDF2_ITERATIONS = 100000;
+const NONCE_SIZE = 16;
+const MAC_SIZE = 16;
+const COUNTER_SIZE = 8;
+
+// V2 constants
+const V2_HEADER_SIZE = 17;  // counter(8) + timestamp(8) + pad_len(1)
+const MIN_PADDING = 32;
+const MAX_PADDING = 128;
+
+// Timestamp range for v2 detection (2020-2100 in milliseconds)
+const MIN_TIMESTAMP_MS = 1577836800000;
+const MAX_TIMESTAMP_MS = 4102444800000;
+
+/**
+ * Generate keystream using SHA256 (AES-256-CTR equivalent).
+ */
+function generateKeystream(key, nonce, length) {
+    let keystream = Buffer.alloc(0);
+    const numBlocks = Math.ceil(length / 32);
+
+    for (let i = 0; i < numBlocks; i++) {
+        const counter = Buffer.alloc(4);
+        counter.writeUInt32LE(i);
+        const block = crypto.createHash('sha256')
+            .update(Buffer.concat([key, nonce, counter]))
+            .digest();
+        keystream = Buffer.concat([keystream, block]);
+    }
+
+    return keystream.slice(0, length);
+}
+
+/**
+ * Shield encryption class.
+ *
+ * @example
+ * const shield = new Shield('password', 'github.com');
+ * const encrypted = shield.encrypt(Buffer.from('secret'));
+ * const decrypted = shield.decrypt(encrypted);
+ */
+class Shield {
+    /**
+     * Create Shield instance with password-derived key.
+     *
+     * @param {string} password - User's password
+     * @param {string} service - Service identifier (e.g., 'github.com')
+     * @param {Object} options - Optional settings
+     * @param {Buffer} options.salt - Custom salt (default: SHA256(service))
+     * @param {number} options.iterations - PBKDF2 iterations (default: 100000)
+     * @param {number} options.maxAgeMs - Maximum message age in milliseconds (default: 60000, null = disabled)
+     */
+    constructor(password, service, options = {}) {
+        const salt = options.salt ||
+            crypto.createHash('sha256').update(service).digest();
+        const iterations = options.iterations || PBKDF2_ITERATIONS;
+        const maxAgeMs = options.maxAgeMs !== undefined ? options.maxAgeMs : 60000;
+
+        this._key = crypto.pbkdf2Sync(password, salt, iterations, 32, 'sha256');
+        this._counter = 0;
+        this._maxAgeMs = maxAgeMs;
+    }
+
+    /**
+     * Create Shield instance from raw key (no password derivation).
+     *
+     * @param {Buffer} key - 32-byte symmetric key
+     * @returns {Shield} Shield instance
+     */
+    static withKey(key) {
+        if (key.length !== 32) {
+            throw new Error(`Key must be 32 bytes, got ${key.length}`);
+        }
+        const instance = Object.create(Shield.prototype);
+        instance._key = key;
+        instance._counter = 0;
+        instance._maxAgeMs = 60000;
+        return instance;
+    }
+
+    /**
+     * Create Shield with hardware fingerprinting (device-bound encryption).
+     *
+     * Derives keys from password + hardware identifier, binding encryption to
+     * the physical device. Keys cannot be transferred to other hardware.
+     *
+     * @param {string} password - User's password
+     * @param {string} service - Service identifier
+     * @param {Object} options - Options
+     * @param {string} options.mode - Fingerprint mode ('none', 'motherboard', 'cpu', 'combined')
+     * @returns {Shield} Shield instance with device-bound key
+     * @throws {Error} If hardware fingerprint unavailable
+     *
+     * @example
+     * const shield = Shield.withFingerprint('password', 'github.com', { mode: 'combined' });
+     * const encrypted = shield.encrypt(Buffer.from('secret'));
+     */
+    static withFingerprint(password, service, options = {}) {
+        const { FingerprintMode, collectFingerprint } = require('./fingerprint');
+
+        const mode = options.mode || FingerprintMode.COMBINED;
+        const fingerprint = collectFingerprint(mode);
+
+        const combinedPassword = fingerprint ? `${password}:${fingerprint}` : password;
+
+        return new Shield(combinedPassword, service, options);
+    }
+
+    /**
+     * Encrypt data (v2 format with replay protection and length obfuscation).
+     *
+     * Inner format: counter(8) || timestamp_ms(8) || pad_len(1) || random_padding(32-128) || plaintext
+     *
+     * @param {Buffer} plaintext - Data to encrypt
+     * @returns {Buffer} Ciphertext: nonce(16) || encrypted_data || mac(16)
+     */
+    encrypt(plaintext) {
+        const nonce = crypto.randomBytes(NONCE_SIZE);
+        const counterBytes = Buffer.alloc(COUNTER_SIZE);
+        counterBytes.writeBigUInt64LE(BigInt(this._counter));
+        this._counter++;
+
+        // Timestamp in milliseconds since Unix epoch
+        const timestampMs = Date.now();
+        const timestampBytes = Buffer.alloc(8);
+        timestampBytes.writeBigUInt64LE(BigInt(timestampMs));
+
+        // Random padding: 32-128 bytes
+        const randomByte = crypto.randomBytes(1)[0];
+        const padLen = (randomByte % (MAX_PADDING - MIN_PADDING + 1)) + MIN_PADDING;
+        const padLenByte = Buffer.alloc(1);
+        padLenByte[0] = padLen;
+        const padding = crypto.randomBytes(padLen);
+
+        // Data to encrypt: counter || timestamp || pad_len || padding || plaintext
+        const data = Buffer.concat([counterBytes, timestampBytes, padLenByte, padding, plaintext]);
+
+        // Generate keystream
+        const keystream = generateKeystream(this._key, nonce, data.length);
+
+        // XOR encrypt
+        const ciphertext = Buffer.alloc(data.length);
+        for (let i = 0; i < data.length; i++) {
+            ciphertext[i] = data[i] ^ keystream[i];
+        }
+
+        // HMAC authenticate
+        const mac = crypto.createHmac('sha256', this._key)
+            .update(Buffer.concat([nonce, ciphertext]))
+            .digest()
+            .slice(0, MAC_SIZE);
+
+        return Buffer.concat([nonce, ciphertext, mac]);
+    }
+
+    /**
+     * Decrypt and verify data (auto-detects v1/v2 format).
+     *
+     * @param {Buffer} encrypted - Ciphertext from encrypt()
+     * @returns {Buffer|null} Plaintext, or null if authentication fails or replay detected
+     */
+    decrypt(encrypted) {
+        const minSize = NONCE_SIZE + COUNTER_SIZE + MAC_SIZE;
+        if (encrypted.length < minSize) {
+            return null;
+        }
+
+        const nonce = encrypted.slice(0, NONCE_SIZE);
+        const ciphertext = encrypted.slice(NONCE_SIZE, -MAC_SIZE);
+        const mac = encrypted.slice(-MAC_SIZE);
+
+        // Verify MAC (constant-time)
+        const expectedMac = crypto.createHmac('sha256', this._key)
+            .update(Buffer.concat([nonce, ciphertext]))
+            .digest()
+            .slice(0, MAC_SIZE);
+
+        if (!crypto.timingSafeEqual(mac, expectedMac)) {
+            return null;
+        }
+
+        // Decrypt
+        const keystream = generateKeystream(this._key, nonce, ciphertext.length);
+        const decrypted = Buffer.alloc(ciphertext.length);
+        for (let i = 0; i < ciphertext.length; i++) {
+            decrypted[i] = ciphertext[i] ^ keystream[i];
+        }
+
+        // Auto-detect v2 by timestamp range (2020-2100)
+        if (decrypted.length >= V2_HEADER_SIZE) {
+            const timestampBytes = decrypted.slice(8, 16);
+            const timestampMs = timestampBytes.readBigUInt64LE();
+
+            if (timestampMs >= MIN_TIMESTAMP_MS && timestampMs <= MAX_TIMESTAMP_MS) {
+                // v2 format detected
+                const padLen = decrypted[16];
+
+                // Validate padding length is within protocol bounds (SECURITY: CVE-PENDING)
+                if (padLen < MIN_PADDING || padLen > MAX_PADDING) {
+                    return null;
+                }
+
+                const dataStart = V2_HEADER_SIZE + padLen;
+
+                if (decrypted.length < dataStart) {
+                    return null;
+                }
+
+                // Replay protection
+                if (this._maxAgeMs !== null) {
+                    const nowMs = Date.now();
+                    const age = nowMs - Number(timestampMs);
+
+                    // Reject if too far in future (>5s clock skew) or too old
+                    if (Number(timestampMs) > nowMs + 5000 || age > this._maxAgeMs) {
+                        return null;
+                    }
+                }
+
+                return decrypted.slice(dataStart);
+            }
+        }
+
+        // v1 format: skip counter (8 bytes)
+        return decrypted.slice(COUNTER_SIZE);
+    }
+
+    /**
+     * Decrypt v1 format explicitly (for legacy compatibility).
+     *
+     * @param {Buffer} encrypted - Ciphertext from encrypt()
+     * @returns {Buffer|null} Plaintext, or null if authentication fails
+     */
+    decryptV1(encrypted) {
+        const minSize = NONCE_SIZE + COUNTER_SIZE + MAC_SIZE;
+        if (encrypted.length < minSize) {
+            return null;
+        }
+
+        const nonce = encrypted.slice(0, NONCE_SIZE);
+        const ciphertext = encrypted.slice(NONCE_SIZE, -MAC_SIZE);
+        const mac = encrypted.slice(-MAC_SIZE);
+
+        // Verify MAC (constant-time)
+        const expectedMac = crypto.createHmac('sha256', this._key)
+            .update(Buffer.concat([nonce, ciphertext]))
+            .digest()
+            .slice(0, MAC_SIZE);
+
+        if (!crypto.timingSafeEqual(mac, expectedMac)) {
+            return null;
+        }
+
+        // Decrypt
+        const keystream = generateKeystream(this._key, nonce, ciphertext.length);
+        const decrypted = Buffer.alloc(ciphertext.length);
+        for (let i = 0; i < ciphertext.length; i++) {
+            decrypted[i] = ciphertext[i] ^ keystream[i];
+        }
+
+        // v1 format: skip counter (8 bytes)
+        return decrypted.slice(COUNTER_SIZE);
+    }
+
+    /**
+     * Get the derived key (for testing/debugging).
+     * @returns {Buffer} The 32-byte key
+     */
+    get key() {
+        return this._key;
+    }
+}
+
+/**
+ * One-shot encrypt with pre-shared key (no password derivation).
+ *
+ * @param {Buffer} key - 32-byte symmetric key
+ * @param {Buffer} data - Data to encrypt
+ * @returns {Buffer} Ciphertext
+ */
+function quickEncrypt(key, data) {
+    const nonce = crypto.randomBytes(NONCE_SIZE);
+    const keystream = generateKeystream(key, nonce, data.length);
+
+    const ciphertext = Buffer.alloc(data.length);
+    for (let i = 0; i < data.length; i++) {
+        ciphertext[i] = data[i] ^ keystream[i];
+    }
+
+    const mac = crypto.createHmac('sha256', key)
+        .update(Buffer.concat([nonce, ciphertext]))
+        .digest()
+        .slice(0, MAC_SIZE);
+
+    return Buffer.concat([nonce, ciphertext, mac]);
+}
+
+/**
+ * One-shot decrypt with pre-shared key.
+ *
+ * @param {Buffer} key - 32-byte symmetric key
+ * @param {Buffer} encrypted - Ciphertext from quickEncrypt()
+ * @returns {Buffer|null} Plaintext, or null if authentication fails
+ */
+function quickDecrypt(key, encrypted) {
+    if (encrypted.length < NONCE_SIZE + MAC_SIZE) {
+        return null;
+    }
+
+    const nonce = encrypted.slice(0, NONCE_SIZE);
+    const ciphertext = encrypted.slice(NONCE_SIZE, -MAC_SIZE);
+    const mac = encrypted.slice(-MAC_SIZE);
+
+    const expectedMac = crypto.createHmac('sha256', key)
+        .update(Buffer.concat([nonce, ciphertext]))
+        .digest()
+        .slice(0, MAC_SIZE);
+
+    if (!crypto.timingSafeEqual(mac, expectedMac)) {
+        return null;
+    }
+
+    const keystream = generateKeystream(key, nonce, ciphertext.length);
+    const decrypted = Buffer.alloc(ciphertext.length);
+    for (let i = 0; i < ciphertext.length; i++) {
+        decrypted[i] = ciphertext[i] ^ keystream[i];
+    }
+
+    return decrypted;
+}
+
+module.exports = {
+    Shield,
+    quickEncrypt,
+    quickDecrypt,
+    generateKeystream
+};
+
+
+
+================================================
+FILE: signatures.js
+================================================
+/**
+ * Shield Signatures - Digital signatures without public-key crypto.
+ *
+ * Two signature types:
+ * 1. SymmetricSignature: HMAC-based, requires shared verification key
+ * 2. LamportSignature: One-time hash-chain signatures (post-quantum)
+ */
+
+const crypto = require('crypto');
+
+/**
+ * HMAC-based digital signatures.
+ */
+class SymmetricSignature {
+    /**
+     * Initialize with signing key.
+     * @param {Buffer} signingKey - 32-byte secret signing key
+     */
+    constructor(signingKey) {
+        this.signingKey = signingKey;
+        this.verificationKey = crypto.createHash('sha256')
+            .update(Buffer.concat([Buffer.from('verify:'), signingKey]))
+            .digest();
+    }
+
+    /**
+     * Generate new signing identity.
+     * @returns {SymmetricSignature}
+     */
+    static generate() {
+        return new SymmetricSignature(crypto.randomBytes(32));
+    }
+
+    /**
+     * Derive signing key from password and identity.
+     * @param {string} password - User's password
+     * @param {string} identity - Identity string
+     * @returns {SymmetricSignature}
+     */
+    static fromPassword(password, identity) {
+        const salt = crypto.createHash('sha256')
+            .update(`sign:${identity}`)
+            .digest();
+        const key = crypto.pbkdf2Sync(password, salt, 100000, 32, 'sha256');
+        return new SymmetricSignature(key);
+    }
+
+    /**
+     * Sign a message.
+     * @param {Buffer} message - Message to sign
+     * @param {boolean} includeTimestamp - Include timestamp for replay protection
+     * @returns {Buffer} Signature bytes
+     */
+    sign(message, includeTimestamp = true) {
+        if (includeTimestamp) {
+            const timestamp = Buffer.alloc(8);
+            timestamp.writeBigUInt64LE(BigInt(Math.floor(Date.now() / 1000)));
+            const sigData = Buffer.concat([timestamp, message]);
+            const signature = crypto.createHmac('sha256', this.signingKey)
+                .update(sigData)
+                .digest();
+            return Buffer.concat([timestamp, signature]);
+        } else {
+            return crypto.createHmac('sha256', this.signingKey)
+                .update(message)
+                .digest();
+        }
+    }
+
+    /**
+     * Verify a signature.
+     * @param {Buffer} message - Original message
+     * @param {Buffer} signature - Signature from sign()
+     * @param {Buffer} verificationKey - Signer's verification key
+     * @param {number} maxAge - Maximum signature age in seconds (0 = no check)
+     * @returns {boolean}
+     */
+    verify(message, signature, verificationKey, maxAge = 300) {
+        if (!crypto.timingSafeEqual(verificationKey, this.verificationKey)) {
+            return false;
+        }
+
+        if (signature.length === 40) {
+            const timestamp = Number(signature.readBigUInt64LE(0));
+            const sig = signature.slice(8);
+
+            if (maxAge > 0) {
+                const now = Math.floor(Date.now() / 1000);
+                if (Math.abs(now - timestamp) > maxAge) {
+                    return false;
+                }
+            }
+
+            const sigData = Buffer.concat([signature.slice(0, 8), message]);
+            const expected = crypto.createHmac('sha256', this.signingKey)
+                .update(sigData)
+                .digest();
+            return crypto.timingSafeEqual(sig, expected);
+        } else {
+            const expected = crypto.createHmac('sha256', this.signingKey)
+                .update(message)
+                .digest();
+            return crypto.timingSafeEqual(signature, expected);
+        }
+    }
+
+    /**
+     * Get key fingerprint.
+     * @returns {string}
+     */
+    getFingerprint() {
+        return crypto.createHash('sha256')
+            .update(this.verificationKey)
+            .digest('hex')
+            .slice(0, 16);
+    }
+}
+
+/**
+ * Lamport one-time signatures (post-quantum secure).
+ */
+class LamportSignature {
+    static BITS = 256;
+
+    /**
+     * Initialize with private key or generate new.
+     * @param {Array|null} privateKey - List of [chain0, chain1] pairs
+     */
+    constructor(privateKey = null) {
+        if (privateKey === null) {
+            privateKey = this._generatePrivateKey();
+        }
+        this._privateKey = privateKey;
+        this._used = false;
+        this.publicKey = this._computePublicKey();
+    }
+
+    /**
+     * Generate new Lamport key pair.
+     * @returns {LamportSignature}
+     */
+    static generate() {
+        return new LamportSignature();
+    }
+
+    _generatePrivateKey() {
+        const keys = [];
+        for (let i = 0; i < LamportSignature.BITS; i++) {
+            keys.push([crypto.randomBytes(32), crypto.randomBytes(32)]);
+        }
+        return keys;
+    }
+
+    _hash(data) {
+        return crypto.createHash('sha256').update(data).digest();
+    }
+
+    _computePublicKey() {
+        const parts = [];
+        for (const [chain0, chain1] of this._privateKey) {
+            parts.push(this._hash(chain0));
+            parts.push(this._hash(chain1));
+        }
+        return Buffer.concat(parts);
+    }
+
+    /**
+     * Sign a message (ONE TIME ONLY).
+     * @param {Buffer} message - Message to sign
+     * @returns {Buffer} Signature bytes
+     */
+    sign(message) {
+        if (this._used) {
+            throw new Error('Lamport key already used - generate new key pair');
+        }
+        this._used = true;
+
+        const msgHash = crypto.createHash('sha256').update(message).digest();
+        const signatureParts = [];
+
+        for (let i = 0; i < LamportSignature.BITS; i++) {
+            const byteIdx = Math.floor(i / 8);
+            const bitIdx = i % 8;
+            const bit = (msgHash[byteIdx] >> bitIdx) & 1;
+
+            const [chain0, chain1] = this._privateKey[i];
+            signatureParts.push(bit ? chain1 : chain0);
+        }
+
+        return Buffer.concat(signatureParts);
+    }
+
+    /**
+     * Verify a Lamport signature.
+     * @param {Buffer} message - Original message
+     * @param {Buffer} signature - Signature from sign()
+     * @param {Buffer} publicKey - Signer's public key
+     * @returns {boolean}
+     */
+    static verify(message, signature, publicKey) {
+        if (signature.length !== 256 * 32) return false;
+        if (publicKey.length !== 256 * 64) return false;
+
+        const msgHash = crypto.createHash('sha256').update(message).digest();
+
+        for (let i = 0; i < 256; i++) {
+            const byteIdx = Math.floor(i / 8);
+            const bitIdx = i % 8;
+            const bit = (msgHash[byteIdx] >> bitIdx) & 1;
+
+            const revealed = signature.slice(i * 32, (i + 1) * 32);
+            const hashed = crypto.createHash('sha256').update(revealed).digest();
+
+            let expected;
+            if (bit) {
+                expected = publicKey.slice(i * 64 + 32, i * 64 + 64);
+            } else {
+                expected = publicKey.slice(i * 64, i * 64 + 32);
+            }
+
+            if (!hashed.equals(expected)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Check if key has been used.
+     * @returns {boolean}
+     */
+    get isUsed() {
+        return this._used;
+    }
+
+    /**
+     * Get public key fingerprint.
+     * @returns {string}
+     */
+    getFingerprint() {
+        return crypto.createHash('sha256')
+            .update(this.publicKey)
+            .digest('hex')
+            .slice(0, 16);
+    }
+}
+
+module.exports = { SymmetricSignature, LamportSignature };
+
+
+
+================================================
+FILE: stream.js
+================================================
+/**
+ * Shield Stream - Streaming encryption for large files.
+ *
+ * Processes data in chunks with constant memory usage.
+ * Each chunk is independently authenticated.
+ */
+
+const crypto = require('crypto');
+const fs = require('fs');
+
+const DEFAULT_CHUNK_SIZE = 64 * 1024; // 64KB
+
+/**
+ * Derive key from password using PBKDF2.
+ */
+function deriveKey(password, salt, iterations = 100000) {
+    return crypto.pbkdf2Sync(password, salt, iterations, 32, 'sha256');
+}
+
+/**
+ * Generate keystream using SHA256.
+ */
+function generateKeystream(key, nonce, length) {
+    let keystream = Buffer.alloc(0);
+    for (let i = 0; i < Math.ceil(length / 32); i++) {
+        const counter = Buffer.alloc(4);
+        counter.writeUInt32LE(i);
+        const block = crypto.createHash('sha256')
+            .update(Buffer.concat([key, nonce, counter]))
+            .digest();
+        keystream = Buffer.concat([keystream, block]);
+    }
+    return keystream.slice(0, length);
+}
+
+/**
+ * Encrypt a single block with authentication.
+ */
+function encryptBlock(key, data) {
+    const nonce = crypto.randomBytes(16);
+    const keystream = generateKeystream(key, nonce, data.length);
+
+    const ciphertext = Buffer.alloc(data.length);
+    for (let i = 0; i < data.length; i++) {
+        ciphertext[i] = data[i] ^ keystream[i];
+    }
+
+    const mac = crypto.createHmac('sha256', key)
+        .update(Buffer.concat([nonce, ciphertext]))
+        .digest()
+        .slice(0, 16);
+
+    return Buffer.concat([nonce, ciphertext, mac]);
+}
+
+/**
+ * Decrypt a single block with verification.
+ */
+function decryptBlock(key, encrypted) {
+    if (encrypted.length < 32) {
+        return null;
+    }
+
+    const nonce = encrypted.slice(0, 16);
+    const ciphertext = encrypted.slice(16, -16);
+    const mac = encrypted.slice(-16);
+
+    const expectedMac = crypto.createHmac('sha256', key)
+        .update(Buffer.concat([nonce, ciphertext]))
+        .digest()
+        .slice(0, 16);
+
+    if (!crypto.timingSafeEqual(mac, expectedMac)) {
+        return null;
+    }
+
+    const keystream = generateKeystream(key, nonce, ciphertext.length);
+    const decrypted = Buffer.alloc(ciphertext.length);
+    for (let i = 0; i < ciphertext.length; i++) {
+        decrypted[i] = ciphertext[i] ^ keystream[i];
+    }
+
+    return decrypted;
+}
+
+/**
+ * Streaming encryption for large files.
+ */
+class StreamCipher {
+    /**
+     * Create StreamCipher with encryption key.
+     *
+     * @param {Buffer} key - 32-byte symmetric key
+     * @param {number} chunkSize - Size of each chunk (default: 64KB)
+     */
+    constructor(key, chunkSize = DEFAULT_CHUNK_SIZE) {
+        this.key = key;
+        this.chunkSize = chunkSize;
+    }
+
+    /**
+     * Create StreamCipher from password.
+     *
+     * @param {string} password - User's password
+     * @param {Buffer} salt - Salt for key derivation
+     * @param {number} chunkSize - Size of each chunk
+     * @returns {StreamCipher}
+     */
+    static fromPassword(password, salt, chunkSize = DEFAULT_CHUNK_SIZE) {
+        const key = deriveKey(password, salt);
+        return new StreamCipher(key, chunkSize);
+    }
+
+    /**
+     * Encrypt data in memory.
+     *
+     * @param {Buffer} data - Data to encrypt
+     * @returns {Buffer} Encrypted data
+     */
+    encrypt(data) {
+        const chunks = [];
+
+        // Header: chunk_size(4) || stream_salt(16)
+        const streamSalt = crypto.randomBytes(16);
+        const header = Buffer.alloc(20);
+        header.writeUInt32LE(this.chunkSize);
+        streamSalt.copy(header, 4);
+        chunks.push(header);
+
+        // Encrypt chunks
+        let offset = 0;
+        let chunkNum = 0;
+        while (offset < data.length) {
+            const chunk = data.slice(offset, offset + this.chunkSize);
+            offset += this.chunkSize;
+
+            // Derive per-chunk key
+            const chunkNumBuf = Buffer.alloc(8);
+            chunkNumBuf.writeBigUInt64LE(BigInt(chunkNum));
+            const chunkKey = crypto.createHash('sha256')
+                .update(Buffer.concat([this.key, streamSalt, chunkNumBuf]))
+                .digest();
+
+            const encrypted = encryptBlock(chunkKey, chunk);
+
+            // Prepend length
+            const lenBuf = Buffer.alloc(4);
+            lenBuf.writeUInt32LE(encrypted.length);
+            chunks.push(Buffer.concat([lenBuf, encrypted]));
+
+            chunkNum++;
+        }
+
+        // End marker
+        const endMarker = Buffer.alloc(4);
+        endMarker.writeUInt32LE(0);
+        chunks.push(endMarker);
+
+        return Buffer.concat(chunks);
+    }
+
+    /**
+     * Decrypt data in memory.
+     *
+     * @param {Buffer} encrypted - Encrypted data
+     * @returns {Buffer} Decrypted data
+     * @throws {Error} If authentication fails
+     */
+    decrypt(encrypted) {
+        // Read header
+        const chunkSize = encrypted.readUInt32LE(0);
+        const streamSalt = encrypted.slice(4, 20);
+
+        const chunks = [];
+        let offset = 20;
+        let chunkNum = 0;
+
+        while (offset < encrypted.length) {
+            const encLen = encrypted.readUInt32LE(offset);
+            if (encLen === 0) break; // End marker
+
+            offset += 4;
+            const encChunk = encrypted.slice(offset, offset + encLen);
+            offset += encLen;
+
+            // Derive per-chunk key
+            const chunkNumBuf = Buffer.alloc(8);
+            chunkNumBuf.writeBigUInt64LE(BigInt(chunkNum));
+            const chunkKey = crypto.createHash('sha256')
+                .update(Buffer.concat([this.key, streamSalt, chunkNumBuf]))
+                .digest();
+
+            const decrypted = decryptBlock(chunkKey, encChunk);
+            if (decrypted === null) {
+                throw new Error(`Chunk ${chunkNum} authentication failed`);
+            }
+
+            chunks.push(decrypted);
+            chunkNum++;
+        }
+
+        return Buffer.concat(chunks);
+    }
+
+    /**
+     * Encrypt a file.
+     *
+     * @param {string} inPath - Input file path
+     * @param {string} outPath - Output file path
+     */
+    encryptFile(inPath, outPath) {
+        const data = fs.readFileSync(inPath);
+        const encrypted = this.encrypt(data);
+        fs.writeFileSync(outPath, encrypted);
+    }
+
+    /**
+     * Decrypt a file.
+     *
+     * @param {string} inPath - Input file path
+     * @param {string} outPath - Output file path
+     */
+    decryptFile(inPath, outPath) {
+        const encrypted = fs.readFileSync(inPath);
+        const decrypted = this.decrypt(encrypted);
+        fs.writeFileSync(outPath, decrypted);
+    }
+}
+
+module.exports = {
+    StreamCipher,
+    deriveKey,
+    encryptBlock,
+    decryptBlock
+};
+
+
+
+================================================
+FILE: totp.js
+================================================
+/**
+ * Shield TOTP - Time-based One-Time Passwords (RFC 6238).
+ *
+ * Compatible with Google Authenticator, Authy, Microsoft Authenticator, etc.
+ */
+
+const crypto = require('crypto');
+
+/**
+ * TOTP generator/verifier.
+ */
+class TOTP {
+    /**
+     * Initialize TOTP generator.
+     *
+     * @param {Buffer} secret - Shared secret (typically 20 bytes)
+     * @param {Object} options - Optional settings
+     * @param {number} options.digits - OTP length (6 or 8)
+     * @param {number} options.interval - Time step in seconds
+     * @param {string} options.algorithm - 'sha1' (compatible) or 'sha256'
+     */
+    constructor(secret, options = {}) {
+        this.secret = secret;
+        this.digits = options.digits || 6;
+        this.interval = options.interval || 30;
+        this.algorithm = options.algorithm || 'sha1';
+    }
+
+    /**
+     * Generate random secret for new 2FA setup.
+     *
+     * @param {number} length - Secret length in bytes
+     * @returns {Buffer}
+     */
+    static generateSecret(length = 20) {
+        return crypto.randomBytes(length);
+    }
+
+    /**
+     * Convert secret to base32 for QR codes.
+     *
+     * @param {Buffer} secret - Secret bytes
+     * @returns {string} Base32 encoded string (without padding)
+     */
+    static secretToBase32(secret) {
+        const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+        let bits = '';
+        for (const byte of secret) {
+            bits += byte.toString(2).padStart(8, '0');
+        }
+        let result = '';
+        for (let i = 0; i < bits.length; i += 5) {
+            const chunk = bits.substr(i, 5).padEnd(5, '0');
+            result += alphabet[parseInt(chunk, 2)];
+        }
+        return result;
+    }
+
+    /**
+     * Parse base32 secret from authenticator app.
+     *
+     * @param {string} b32 - Base32 encoded secret
+     * @returns {Buffer} Secret bytes
+     */
+    static secretFromBase32(b32) {
+        const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+        let bits = '';
+        for (const char of b32.toUpperCase().replace(/=/g, '')) {
+            const val = alphabet.indexOf(char);
+            if (val >= 0) bits += val.toString(2).padStart(5, '0');
+        }
+        const bytes = [];
+        for (let i = 0; i + 8 <= bits.length; i += 8) {
+            bytes.push(parseInt(bits.substr(i, 8), 2));
+        }
+        return Buffer.from(bytes);
+    }
+
+    /**
+     * Generate current TOTP code.
+     *
+     * @param {number} timestamp - Unix timestamp (default: current time)
+     * @returns {string} OTP code
+     */
+    generate(timestamp = null) {
+        if (timestamp === null) {
+            timestamp = Math.floor(Date.now() / 1000);
+        }
+        const counter = Math.floor(timestamp / this.interval);
+        return this._hotp(counter);
+    }
+
+    /**
+     * Verify TOTP code with time window.
+     *
+     * @param {string} code - User-provided code
+     * @param {number} timestamp - Time to verify against
+     * @param {number} window - Number of intervals to check before/after
+     * @returns {boolean}
+     */
+    verify(code, timestamp = null, window = 1) {
+        if (timestamp === null) {
+            timestamp = Math.floor(Date.now() / 1000);
+        }
+        const counter = Math.floor(timestamp / this.interval);
+
+        for (let offset = -window; offset <= window; offset++) {
+            const expected = this._hotp(counter + offset);
+            if (crypto.timingSafeEqual(
+                Buffer.from(code),
+                Buffer.from(expected)
+            )) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    _hotp(counter) {
+        // Counter as 8-byte big-endian
+        const counterBytes = Buffer.alloc(8);
+        counterBytes.writeBigUInt64BE(BigInt(counter));
+
+        // HMAC
+        const h = crypto.createHmac(this.algorithm, this.secret)
+            .update(counterBytes)
+            .digest();
+
+        // Dynamic truncation
+        const offset = h[h.length - 1] & 0x0F;
+        const code = (h.readUInt32BE(offset) & 0x7FFFFFFF) %
+            Math.pow(10, this.digits);
+
+        return code.toString().padStart(this.digits, '0');
+    }
+
+    /**
+     * Generate URI for QR code.
+     *
+     * @param {string} account - User account identifier
+     * @param {string} issuer - Service name
+     * @returns {string} otpauth:// URI
+     */
+    provisioningUri(account, issuer = 'Shield') {
+        const secret = TOTP.secretToBase32(this.secret);
+        return `otpauth://totp/${issuer}:${account}` +
+            `?secret=${secret}&issuer=${issuer}` +
+            `&algorithm=${this.algorithm.toUpperCase()}&digits=${this.digits}`;
+    }
+}
+
+/**
+ * Recovery codes for 2FA backup.
+ */
+class RecoveryCodes {
+    /**
+     * Initialize with existing codes or generate new ones.
+     *
+     * @param {string[]} codes - List of existing codes
+     */
+    constructor(codes = null) {
+        if (codes === null) {
+            codes = RecoveryCodes.generateCodes();
+        }
+        this._codes = new Set(codes);
+        this._used = new Set();
+    }
+
+    /**
+     * Generate recovery codes.
+     *
+     * @param {number} count - Number of codes
+     * @param {number} length - Length of each code
+     * @returns {string[]}
+     */
+    static generateCodes(count = 10, length = 8) {
+        const codes = [];
+        for (let i = 0; i < count; i++) {
+            const code = crypto.randomBytes(length / 2).toString('hex').toUpperCase();
+            codes.push(`${code.slice(0, 4)}-${code.slice(4)}`);
+        }
+        return codes;
+    }
+
+    /**
+     * Verify and consume a recovery code.
+     *
+     * @param {string} code - Recovery code to verify
+     * @returns {boolean}
+     */
+    verify(code) {
+        // Normalize format
+        let normalized = code.toUpperCase().replace(/-/g, '').replace(/ /g, '');
+        if (normalized.length === 8) {
+            normalized = `${normalized.slice(0, 4)}-${normalized.slice(4)}`;
+        }
+
+        if (this._codes.has(normalized) && !this._used.has(normalized)) {
+            this._used.add(normalized);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Number of unused recovery codes.
+     * @returns {number}
+     */
+    get remaining() {
+        return this._codes.size - this._used.size;
+    }
+
+    /**
+     * Get all recovery codes.
+     * @returns {string[]}
+     */
+    get codes() {
+        return Array.from(this._codes).sort();
+    }
+}
+
+module.exports = { TOTP, RecoveryCodes };
+
+
