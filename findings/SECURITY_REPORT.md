@@ -2,9 +2,9 @@
 
 **Status**: IN-PROGRESS
 **Assessment Start**: 2026-03-01
-**Last Updated**: 2026-03-02T13:00:00+03:00
-**Tasks Completed**: 34/66
-**Findings**: 233 total (0 CRITICAL, 26 HIGH, 108 MEDIUM, 65 LOW, 34 INFO)
+**Last Updated**: 2026-03-02T18:00:00+03:00
+**Tasks Completed**: 36/66
+**Findings**: 256 total (0 CRITICAL, 28 HIGH, 120 MEDIUM, 73 LOW, 35 INFO)
 
 **Project**: Shield — 12-language symmetric encryption library
 **Crypto Stack**: PBKDF2-SHA256 (100k iterations) → SHA256-CTR → HMAC-SHA256 (128-bit truncated)
@@ -23,11 +23,11 @@
 | Category | Count |
 |----------|-------|
 | CRITICAL findings | 0 |
-| HIGH findings | 26 |
-| MEDIUM findings | 108 |
-| LOW findings | 65 |
-| INFO findings | 34 |
-| **Total** | **233** |
+| HIGH findings | 28 |
+| MEDIUM findings | 120 |
+| LOW findings | 73 |
+| INFO findings | 35 |
+| **Total** | **256** |
 
 ---
 
@@ -474,7 +474,25 @@ See `findings/agents/A05-docker-container.md` for full details.
 | SHIELD-A09-029 | SDK Exports WasmClient + Fetch Hook Utilities | LOW | CWE-200 | `index.ts:243-247` |
 
 ### A10 — CI/CD & Supply Chain
-*Phase 2 — Pending*
+**15 findings** (2 HIGH, 8 MEDIUM, 4 LOW, 1 INFO) — Audit Checklist: 3/11 PASS
+
+| Finding ID | Title | Severity | CWE | Location |
+|-----------|-------|----------|-----|----------|
+| SHIELD-A10-001 | All GH Actions Pinned by Tag/Branch — Not SHA | HIGH | CWE-829 | `.github/workflows/*.yml` (50+ refs) |
+| SHIELD-A10-002 | TruffleHog Pinned to @main Branch | HIGH | CWE-829 | `ci.yml:364` |
+| SHIELD-A10-003 | No Dependency Scanning for Python/JS/Go/Java | MEDIUM | CWE-1104 | `ci.yml` (absence) |
+| SHIELD-A10-004 | Release Binaries Not Signed — No Provenance | MEDIUM | CWE-494 | `release.yml:80-240` |
+| SHIELD-A10-005 | No SBOM Generated in Pipeline | MEDIUM | CWE-1104 | `ci.yml`, `release.yml` (absence) |
+| SHIELD-A10-006 | `cargo publish --allow-dirty` | MEDIUM | CWE-494 | `release.yml:256` |
+| SHIELD-A10-007 | All 3 Publish Steps `continue-on-error: true` | MEDIUM | CWE-390 | `release.yml:257,283,306` |
+| SHIELD-A10-008 | Unpinned `cargo install` in CI (3 tools) | MEDIUM | CWE-829 | `ci.yml:343,360,383` |
+| SHIELD-A10-009 | Release Workflow `contents: write` Global | MEDIUM | CWE-250 | `release.yml:17` |
+| SHIELD-A10-010 | `workflow_dispatch` Unvalidated Version Input | MEDIUM | CWE-20 | `release.yml:8-11` |
+| SHIELD-A10-011 | Duplicate npm Publish Workflows — Inconsistent | LOW | CWE-1188 | `release.yml:286-306`, `npm-publish.yml:1-35` |
+| SHIELD-A10-012 | Python CI `pip install -e` — Not Reproducible | LOW | CWE-1104 | `ci.yml:71` |
+| SHIELD-A10-013 | Browser SDK `npm install` vs `npm ci` | LOW | CWE-1104 | `ci.yml:114` |
+| SHIELD-A10-014 | No Signing for crates.io/PyPI Packages | LOW | CWE-494 | `release.yml:253-282` |
+| SHIELD-A10-015 | Security Disclosure Process Correct | INFO | N/A | `.github/ISSUE_TEMPLATE/security_vulnerability.md` |
 
 ### A11 — Error Disclosure
 *Phase 2 — Pending*
@@ -641,6 +659,21 @@ See `findings/agents/A05-docker-container.md` for full details.
 | SHIELD-A06-024 | VULN | MEDIUM | A06 | browser.py:103-111 — HMAC(master, session_id), no domain separation label |
 | SHIELD-A06-025 | VULN | MEDIUM | A06 | browser.py:71-101 — no session_id validation, empty/long/negative ttl accepted |
 | SHIELD-A06-026 | VULN | MEDIUM | A06 | fastapi.py:100-106 — same startswith() as A06-013/014, systemic pattern |
+| SHIELD-A10-001 | VERIFIED | HIGH | A10 | All 50+ action refs across 3 workflows — zero SHA pins |
+| SHIELD-A10-002 | VERIFIED | HIGH | A10 | ci.yml:364 — trufflehog@main mutable branch, diff-only scan |
+| SHIELD-A10-003 | VERIFIED | MEDIUM | A10 | ci.yml — only cargo audit, no pip/npm/go/java scanning |
+| SHIELD-A10-004 | VERIFIED | MEDIUM | A10 | release.yml — no signing, checksums generated but not published |
+| SHIELD-A10-005 | VERIFIED | MEDIUM | A10 | All workflows — no SBOM generation |
+| SHIELD-A10-006 | VERIFIED | MEDIUM | A10 | release.yml:256 — cargo publish --allow-dirty |
+| SHIELD-A10-007 | VERIFIED | MEDIUM | A10 | release.yml:257,283,306 — all publishes continue-on-error |
+| SHIELD-A10-008 | VERIFIED | MEDIUM | A10 | ci.yml:343,360,383 — unpinned cargo install |
+| SHIELD-A10-009 | VERIFIED | MEDIUM | A10 | release.yml:17 — contents:write global, not per-job |
+| SHIELD-A10-010 | VERIFIED | MEDIUM | A10 | release.yml:8-11 — no version format validation |
+| SHIELD-A10-011 | VERIFIED | LOW | A10 | release.yml + npm-publish.yml — duplicate, inconsistent npm publish |
+| SHIELD-A10-012 | VERIFIED | LOW | A10 | ci.yml:71 — pip install -e, no lock file |
+| SHIELD-A10-013 | VERIFIED | LOW | A10 | ci.yml:114 — npm install vs npm ci inconsistency |
+| SHIELD-A10-014 | VERIFIED | LOW | A10 | release.yml:253-282 — no signing for Rust/Python packages |
+| SHIELD-A10-015 | NON-VULN | INFO | A10 | Security disclosure template correctly configured |
 
 **Tag Legend**:
 - `VULN` — Confirmed vulnerability with reproduction steps
@@ -730,9 +763,9 @@ See `findings/agents/A05-docker-container.md` for full details.
 |-------|--------|-------|----------|-----------|
 | 0 — Setup | COMPLETE | 3/3 | 0 | 2026-03-01T03:03:00+03:00 |
 | 1 — Crypto Core | **COMPLETE** | **14/14** | **70** | 2026-03-01T19:00:00+03:00 |
-| 2 — Protocol/App/Infra | IN-PROGRESS | 2/26 | 20 | |
+| 2 — Protocol/App/Infra | IN-PROGRESS | 19/26 | 186 | |
 | 3 — Platform/HW | PENDING | 0/12 | 0 | |
 | 4 — Cross-Domain 1 | PENDING | 0/5 | 0 | |
 | 5 — Cross-Domain 2 | PENDING | 0/3 | 0 | |
 | 6 — Final | PENDING | 0/3 | 0 | |
-| **Total** | **IN-PROGRESS** | **19/66** | **90** | |
+| **Total** | **IN-PROGRESS** | **36/66** | **256** | |
