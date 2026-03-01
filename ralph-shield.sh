@@ -29,6 +29,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Ensure clean personal Claude environment (mirrors claude-gm from .zshrc)
+unset CLAUDE_CODE_USE_FOUNDRY ANTHROPIC_FOUNDRY_API_KEY ANTHROPIC_FOUNDRY_BASE_URL
+unset NODE_EXTRA_CA_CERTS CLAUDE_CODE_CLIENT_KEY CLAUDE_CODE_CLIENT_CERT
+unset ANTHROPIC_CUSTOM_HEADERS ANTHROPIC_LOG
+unset CLAUDECODE  # allow nested invocation if launched from within CC
+export ANTHROPIC_MODEL="claude-opus-4-6[1m]"
+
 PROMPT_FILE=".GM/Ralph-Exec-Prompt.md"
 STATE_FILE="RALPH_STATE.md"
 TASKS_FILE="RALPH_TASKS.md"
@@ -277,7 +284,7 @@ wait_for_credits() {
     # Probe with a minimal request
     local probe_output probe_exit
     probe_exit=0
-    probe_output=$(claude -p --model "$MODEL" --dangerously-skip-permissions \
+    probe_output=$(CLAUDECODE= claude -p --model "$MODEL" --dangerously-skip-permissions \
       --output-format text \
       "Reply with exactly: READY" 2>&1) || probe_exit=$?
 
@@ -315,17 +322,8 @@ generate_digests() {
   # 2. Repo digest (large) — full codebase, referenced but not piped
 
   log "Generating maps digest: $MAPS_DIGEST"
-  gitingest .GM/ \
-    --output "$MAPS_DIGEST" \
-    --include-pattern "*.md" \
-    --exclude-pattern "iterations/*" \
-    --exclude-pattern "Digest.txt" \
-    --exclude-pattern "agent-skills-maps.txt" \
-    2>/dev/null || {
-      log "WARNING: gitingest failed for maps — falling back to cat"
-      cat .GM/agent-map.md .GM/agent-teams-map.md .GM/skills-map.md \
-        .GM/SHIELD_SECURITY_CONTEXT.md > "$MAPS_DIGEST"
-    }
+  # Only the 3 map files — NOT the full .GM/ (SHIELD_SECURITY_CONTEXT is 580 lines)
+  cat .GM/agent-map.md .GM/agent-teams-map.md .GM/skills-map.md > "$MAPS_DIGEST" 2>/dev/null
   log "Maps digest: $(wc -c < "$MAPS_DIGEST" | tr -d ' ') bytes"
 
   log "Generating full repo digest: $REPO_DIGEST"
@@ -347,28 +345,27 @@ generate_digests() {
 }
 
 build_prompt() {
-  # Pipe to Claude each iteration:
-  #   1. Iteration prompt (Ralph-Exec-Prompt.md)
-  #   2. State files (small, change every iteration)
-  #   3. Maps digest (small, agent/team/skill context)
-  #   4. Reference to repo digest (NOT the content — just the path)
+  # Keep prompt SMALL to avoid "Prompt is too long" errors.
+  # Pipe: iteration prompt + state (tiny) + maps (small)
+  # Reference: RALPH_TASKS.md, SECURITY_REPORT.md, Digest.txt (Claude reads them)
 
   cat <<'PROMPT_HEADER'
 You are executing one iteration of the Ralph Wiggum autonomous security assessment loop.
 
-CONTEXT PROVIDED BELOW (do NOT re-read these files):
-- Iteration instructions
-- RALPH_STATE.md, RALPH_TASKS.md, SECURITY_REPORT.md (current state)
-- Agent/team/skill maps digest
+INLINE BELOW: iteration instructions, RALPH_STATE.md, and agent/team/skill maps.
 
-FULL REPO DIGEST available at .GM/Digest.txt — read it when you need broad codebase context.
-Do NOT read it every time. Only when your task requires exploring unfamiliar source code.
+YOUR FIRST TOOL CALLS (before anything else):
+1. Read RALPH_TASKS.md — find next task
+2. Read findings/SECURITY_REPORT.md — know current findings
 
-TOKEN-SAVING: Use `gitingest` via Bash to digest specific directories instead of reading files one-by-one:
+AVAILABLE ON DISK (read when needed):
+- .GM/SHIELD_SECURITY_CONTEXT.md — full recon data, risk hotspots
+- .GM/Digest.txt — full repo digest for broad codebase exploration
+
+TOKEN-SAVING: Use `gitingest` via Bash to digest directories instead of reading files one-by-one:
   gitingest shield-core/src/ --output .GM/task-digest.txt --exclude-pattern "branding/*"
   gitingest python/shield/ --output .GM/task-digest.txt --exclude-pattern "branding/*"
-  gitingest c/src/ --output .GM/task-digest.txt --exclude-pattern "branding/*"
-Then read .GM/task-digest.txt for compact context. ALWAYS exclude branding/*.
+Then read .GM/task-digest.txt. ALWAYS exclude branding/*.
 
 PROMPT_HEADER
 
@@ -380,15 +377,7 @@ PROMPT_HEADER
   cat "$STATE_FILE"
 
   echo ""
-  echo "=== RALPH_TASKS.md ==="
-  cat "$TASKS_FILE"
-
-  echo ""
-  echo "=== findings/SECURITY_REPORT.md ==="
-  cat "$REPORT_FILE"
-
-  echo ""
-  echo "=== AGENT / TEAM / SKILL MAPS (digest) ==="
+  echo "=== AGENT / TEAM / SKILL MAPS ==="
   cat "$MAPS_DIGEST"
 }
 
@@ -544,7 +533,8 @@ main() {
 
     while true; do
       # Run Claude in print mode with the iteration prompt
-      output=$(echo "$prompt" | claude \
+      # Unset CLAUDECODE to allow nested invocation from within a CC session
+      output=$(echo "$prompt" | CLAUDECODE= claude \
         -p \
         --model "$MODEL" \
         --dangerously-skip-permissions \
@@ -575,17 +565,29 @@ main() {
       if [[ "$exit_code" -ne 0 ]]; then
         crash_retries=$((crash_retries + 1))
 
+        # Dump full crash output to a separate file for debugging
+        local crash_file=".GM/iterations/crash-$(date +%s).txt"
+        echo "$output" > "$crash_file" 2>/dev/null
+        log "CRASH: exit=$exit_code — full output saved to $crash_file"
+
+        # Log last 5 lines inline for quick visibility
+        local tail_output
+        tail_output=$(echo "$output" | tail -5)
+        if [[ -n "$tail_output" ]]; then
+          log "CRASH output (last 5 lines):"
+          echo "$tail_output" | while IFS= read -r line; do log "  > $line"; done
+        else
+          log "CRASH: output was EMPTY"
+        fi
+
         if [[ "$crash_retries" -ge "$MAX_CRASH_RETRIES" ]]; then
           log "CRASH: $MAX_CRASH_RETRIES retries exhausted for task $current_task (exit=$exit_code)"
-          log "Last output (tail):"
-          echo "$output" | tail -20 >> "$LOG_FILE"
           log "Skipping to next iteration — state files may need manual review"
           break
         fi
 
         local backoff=$((CRASH_BACKOFF_BASE * (2 ** (crash_retries - 1))))
-        log "CRASH: exit=$exit_code, retry $crash_retries/$MAX_CRASH_RETRIES in ${backoff}s"
-        echo "$output" | tail -10 >> "$LOG_FILE"
+        log "CRASH: retry $crash_retries/$MAX_CRASH_RETRIES in ${backoff}s"
         sleep "$backoff"
 
         if [[ "$SHUTDOWN_REQUESTED" == true ]]; then
