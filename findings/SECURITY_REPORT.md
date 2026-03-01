@@ -2,9 +2,9 @@
 
 **Status**: IN-PROGRESS
 **Assessment Start**: 2026-03-01
-**Last Updated**: 2026-03-02T18:00:00+03:00
-**Tasks Completed**: 36/66
-**Findings**: 256 total (0 CRITICAL, 28 HIGH, 120 MEDIUM, 73 LOW, 35 INFO)
+**Last Updated**: 2026-03-03T02:30:00+03:00
+**Tasks Completed**: 40/66
+**Findings**: 302 total (0 CRITICAL, 33 HIGH, 143 MEDIUM, 88 LOW, 38 INFO)
 
 **Project**: Shield — 12-language symmetric encryption library
 **Crypto Stack**: PBKDF2-SHA256 (100k iterations) → SHA256-CTR → HMAC-SHA256 (128-bit truncated)
@@ -23,11 +23,11 @@
 | Category | Count |
 |----------|-------|
 | CRITICAL findings | 0 |
-| HIGH findings | 28 |
-| MEDIUM findings | 120 |
-| LOW findings | 73 |
-| INFO findings | 35 |
-| **Total** | **256** |
+| HIGH findings | 33 |
+| MEDIUM findings | 143 |
+| LOW findings | 88 |
+| INFO findings | 38 |
+| **Total** | **302** |
 
 ---
 
@@ -78,7 +78,7 @@ See `findings/agents/A05-docker-container.md` for full details.
 ### CRITICAL
 *No findings yet.*
 
-### HIGH (20)
+### HIGH (33)
 - **SHIELD-A01-001**: Key Separation Violation — Same Key for Encryption and HMAC (CWE-330, ALL 12 impls)
 - **SHIELD-A01-002**: JavaScript Allows Configurable PBKDF2 Iterations — Downgrade Attack (CWE-916, JS only)
 - **SHIELD-A01-003**: JavaScript Salt Type Confusion Bypasses Derivation (CWE-843, JS only)
@@ -97,8 +97,22 @@ See `findings/agents/A05-docker-container.md` for full details.
 - **SHIELD-A04-013**: CLI `shield check <password>` Exposes Password in Process List and Shell History (CWE-214, Rust CLI)
 - **SHIELD-A05-001**: Container Runs as Root — No USER Directive in All Dockerfiles (CWE-250, Docker)
 - **SHIELD-A05-002**: Curl-Pipe-to-Shell Pattern for Rust Installation — No Integrity Check (CWE-494, Docker)
+- **SHIELD-A06-002**: All Middleware Constructors Store Password/Key as Long-Lived Instance Attributes (CWE-316, All frameworks)
+- **SHIELD-A07-001**: No Token Revocation Mechanism — Tokens Valid Until Expiry (CWE-613, All frameworks)
+- **SHIELD-A08-001**: Handshake Timeout Not Enforced — Indefinite Blocking DoS (CWE-400, channel.rs)
+- **SHIELD-A08-003**: 16MB Allocation from Untrusted Frame Length (CWE-400, channel.rs)
+- **SHIELD-A08-004**: PAKE CPU DoS — 400k PBKDF2 Before Authentication (CWE-400, channel.rs)
+- **SHIELD-A09-001**: Key Transported in Plaintext JSON — No E2E Encryption (CWE-319, Browser SDK)
+- **SHIELD-A10-001**: All GH Actions Pinned by Tag/Branch — Not SHA (CWE-829, .github/workflows/)
+- **SHIELD-A10-002**: TruffleHog Pinned to @main Branch (CWE-829, ci.yml)
+- **SHIELD-A11-005**: FastAPI shield_protected Leaks Raw Decrypt Exception to HTTP (CWE-209, fastapi.py)
+- **SHIELD-A11-006**: Express shieldRequired Leaks err.message in HTTP Response (CWE-209, express.js)
+- **SHIELD-A11-015**: Distinguishable Error Paths Enable Crypto Oracle — Systemic (CWE-208+CWE-209, All impls)
+- **SHIELD-A11-016**: FastAPI shield_protected Unhandled TypeError Creates 500/400 Oracle (CWE-209+CWE-755, fastapi.py)
+- **SHIELD-A11-025**: Systemic Fail-Open on Encryption Across All Web Frameworks (CWE-636+CWE-311, Flask/Express/Django)
+- **SHIELD-A04-002**: Python Shield Accepts iterations=0 — Key Derivation Bypass (CWE-916, Python only)
 
-### MEDIUM (44)
+### MEDIUM (143)
 - **SHIELD-A01-008**: Android and iOS Use V1 Wire Format with Incrementing Counter — Divergent from V2 Implementations (CWE-838, Android/iOS)
 - **SHIELD-A01-009**: C# BitConverter.GetBytes() Endianness is Platform-Dependent (CWE-198, C# only)
 - **SHIELD-A01-011**: JavaScript O(n²) Buffer.concat in Keystream Generation — Algorithmic DoS (CWE-405, JS only)
@@ -474,7 +488,7 @@ See `findings/agents/A05-docker-container.md` for full details.
 | SHIELD-A09-029 | SDK Exports WasmClient + Fetch Hook Utilities | LOW | CWE-200 | `index.ts:243-247` |
 
 ### A10 — CI/CD & Supply Chain
-**15 findings** (2 HIGH, 8 MEDIUM, 4 LOW, 1 INFO) — Audit Checklist: 3/11 PASS
+**35 findings** (2 HIGH, 16 MEDIUM, 14 LOW, 3 INFO) — Audit Checklist: 3/18 PASS — **AGENT COMPLETE**
 
 | Finding ID | Title | Severity | CWE | Location |
 |-----------|-------|----------|-----|----------|
@@ -493,9 +507,57 @@ See `findings/agents/A05-docker-container.md` for full details.
 | SHIELD-A10-013 | Browser SDK `npm install` vs `npm ci` | LOW | CWE-1104 | `ci.yml:114` |
 | SHIELD-A10-014 | No Signing for crates.io/PyPI Packages | LOW | CWE-494 | `release.yml:253-282` |
 | SHIELD-A10-015 | Security Disclosure Process Correct | INFO | N/A | `.github/ISSUE_TEMPLATE/security_vulnerability.md` |
+| SHIELD-A10-016 | Android SDK Uses Alpha `security-crypto:1.1.0-alpha06` | MEDIUM | CWE-1104 | `android/shield/build.gradle.kts:47` |
+| SHIELD-A10-017 | No Cargo.lock Committed — Non-Reproducible Rust Builds | MEDIUM | CWE-1104 | Repository root (absence) |
+| SHIELD-A10-018 | `reqwest` 0.11 — Two Major Versions Behind (0.13) | LOW | CWE-1104 | `shield-core/Cargo.toml:62` |
+| SHIELD-A10-019 | C# SDK Targets .NET 6.0 — EOL Since Nov 2024 | MEDIUM | CWE-1104 | `csharp/Shield/Shield.csproj:4` |
+| SHIELD-A10-020 | `md5` Crate Used for Fingerprinting — Broken Hash | LOW | CWE-328 | `shield-core/Cargo.toml:73` |
+| SHIELD-A10-021 | Browser devDependencies Use Caret Ranges | LOW | CWE-1104 | `browser/package.json:47-56` |
+| SHIELD-A10-022 | Go `go.sum` Exists but No `go mod verify` in CI | LOW | CWE-494 | `ci.yml` Go job (absence) |
+| SHIELD-A10-023 | Zero Runtime Deps in 8/12 Impls — Positive | INFO | N/A | 8 manifests |
+| SHIELD-A10-024 | Go `x/crypto` v0.47.0 — Current and Patched | INFO | N/A | `go/go.mod:5` |
+| SHIELD-A10-025 | `.gitignore` Explicitly Excludes `Cargo.lock` | MEDIUM | CWE-1188 | `.gitignore:3` |
+| SHIELD-A10-026 | PyPI Uses Legacy API Token — Not Trusted Publishers | MEDIUM | CWE-522 | `release.yml:279-282` |
+| SHIELD-A10-027 | Build Artifact Transfer No Integrity Verification | MEDIUM | CWE-494 | `release.yml:101-153` |
+| SHIELD-A10-028 | No SECURITY.md at Repository Root | LOW | CWE-1059 | Repo root (absence) |
+| SHIELD-A10-029 | No CODEOWNERS File — No Required Security Review | LOW | CWE-284 | Repo root (absence) |
+| SHIELD-A10-030 | No Dependabot/Renovate — No Auto Dependency Updates | LOW | CWE-1104 | `.github/` (absence) |
+| SHIELD-A10-031 | Release Checksums Generated but Never Published | LOW | CWE-494 | `release.yml:158-236` |
+| SHIELD-A10-032 | CI Cache Key References Non-Existent Cargo.lock | LOW | CWE-1188 | `release.yml:78`, `ci.yml:39` |
+| SHIELD-A10-033 | WASM Excluded from Release but Advertised in Body | LOW | CWE-1059 | `release.yml:141,186` |
+| SHIELD-A10-034 | npm-publish.yml `workflow_dispatch` No Guards | MEDIUM | CWE-284 | `npm-publish.yml:6` |
+| SHIELD-A10-035 | `pip install build twine` Unpinned in Release | LOW | CWE-829 | `release.yml:273` |
 
 ### A11 — Error Disclosure
-*Phase 2 — Pending*
+**25 findings** (5 HIGH, 14 MEDIUM, 4 LOW, 1 INFO) — Error catalog + middleware error propagation + crypto oracle assessment — **TASK 2/3 DONE**
+
+| Finding ID | Title | Severity | CWE | Location |
+|------------|-------|----------|-----|----------|
+| SHIELD-A11-001 | Rust CiphertextTooShort leaks exact byte counts | MEDIUM | CWE-209 | error.rs:12-13 |
+| SHIELD-A11-002 | Rust InvalidKeyLength reveals expected/actual key size | MEDIUM | CWE-209 | error.rs:24-25 |
+| SHIELD-A11-003 | Python/JS/Rust key validation errors leak key length | MEDIUM | CWE-209 | core.py:103, shield.js:83 |
+| SHIELD-A11-004 | Rust AuthenticationFailed reveals MAC mechanism | LOW | CWE-209 | error.rs:16 |
+| SHIELD-A11-005 | FastAPI shield_protected leaks raw decrypt exception to HTTP | HIGH | CWE-209 | fastapi.py:174 |
+| SHIELD-A11-006 | Express shieldRequired leaks err.message in HTTP response | HIGH | CWE-209 | express.js:142-144 |
+| SHIELD-A11-007 | Express shieldErrorHandler exposes crypto error details | MEDIUM | CWE-209 | express.js:163-169 |
+| SHIELD-A11-008 | Confidential middleware leaks exception details | MEDIUM | CWE-209 | middleware.py:132-138 |
+| SHIELD-A11-009 | TEE type mismatch error reveals expected TEE configuration | MEDIUM | CWE-209 | base.py:311-312 |
+| SHIELD-A11-010 | User enumeration via user-exists error across 7 impls | MEDIUM | CWE-204 | identity.rs:64, identity.py:121, identity.js:96 |
+| SHIELD-A11-011 | Python/JS channel errors leak protocol internals | MEDIUM | CWE-209 | channel.py:268,271, channel.js:270,274 |
+| SHIELD-A11-012 | Stream cipher chunk auth errors leak chunk numbers | LOW | CWE-209 | stream.py:189, stream.js:195, StreamCipher.java:164 |
+| SHIELD-A11-013 | Java/Kotlin expose algorithm names in RuntimeExceptions | LOW | CWE-209 | Shield.java:333,343,353 |
+| SHIELD-A11-014 | Python CLI version string exposes library identity | INFO | CWE-200 | cli.py:157 |
+| SHIELD-A11-015 | Distinguishable error paths enable crypto oracle (systemic) | HIGH | CWE-208+CWE-209 | All impls — decrypt path |
+| SHIELD-A11-016 | FastAPI shield_protected unhandled TypeError creates 500/400 oracle | HIGH | CWE-209+CWE-755 | fastapi.py:171-174 |
+| SHIELD-A11-017 | Express shieldRequired leaks decrypt-vs-parse error via err.message | MEDIUM | CWE-209 | express.js:136-145 |
+| SHIELD-A11-018 | Flask _before_request silently swallows ALL decrypt errors (fail-open) | MEDIUM | CWE-636 | flask.py:121-134 |
+| SHIELD-A11-019 | Flask _after_request silently swallows encrypt errors (plaintext leak) | MEDIUM | CWE-636+CWE-311 | flask.py:136-158 |
+| SHIELD-A11-020 | Express shieldMiddleware sends plaintext on encrypt failure | MEDIUM | CWE-636+CWE-311 | express.js:58-73 |
+| SHIELD-A11-021 | Django middleware encrypt fails open to plaintext | MEDIUM | CWE-636+CWE-311 | django/__init__.py:79-89 |
+| SHIELD-A11-022 | requires_attestation decorator leaks AttestationError.message + TEE type | MEDIUM | CWE-209 | middleware.py:237-262 |
+| SHIELD-A11-023 | AttestationRouter verify endpoint returns full measurements/claims | MEDIUM | CWE-200 | middleware.py:399-407 |
+| SHIELD-A11-024 | AttestationRouter health endpoint exposes TEE measurements | LOW | CWE-200 | middleware.py:417-422 |
+| SHIELD-A11-025 | Systemic fail-open on encryption across all web frameworks | HIGH | CWE-636+CWE-311 | Flask/Express/Django middleware |
 
 ### A12 — Mobile Platform
 *Phase 3 — Pending*
@@ -674,6 +736,15 @@ See `findings/agents/A05-docker-container.md` for full details.
 | SHIELD-A10-013 | VERIFIED | LOW | A10 | ci.yml:114 — npm install vs npm ci inconsistency |
 | SHIELD-A10-014 | VERIFIED | LOW | A10 | release.yml:253-282 — no signing for Rust/Python packages |
 | SHIELD-A10-015 | NON-VULN | INFO | A10 | Security disclosure template correctly configured |
+| SHIELD-A10-016 | VERIFIED | MEDIUM | A10 | android/shield/build.gradle.kts:47 — alpha security-crypto dependency |
+| SHIELD-A10-017 | VERIFIED | MEDIUM | A10 | No Cargo.lock — CLI binary and WASM builds non-reproducible |
+| SHIELD-A10-018 | VERIFIED | LOW | A10 | shield-core/Cargo.toml:62 — reqwest 0.11 outdated (current: 0.13) |
+| SHIELD-A10-019 | VERIFIED | MEDIUM | A10 | csharp/Shield.csproj:4 — .NET 6 EOL Nov 2024, no security patches |
+| SHIELD-A10-020 | VERIFIED | LOW | A10 | shield-core/Cargo.toml:73 — md5 crate non-optional, CWE-328 |
+| SHIELD-A10-021 | VERIFIED | LOW | A10 | browser/package.json — all 8 devDeps use caret ranges, compounds A10-013 |
+| SHIELD-A10-022 | VERIFIED | LOW | A10 | ci.yml Go job — no go mod verify step |
+| SHIELD-A10-023 | NON-VULN | INFO | A10 | 8/12 impls have zero runtime deps — positive finding |
+| SHIELD-A10-024 | NON-VULN | INFO | A10 | Go x/crypto v0.47.0 current, post all 2025 CVE patches |
 
 **Tag Legend**:
 - `VULN` — Confirmed vulnerability with reproduction steps
