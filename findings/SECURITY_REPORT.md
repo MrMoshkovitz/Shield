@@ -2,9 +2,9 @@
 
 **Status**: IN-PROGRESS
 **Assessment Start**: 2026-03-01
-**Last Updated**: 2026-03-02T08:30:00+03:00
-**Tasks Completed**: 30/66
-**Findings**: 198 total (0 CRITICAL, 22 HIGH, 89 MEDIUM, 55 LOW, 32 INFO)
+**Last Updated**: 2026-03-02T11:00:00+03:00
+**Tasks Completed**: 33/66
+**Findings**: 226 total (0 CRITICAL, 26 HIGH, 103 MEDIUM, 63 LOW, 34 INFO)
 
 **Project**: Shield — 12-language symmetric encryption library
 **Crypto Stack**: PBKDF2-SHA256 (100k iterations) → SHA256-CTR → HMAC-SHA256 (128-bit truncated)
@@ -23,11 +23,11 @@
 | Category | Count |
 |----------|-------|
 | CRITICAL findings | 0 |
-| HIGH findings | 22 |
-| MEDIUM findings | 85 |
-| LOW findings | 51 |
-| INFO findings | 31 |
-| **Total** | **189** |
+| HIGH findings | 26 |
+| MEDIUM findings | 103 |
+| LOW findings | 63 |
+| INFO findings | 34 |
+| **Total** | **226** |
 
 ---
 
@@ -419,10 +419,44 @@ See `findings/agents/A05-docker-container.md` for full details.
 | SHIELD-A07-038 | EncryptedCookie decode() Swallows All Exceptions | INFO | CWE-755 | `browser.py:206-219` |
 
 ### A08 — Transport Protocol
-*Phase 2 — Pending*
+**14 findings** (3 HIGH, 7 MEDIUM, 3 LOW, 1 INFO)
+
+| Finding ID | Title | Severity | CWE | Location |
+|-----------|-------|----------|-----|----------|
+| SHIELD-A08-001 | Handshake Timeout Not Enforced — Indefinite Blocking DoS | HIGH | CWE-400 | `channel.rs:63,197-291` |
+| SHIELD-A08-002 | Non-Standard PAKE — No Formal Security Proof | MEDIUM | CWE-327 | `exchange.rs:20-57` |
+| SHIELD-A08-003 | 16MB Allocation from Untrusted Frame Length | HIGH | CWE-400 | `channel.rs:446-464` |
+| SHIELD-A08-004 | PAKE CPU DoS — 400k PBKDF2 Before Authentication | HIGH | CWE-400 | `channel.rs:200-284` |
+| SHIELD-A08-005 | Service Name Not in Session Key — Cross-Protocol | MEDIUM | CWE-346 | `channel.rs:147-174` |
+| SHIELD-A08-006 | Ratchet Counter Not Constant-Time + Leaks Value | MEDIUM | CWE-208 | `ratchet.rs:87-91` |
+| SHIELD-A08-007 | Ratchet Key Reuse for Encryption and Authentication | MEDIUM | CWE-323 | `ratchet.rs:145-188` |
+| SHIELD-A08-008 | PAKEExchange::derive() Panics on iterations=0 | MEDIUM | CWE-252 | `exchange.rs:26` |
+| SHIELD-A08-009 | ChannelConfig Password Not Zeroized | MEDIUM | CWE-316 | `channel.rs:54-64` |
+| SHIELD-A08-010 | QRExchange Exposes Raw Key in Base64 | MEDIUM | CWE-200 | `exchange.rs:79-98` |
+| SHIELD-A08-011 | Handshake Error Messages Leak Protocol State | LOW | CWE-209 | `channel.rs:364-375` |
+| SHIELD-A08-012 | KeySplitter XOR-Only — No Threshold Scheme | LOW | CWE-330 | `exchange.rs:117-161` |
+| SHIELD-A08-013 | Async Channel Duplicates Sync Logic — Divergence Risk | LOW | CWE-710 | `channel_async.rs` |
+| SHIELD-A08-014 | Ratchet Forward Secrecy Verified Correct | INFO | N/A | `ratchet.rs:23-109` |
 
 ### A09 — Browser & WASM
-*Phase 2 — Pending*
+**14 findings** (1 HIGH, 6 MEDIUM, 5 LOW, 1 INFO) + 7 cross-referenced from A03
+
+| Finding ID | Title | Severity | CWE | Location |
+|-----------|-------|----------|-----|----------|
+| SHIELD-A09-001 | Key Transported in Plaintext JSON — No E2E Encryption | HIGH | CWE-319 | `browser/js/index.ts:120-131` |
+| SHIELD-A09-002 | Fetch Hook Fail-Open on Decrypt Error | MEDIUM | CWE-636 | `browser/js/fetch-hook.ts:85-93` |
+| SHIELD-A09-003 | Fetch Hook Silent Downgrade on Expired Key | MEDIUM | CWE-636 | `browser/js/fetch-hook.ts:70-74` |
+| SHIELD-A09-004 | No WASM Binary Integrity Verification (SRI) | MEDIUM | CWE-494 | `browser/js/index.ts:19-20` |
+| SHIELD-A09-005 | ShieldClient.clear() Does Not Zeroize Key | MEDIUM | CWE-226 | `browser/src/lib.rs:196-201` |
+| SHIELD-A09-006 | Fetch Hook Clones Every JSON Response — DoS | MEDIUM | CWE-400 | `browser/js/fetch-hook.ts:44-63` |
+| SHIELD-A09-007 | Fetch Hook Monkey-Patches window.fetch | LOW | CWE-1021 | `browser/js/fetch-hook.ts:35-37` |
+| SHIELD-A09-008 | Key Endpoint URL No Validation | MEDIUM | CWE-918 | `browser/js/index.ts:66-72` |
+| SHIELD-A09-009 | Singleton Stale Key on Re-init | LOW | CWE-664 | `browser/js/index.ts:77-80` |
+| SHIELD-A09-010 | Auto-Refresh No Retry Logic | LOW | CWE-754 | `browser/js/index.ts:170-176` |
+| SHIELD-A09-011 | Decryption Errors Leak Crypto Internals | LOW | CWE-209 | `browser/src/lib.rs:73,76,133,141` |
+| SHIELD-A09-012 | No CSP Documentation | LOW | CWE-1021 | `browser/README.md` |
+| SHIELD-A09-013 | WASM Exports Crypto Primitives to JS | INFO | CWE-200 | `shield-core/src/wasm.rs:327-362` |
+| SHIELD-A09-014 | XSS via Decrypted Content (UN-VERIFIED) | MEDIUM | CWE-79 | `browser/js/fetch-hook.ts:79-84` |
 
 ### A10 — CI/CD & Supply Chain
 *Phase 2 — Pending*
