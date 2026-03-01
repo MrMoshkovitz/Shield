@@ -1,0 +1,1653 @@
+Directory structure:
+└── .GM/
+    ├── agent-map.md
+    ├── agent-teams-map.md
+    ├── CLAUDE.md
+    ├── Ralph-Exec-Prompt.md
+    ├── SHIELD_SECURITY_CONTEXT.md
+    └── skills-map.md
+
+================================================
+FILE: agent-map.md
+================================================
+# Shield Security Agent Map
+
+> 16 security agents covering OWASP Top 10, API Security Top 10, and CWE Top 25
+> Each agent: 1 domain team + 1-3 cross-domain teams
+
+## Agent Registry
+
+| # | Agent File | Priority | Domain Team | Cross-Domain Team(s) |
+|---|-----------|----------|-------------|---------------------|
+| 1 | `security-crypto-primitives.md` | CRITICAL | Team 1: Crypto Core | Team 6 (lead) |
+| 2 | `security-cross-language.md` | CRITICAL | Team 1: Crypto Core | Team 8 (lead) |
+| 3 | `security-memory-safety.md` | CRITICAL | Team 1: Crypto Core | Team 9 (lead) |
+| 4 | `security-input-validation.md` | CRITICAL | Team 2: Protocol & Data | Team 6, Team 8, Team 3 (secondary) |
+| 5 | `security-docker-container.md` | CRITICAL | Team 4: Infrastructure | Team 7, Team 11 (lead) |
+| 6 | `security-web-integration.md` | HIGH | Team 3: Application | Team 6, Team 11 |
+| 7 | `security-auth-session.md` | HIGH | Team 3: Application | Team 9, Team 10, Team 5 (secondary) |
+| 8 | `security-transport-protocol.md` | HIGH | Team 2: Protocol & Data | Team 10 (lead) |
+| 9 | `security-browser-wasm.md` | HIGH | Team 3: Application | Team 7, Team 9 |
+| 10 | `security-cicd-supply-chain.md` | HIGH | Team 4: Infrastructure | Team 7 (lead), Team 11 |
+| 11 | `security-error-disclosure.md` | HIGH | Team 3: Application | Team 6, Team 8, Team 11 |
+| 12 | `security-mobile-platform.md` | MEDIUM | Team 5: Platform & HW | Team 9 |
+| 13 | `security-confidential-tee.md` | MEDIUM | Team 5: Platform & HW | Team 9 |
+| 14 | `security-streaming-group.md` | MEDIUM | Team 2: Protocol & Data | Team 8 |
+| 15 | `security-signatures-2fa.md` | MEDIUM | Team 2: Protocol & Data | Team 10 |
+| 16 | `security-fingerprint.md` | MEDIUM | Team 5: Platform & HW | Team 10 |
+
+## Execution Phases
+
+```
+Phase 1 (BLOCKING):  Agents 1, 2, 3       → Core crypto + memory safety
+    ↓
+Phase 2 (PARALLEL):  Agents 4-11          → Protocol, app, infrastructure
+    ↓
+Phase 3 (PARALLEL):  Agents 12-16         → Platform & advanced features
+    ↓
+Phase 4 (PARALLEL):  Teams 6, 7, 8, 11    → Cross-domain batch 1
+    ↓
+Phase 5 (PARALLEL):  Teams 9, 10          → Cross-domain batch 2
+    ↓
+Phase 6 (FINAL):     Team 12              → Launch readiness go/no-go
+```
+
+## File Ownership Quick Reference
+
+| Codebase Area | Primary Agent | Secondary |
+|---------------|--------------|-----------|
+| `shield-core/src/shield.rs` | 1 | 2, 3, 4 |
+| `python/shield/core.py` | 1 | 2, 3, 4 |
+| `javascript/src/shield.js` | 1 | 2, 4, 11 |
+| `c/src/shield.c` | 1 | 2, 3 |
+| `c/src/shield_fingerprint.c` | 3 | 16 |
+| `go/shield/shield.go` | 2 | 1 |
+| `java/.../Shield.java` | 2 | 1 |
+| `csharp/Shield/Shield.cs` | 2 | 1 |
+| `swift/.../Shield.swift` | 2 | 1 |
+| `kotlin/.../Shield.kt` | 2 | 1 |
+| `python/shield/integrations/fastapi.py` | 6 | 7, 11 |
+| `python/shield/integrations/flask.py` | 6 | 7 |
+| `python/shield/integrations/protection.py` | 7 | 6 |
+| `python/shield/integrations/browser.py` | 9 | 6, 7 |
+| `javascript/integrations/express.js` | 6 | 11 |
+| `browser/js/fetch-hook.ts` | 9 | 6 |
+| `browser/js/index.ts` | 9 | — |
+| `shield-core/src/channel.rs` | 8 | — |
+| `shield-core/src/channel_async.rs` | 8 | — |
+| `shield-core/src/ratchet.rs` | 8 | 3 |
+| `shield-core/src/exchange.rs` | 8 | — |
+| `shield-core/src/stream.rs` | 14 | — |
+| `shield-core/src/group.rs` | 14 | — |
+| `shield-core/src/totp.rs` | 15 | 7 |
+| `shield-core/src/signatures.rs` | 15 | — |
+| `shield-core/src/identity.rs` | 7 | 11 |
+| `shield-core/src/fingerprint.rs` | 16 | — |
+| `shield-core/src/wasm.rs` | 9 | 3 |
+| `shield-core/src/error.rs` | 11 | 4 |
+| `shield-core/src/confidential/*.rs` | 13 | — |
+| `python/.../confidential/*.py` | 13 | — |
+| `shield-core/src/fido2/*.rs` | 7 | — |
+| `android/.../shield/src/**` | 12 | — |
+| `ios/Sources/Shield/**` | 12 | — |
+| `Dockerfile` | 5 | — |
+| `docker-compose.yml` | 5 | — |
+| `examples/opaque-containers/*` | 5 | — |
+| `.github/workflows/*.yml` | 10 | — |
+| `shield-core/Cargo.toml` | 10 | — |
+| `c/Makefile` | 10 | 3 |
+
+## Coverage Validation
+
+- **OWASP Top 10 (2021)**: 10/10 covered
+- **OWASP API Security Top 10**: 10/10 covered
+- **CWE Top 25**: 23/25 covered (N/A: SQL injection, file upload)
+- **All entry points from SHIELD_SECURITY_CONTEXT.md**: covered
+- **Cross-domain pairwise coverage**: 16/16 realistic pairs covered (Teams 6-11)
+
+
+
+================================================
+FILE: agent-teams-map.md
+================================================
+# Shield Security Agent Teams
+
+> 12 teams (5 domain + 7 cross-domain), 16 agents, 6 execution phases
+
+---
+
+## Domain Teams (Phase 1-3)
+
+### Team 1: Crypto Core
+**Phase**: 1 (BLOCKING — must complete before Phase 2)
+**Focus**: Cryptographic correctness, cross-language parity, memory safety
+
+| Agent # | Agent File | Role in Team |
+|---------|-----------|-------------|
+| 1 | `security-crypto-primitives.md` | Audit all crypto primitives (PBKDF2, CTR, HMAC) across 12 languages |
+| 2 | `security-cross-language.md` | Verify byte-identical parity across all implementations |
+| 3 | `security-memory-safety.md` | Audit key lifecycle, buffer safety, zeroization |
+
+**Handoff**: Findings from Team 1 inform all Phase 2 teams on crypto assumptions.
+
+---
+
+### Team 2: Protocol & Data
+**Phase**: 2 (PARALLEL — after Phase 1)
+**Focus**: Transport security, input handling, streaming, signatures
+
+| Agent # | Agent File | Role in Team |
+|---------|-----------|-------------|
+| 8 | `security-transport-protocol.md` | Audit ShieldChannel, PAKE handshake, RatchetSession |
+| 4 | `security-input-validation.md` | Audit all input parsing and validation paths |
+| 14 | `security-streaming-group.md` | Audit StreamCipher and GroupEncryption |
+| 15 | `security-signatures-2fa.md` | Audit signature schemes and TOTP/recovery codes |
+
+**Dependencies**: Requires Agent 1 findings on crypto primitive correctness.
+
+---
+
+### Team 3: Application
+**Phase**: 2 (PARALLEL — after Phase 1)
+**Focus**: Web frameworks, authentication, browser, error handling
+
+| Agent # | Agent File | Role in Team |
+|---------|-----------|-------------|
+| 6 | `security-web-integration.md` | Audit FastAPI/Flask/Express middleware |
+| 7 | `security-auth-session.md` | Audit tokens, rate limiting, identity |
+| 9 | `security-browser-wasm.md` | Audit browser SDK, WASM, fetch hook |
+| 11 | `security-error-disclosure.md` | Audit error messages across all 12 impls |
+| 4 | `security-input-validation.md` | **(Secondary)** Input validation in middleware paths |
+
+**Dependencies**: Requires Agent 3 findings on WASM memory safety.
+
+---
+
+### Team 4: Infrastructure
+**Phase**: 2 (PARALLEL — after Phase 1)
+**Focus**: Docker hardening, CI/CD pipeline, supply chain
+
+| Agent # | Agent File | Role in Team |
+|---------|-----------|-------------|
+| 5 | `security-docker-container.md` | Audit all Dockerfiles, compose, opaque containers |
+| 10 | `security-cicd-supply-chain.md` | Audit GitHub Actions, dependencies, release signing |
+
+**Dependencies**: None (can run independently).
+
+---
+
+### Team 5: Platform & HW
+**Phase**: 3 (PARALLEL — after Phase 2)
+**Focus**: Mobile SDKs, TEE attestation, device fingerprinting
+
+| Agent # | Agent File | Role in Team |
+|---------|-----------|-------------|
+| 12 | `security-mobile-platform.md` | Audit Android Keystore, iOS Keychain, biometrics |
+| 13 | `security-confidential-tee.md` | Audit Nitro/SEV/MAA/SGX attestation and sealed storage |
+| 16 | `security-fingerprint.md` | Audit device fingerprinting, MD5, command injection |
+| 7 | `security-auth-session.md` | **(Secondary)** Auth state in mobile/TEE key management |
+
+**Dependencies**: Requires Agent 1 findings on crypto used in mobile/TEE.
+
+---
+
+## Cross-Domain Teams (Phase 4-6)
+
+### Team 6: Crypto Oracle & Error Leakage
+**Phase**: 4 | **Priority**: CRITICAL | **File**: `team-6-crypto-oracle-error.md`
+**Chain**: Error messages + middleware behavior → crypto oracle attack
+
+| Role | Agent # | Agent File |
+|------|---------|-----------|
+| Lead | 1 | `security-crypto-primitives.md` |
+| Support | 11 | `security-error-disclosure.md` |
+| Support | 6 | `security-web-integration.md` |
+| Support | 4 | `security-input-validation.md` |
+
+---
+
+### Team 7: Supply Chain to Runtime
+**Phase**: 4 | **Priority**: HIGH | **File**: `team-7-supply-chain-runtime.md`
+**Chain**: CI/CD compromise → deployment → runtime crypto corruption
+
+| Role | Agent # | Agent File |
+|------|---------|-----------|
+| Lead | 10 | `security-cicd-supply-chain.md` |
+| Support | 5 | `security-docker-container.md` |
+| Support | 9 | `security-browser-wasm.md` |
+
+---
+
+### Team 8: Cross-Language Interop Exploit
+**Phase**: 4 | **Priority**: CRITICAL | **File**: `team-8-cross-lang-interop.md`
+**Chain**: Behavioral divergences across 12 impls → interop exploitation
+
+| Role | Agent # | Agent File |
+|------|---------|-----------|
+| Lead | 2 | `security-cross-language.md` |
+| Support | 4 | `security-input-validation.md` |
+| Support | 11 | `security-error-disclosure.md` |
+| Support | 14 | `security-streaming-group.md` |
+
+---
+
+### Team 9: Key Lifecycle & Exposure
+**Phase**: 5 | **Priority**: CRITICAL | **File**: `team-9-key-lifecycle.md`
+**Chain**: Key extraction at any lifecycle point → forge/decrypt
+
+| Role | Agent # | Agent File |
+|------|---------|-----------|
+| Lead | 3 | `security-memory-safety.md` |
+| Support | 12 | `security-mobile-platform.md` |
+| Support | 9 | `security-browser-wasm.md` |
+| Support | 7 | `security-auth-session.md` |
+| Support | 13 | `security-confidential-tee.md` |
+
+---
+
+### Team 10: Auth & Transport MITM
+**Phase**: 5 | **Priority**: HIGH | **File**: `team-10-auth-transport-mitm.md`
+**Chain**: MITM → session compromise → device rebinding → identity takeover
+
+| Role | Agent # | Agent File |
+|------|---------|-----------|
+| Lead | 8 | `security-transport-protocol.md` |
+| Support | 7 | `security-auth-session.md` |
+| Support | 16 | `security-fingerprint.md` |
+| Support | 15 | `security-signatures-2fa.md` |
+
+---
+
+### Team 11: Config & Deployment Drift
+**Phase**: 4 | **Priority**: HIGH | **File**: `team-11-config-deployment-drift.md`
+**Chain**: Dev config differences → production security gaps
+
+| Role | Agent # | Agent File |
+|------|---------|-----------|
+| Lead | 5 | `security-docker-container.md` |
+| Support | 10 | `security-cicd-supply-chain.md` |
+| Support | 6 | `security-web-integration.md` |
+| Support | 11 | `security-error-disclosure.md` |
+
+---
+
+### Team 12: Launch Readiness (Meta-Team)
+**Phase**: 6 (FINAL) | **Priority**: CRITICAL | **File**: `team-12-launch-readiness.md`
+**Purpose**: Aggregate, deduplicate, prioritize ALL findings → Go/No-Go
+
+| Role | Input |
+|------|-------|
+| Lead | Orchestrator |
+| Input | All 11 teams' complete findings |
+
+---
+
+## Execution DAG
+
+```
+                    ┌─────────────────────────────────┐
+                    │  Phase 1 (BLOCKING)              │
+                    │  Team 1: Crypto Core             │
+                    │  [Agents 1, 2, 3]                │
+                    └────────────┬────────────────────┘
+                                 ▼
+       ┌──────────────────────────────────────────────────────────┐
+       │  Phase 2 (PARALLEL) — Domain Audit                       │
+       │                                                          │
+       │  Team 2: Protocol    Team 3: Application    Team 4: Infra│
+       │  [8, 4, 14, 15]     [6, 7, 9, 11, +4]     [5, 10]      │
+       └────────────────────────┬─────────────────────────────────┘
+                                ▼
+       ┌──────────────────────────────────────────────────────────┐
+       │  Phase 3 (PARALLEL) — Platform Audit                     │
+       │                                                          │
+       │  Team 5: Platform & HW [12, 13, 16, +7]                 │
+       └────────────────────────┬─────────────────────────────────┘
+                                ▼
+       ┌──────────────────────────────────────────────────────────┐
+       │  Phase 4 (PARALLEL) — Cross-Domain Batch 1               │
+       │                                                          │
+       │  Team 6: Crypto     Team 7: Supply   Team 8: Cross-Lang │
+       │  Oracle & Error     Chain→Runtime    Interop Exploit     │
+       │  [1,11,6,4]        [10,5,9]         [2,4,11,14]         │
+       │                                                          │
+       │  Team 11: Config & Deployment Drift [5,6,10,11]          │
+       └────────────────────────┬─────────────────────────────────┘
+                                ▼
+       ┌──────────────────────────────────────────────────────────┐
+       │  Phase 5 (PARALLEL) — Cross-Domain Batch 2               │
+       │                                                          │
+       │  Team 9: Key Lifecycle     Team 10: Auth & Transport     │
+       │  & Exposure                MITM Chain                    │
+       │  [3,12,9,7,13]            [8,7,16,15]                   │
+       └────────────────────────┬─────────────────────────────────┘
+                                ▼
+       ┌──────────────────────────────────────────────────────────┐
+       │  Phase 6 (FINAL) — Launch Readiness                      │
+       │                                                          │
+       │  Team 12: Go/No-Go Assessment [ALL findings]             │
+       └──────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Agent Participation Matrix
+
+| Agent | Domain Team | Cross-Domain Team(s) |
+|-------|------------|---------------------|
+| 1 (crypto-primitives) | Team 1 | Team 6 (lead) |
+| 2 (cross-language) | Team 1 | Team 8 (lead) |
+| 3 (memory-safety) | Team 1 | Team 9 (lead) |
+| 4 (input-validation) | Team 2 | Team 6, Team 8, Team 3 (secondary) |
+| 5 (docker-container) | Team 4 | Team 7, Team 11 (lead) |
+| 6 (web-integration) | Team 3 | Team 6, Team 11 |
+| 7 (auth-session) | Team 3 | Team 9, Team 10, Team 5 (secondary) |
+| 8 (transport-protocol) | Team 2 | Team 10 (lead) |
+| 9 (browser-wasm) | Team 3 | Team 7, Team 9 |
+| 10 (cicd-supply-chain) | Team 4 | Team 7 (lead), Team 11 |
+| 11 (error-disclosure) | Team 3 | Team 6, Team 8, Team 11 |
+| 12 (mobile-platform) | Team 5 | Team 9 |
+| 13 (confidential-tee) | Team 5 | Team 9 |
+| 14 (streaming-group) | Team 2 | Team 8 |
+| 15 (signatures-2fa) | Team 2 | Team 10 |
+| 16 (fingerprint) | Team 5 | Team 10 |
+
+Every agent: exactly 1 domain team + 1-3 cross-domain teams.
+
+---
+
+## Pairwise Domain Coverage
+
+| Domain A × Domain B | Chain | Team |
+|---------------------|-------|------|
+| Crypto × Web middleware | Crypto oracle via error leak | Team 6 |
+| Crypto × Transport | PAKE key compromise → crypto break | Team 10 |
+| Crypto × Cross-language | Interop exploit via divergence | Team 8 |
+| Crypto × Memory | Key lifecycle exposure | Team 9 |
+| Web × Docker | Config drift dev→prod | Team 11 |
+| Web × CI/CD | Config drift via deployment | Team 11 |
+| Web × Browser | Key exchange MITM | Team 9 |
+| CI/CD × Docker | Supply chain → deployment | Team 7 |
+| CI/CD × WASM | Tampered build → runtime | Team 7 |
+| Auth × Transport | MITM → session compromise | Team 10 |
+| Auth × Fingerprint | Device binding bypass | Team 10 |
+| Mobile × Memory | Mobile key storage → extraction | Team 9 |
+| TEE × Memory | Sealed storage → key extraction | Team 9 |
+| Error × Crypto | Error oracle attack | Team 6 |
+| Streaming × Cross-lang | Chunk handling divergence | Team 8 |
+| Signatures × Transport | Forgery after MITM key compromise | Team 10 |
+
+---
+
+## Dedup Strategy
+
+| Scenario | Action |
+|----------|--------|
+| Domain + cross-domain find same issue | Cross-domain REFERENCES domain finding by ID |
+| Chain escalates severity | Consolidated severity = highest in chain |
+| Multiple chains share root cause | Single root cause, multiple chain references |
+| Contradictory findings | Flag for manual review |
+
+---
+
+## Coverage Summary
+
+| Standard | Coverage | Teams |
+|----------|---------|-------|
+| OWASP Top 10 (2021) | 10/10 | All domain teams |
+| OWASP API Security Top 10 | 10/10 | Teams 2, 3, 4 |
+| CWE Top 25 | 23/25 | All domain teams |
+| CIS Docker Benchmark | Partial | Team 4 (Agent 5) |
+| NIST 800-57 Key Management | Partial | Team 1 (Agents 1, 3) |
+| RFC 6238 (TOTP) | Full | Agent 15 |
+| Cross-domain attack chains | 16/16 pairwise | Teams 6-11 |
+
+
+
+================================================
+FILE: CLAUDE.md
+================================================
+# CLAUDE.md — Shield Security Assessment
+
+**Project**: Shield — 12-language symmetric encryption library
+**Crypto stack**: PBKDF2-SHA256 (100k iterations) → SHA256-CTR → HMAC-SHA256 (128-bit truncated)
+**Wire format**: `nonce(16 bytes) || ciphertext || MAC(16 bytes)`
+
+## Mission
+
+Enterprise security assessment of Shield before launch. Zero-miss requirement.
+16 agents audit individual domains. 7 cross-domain teams audit attack chains.
+42 skills provide reusable procedures. All findings go to `findings/`.
+
+---
+
+## Repository Structure
+
+| Directory | Focus |
+|-----------|-------|
+| `shield-core/` | Rust core library + CLI (single source of truth) |
+| `browser/` | Browser SDK (auto-decrypt fetch with WASM) |
+| `android/` | Android SDK (Keystore + biometric) |
+| `ios/` | iOS SDK (Keychain + Face ID/Touch ID) |
+| `python/` | Python package (pip install shield-crypto) |
+| `javascript/` | JavaScript/Node.js (@guard8/shield) |
+| `go/` | Go module |
+| `c/` | C library (libshield) |
+| `java/` | Java/Gradle |
+| `csharp/` | C#/.NET |
+| `swift/` | Swift Package |
+| `kotlin/` | Kotlin/JVM |
+| `wasm/` | WebAssembly (re-exports shield-core) |
+| `examples/` | Usage examples (browser, hsm, confidential-computing) |
+| `tests/` | Cross-language interoperability tests |
+| `findings/` | **Security assessment output** |
+| `.GM/` | **Recon docs, agent/team/skill maps** |
+
+---
+
+## Crypto Parameters
+
+| Parameter | Value |
+|-----------|-------|
+| Key derivation | PBKDF2-SHA256, 100,000 iterations |
+| Key size | 256 bits |
+| Nonce | 128 bits (random per message) |
+| MAC | HMAC-SHA256, truncated to 128 bits |
+| Wire format | nonce(16) ‖ ciphertext ‖ MAC(16) |
+| Encryption flow | Password → PBKDF2 → Key → SHA256-CTR + HMAC-SHA256 → Ciphertext |
+
+---
+
+## Running Tests
+
+```bash
+cd shield-core && cargo test --features confidential   # Rust (95 tests)
+cd python && python -m pytest                           # Python (153 tests)
+cd javascript && npm test                               # JavaScript (81 tests)
+cd go && go test ./...                                  # Go (31 tests)
+cd c && make test                                       # C (16 tests)
+cd java && gradle test                                  # Java (19 tests)
+cd wasm && cargo test                                   # WASM
+```
+
+---
+
+## Assessment Arsenal
+
+### Agents (16)
+
+| # | Agent | Priority | File |
+|---|-------|----------|------|
+| 1 | Crypto Primitives | CRITICAL | `.claude/agents/security-crypto-primitives.md` |
+| 2 | Cross-Language Parity | CRITICAL | `.claude/agents/security-cross-language.md` |
+| 3 | Memory Safety | CRITICAL | `.claude/agents/security-memory-safety.md` |
+| 4 | Input Validation | CRITICAL | `.claude/agents/security-input-validation.md` |
+| 5 | Docker & Container | CRITICAL | `.claude/agents/security-docker-container.md` |
+| 6 | Web Integration | HIGH | `.claude/agents/security-web-integration.md` |
+| 7 | Auth & Session | HIGH | `.claude/agents/security-auth-session.md` |
+| 8 | Transport Protocol | HIGH | `.claude/agents/security-transport-protocol.md` |
+| 9 | Browser & WASM | HIGH | `.claude/agents/security-browser-wasm.md` |
+| 10 | CI/CD & Supply Chain | HIGH | `.claude/agents/security-cicd-supply-chain.md` |
+| 11 | Error Disclosure | HIGH | `.claude/agents/security-error-disclosure.md` |
+| 12 | Mobile Platform | MEDIUM | `.claude/agents/security-mobile-platform.md` |
+| 13 | Confidential TEE | MEDIUM | `.claude/agents/security-confidential-tee.md` |
+| 14 | Streaming & Group | MEDIUM | `.claude/agents/security-streaming-group.md` |
+| 15 | Signatures & 2FA | MEDIUM | `.claude/agents/security-signatures-2fa.md` |
+| 16 | Fingerprint | MEDIUM | `.claude/agents/security-fingerprint.md` |
+
+### Cross-Domain Teams (7)
+
+| Team | Name | Priority | Phase | File |
+|------|------|----------|-------|------|
+| T6 | Crypto Oracle & Error Leakage | CRITICAL | 4 | `.claude/agents/team-6-crypto-oracle-error.md` |
+| T7 | Supply Chain to Runtime | HIGH | 4 | `.claude/agents/team-7-supply-chain-runtime.md` |
+| T8 | Cross-Language Interop Exploit | CRITICAL | 4 | `.claude/agents/team-8-cross-lang-interop.md` |
+| T9 | Key Lifecycle & Exposure | CRITICAL | 5 | `.claude/agents/team-9-key-lifecycle.md` |
+| T10 | Auth & Transport MITM | HIGH | 5 | `.claude/agents/team-10-auth-transport-mitm.md` |
+| T11 | Config & Deployment Drift | HIGH | 4 | `.claude/agents/team-11-config-deployment-drift.md` |
+| T12 | Launch Readiness (Go/No-Go) | CRITICAL | 6 | `.claude/agents/team-12-launch-readiness.md` |
+
+### Skills (top 10 — full registry: `.GM/skills-map.md`, 42 skills)
+
+| Need | Skill |
+|------|-------|
+| Navigate codebase | `/skill-shield-file-navigator` |
+| Scan across languages | `/skill-multi-lang-symbol-scanner` |
+| Detect CWE patterns | `/skill-cwe-pattern-detector` |
+| Format a finding | `/skill-finding-formatter` |
+| Generate finding ID | `/skill-finding-id-generator` |
+| Collect evidence | `/skill-evidence-snapshot-collector` |
+| Build attack chain | `/skill-attack-chain-builder` |
+| Deduplicate findings | `/skill-finding-deduplicator` |
+| Generate risk matrix | `/skill-risk-matrix-generator` |
+| Track audit progress | `/skill-audit-progress-tracker` |
+
+---
+
+## How To Execute
+
+### Run a Single Agent
+
+1. Read agent file: `.claude/agents/security-{name}.md`
+2. Read `.GM/SHIELD_SECURITY_CONTEXT.md` for recon data
+3. Follow the Audit Checklist in agent file item by item
+4. Use skills listed in the agent (invoke via Skill tool)
+5. Generate finding IDs with `/skill-finding-id-generator`, format with `/skill-finding-formatter`
+6. Write findings to `findings/agents/A{##}-{name}.md`
+
+### Run a Cross-Domain Team
+
+1. Read team file: `.claude/agents/team-{N}-{name}.md`
+2. Read ALL input agent findings from `findings/agents/`
+3. Follow the Coordination Flow in the team file
+4. Build attack chains with `/skill-attack-chain-builder`
+5. Cross-reference agent findings by `SHIELD-A##-###` ID — never duplicate
+6. Write findings to `findings/teams/T{##}-{name}.md`
+
+### Use a Skill
+
+Invoke via the Skill tool: `/skill-name` (e.g., `/skill-cwe-pattern-detector`)
+
+### Spawn Parallel Workers
+
+Use the Agent tool with `subagent_type="general-purpose"`. Pass agent `.md` content as prompt instructions. Use `isolation: "worktree"` for file-writing agents.
+
+---
+
+## Execution Phases
+
+```
+Phase 1 (BLOCKING):  Agents 1, 2, 3         → Crypto Core
+Phase 2 (PARALLEL):  Agents 4-11            → Protocol + App + Infra
+Phase 3 (PARALLEL):  Agents 12-16           → Platform & HW
+Phase 4 (PARALLEL):  Teams 6, 7, 8, 11      → Cross-domain batch 1
+Phase 5 (PARALLEL):  Teams 9, 10            → Cross-domain batch 2
+Phase 6 (FINAL):     Team 12                → Go/No-Go
+```
+
+**Dependencies**: Phase N+1 requires Phase N findings written. Teams consume agent findings as input. Team 12 consumes ALL team findings.
+
+---
+
+## Findings Directory & Output Format
+
+### Directory Structure
+
+```
+findings/
+  agents/          # A01-A16, one file per agent
+  teams/           # T06-T12, one file per team
+  SUMMARY.md       # Team 12 final output (go/no-go)
+```
+
+### Finding ID Format
+
+`SHIELD-{SOURCE}-{SEQ}` — e.g., `SHIELD-A01-001`, `SHIELD-T08-003`
+
+### Finding Template
+
+```markdown
+### SHIELD-A01-001: [Title]
+- **Severity**: CRITICAL | HIGH | MEDIUM | LOW | INFO
+- **CWE**: CWE-XXX
+- **Location**: `file/path.ext:line`
+- **Evidence**: code snippet or output
+- **Impact**: what attacker achieves
+- **Reproduction**: steps to reproduce
+- **Fix Complexity**: LOW | MEDIUM | HIGH
+- **Remediation**: specific fix steps
+```
+
+### Severity Criteria
+
+| Severity | Criteria |
+|----------|----------|
+| CRITICAL | Direct key/plaintext exposure, authentication bypass, RCE |
+| HIGH | Partial key leakage, timing oracle, weak crypto parameter |
+| MEDIUM | Information disclosure, missing hardening, config drift |
+| LOW | Minor best-practice deviation, defense-in-depth gap |
+
+---
+
+## Reference Files
+
+| File | Contains |
+|------|----------|
+| `.GM/SHIELD_SECURITY_CONTEXT.md` | Full recon: tech inventory, architecture, attack surface, deps, risk hotspots |
+| `.GM/agent-map.md` | Agent registry, execution phases, file ownership matrix |
+| `.GM/agent-teams-map.md` | 12 teams, execution DAG, participation matrix, dedup strategy |
+| `.GM/skills-map.md` | 42 skills, layer architecture, agent-to-skill mapping |
+
+**When to read**: Read `SHIELD_SECURITY_CONTEXT.md` before any agent run. Read `agent-map.md` to understand phase dependencies. Read `skills-map.md` to find the right skill for a task.
+
+---
+
+## Rules of Engagement
+
+1. **EVIDENCE OVER OPINION** — every finding requires `file:line` + code snippet
+2. **CWE MAPPING REQUIRED** — no finding without a CWE ID
+3. **CROSS-REFERENCE, NEVER DUPLICATE** — teams reference agent finding IDs, don't re-report
+4. **SEVERITY ESCALATION** — cross-domain chains use highest component severity
+5. **CONTRADICTIONS FLAGGED** — disagreements between agents flagged for manual review
+6. **KNOWN FINDINGS FIRST** — verify known issues from recon before scanning for new ones
+7. **SKILLS FOR HOW** — use the 42 skills, don't reinvent procedures
+8. **WRITE AS YOU GO** — don't batch findings, write each as discovered
+9. **PHASE GATES** — don't start Phase N+1 until Phase N findings are written
+10. **NO FIXES WITHOUT APPROVAL** — findings only, no code changes unless explicitly approved
+
+
+
+================================================
+FILE: Ralph-Exec-Prompt.md
+================================================
+Attached:
+@.GM/SHIELD_SECURITY_CONTEXT.md 
+@.GM/agent-map.md
+@.GM/agent-teams-map.md
+@.GM/skills-map.md
+@CLAUDE.md
+
+
+## PROTOCOLS
+1. **ULTRATHINK** - Deep reasoning before action
+2. **ACCURACY**: Read source code + docs. Validate yourself. Accuracy is critical.
+3. **READ FIRST**: Start by reading @CLAUDE.md instruction file (if it exists)
+4. **AGENT ROUTER**: Use @agent-router to identify best agent for task
+5. **SKILLS**: Use every relevant skill from ./.claude/skills/*
+6. **AGENTS**: Use every relevant agent from ./.claude/agents/*
+7. **TEAMS**: Use every relevant team from ./.claude/agent-teams/*
+8. **FINDINGS**: Write every finding in .GM/findings/ with full evidence and reproduction steps
+9. **DEDUPE**: If multiple agents/teams find the same issue, write one finding and note all sources
+10. **NO FIXES WITHOUT APPROVAL**: Do not implement any fixes until without explicit approval from project lead (ME THE USER) - ONLY write findings with evidence and reproduction steps, fix complexity estimate, and impact assessment and Remediation and Mitigation setp-by-step instructions and strategy. I will review and decide which findings to fix and how.
+11. **SCOPE**: The entire codebase, infrastructure, CI/CD pipelines, and documentation related to the Shield project. Assume everything is in scope unless explicitly told otherwise. - Highest risk areas are likely to be enterprise API code, Docker configuration, and Confidential Computing implementation, but review everything with a security mindset.
+12. **TIMELINE**: Shield launches in 2 days. We have 48 hours to complete a comprehensive security assessment. Prioritize speed and accuracy. Focus on critical paths first, but review everything as time allows - Don't miss anything critical, but also don't get bogged down in low-risk details. We need to find and report all critical, high-severity and even medium-severity issues before launch. We can triage and prioritize fixes after the assessment is complete, but we must find everything, not just the low-hanging fruit. This is a zero-miss mission.
+13. **COMMUNICATION**: After every Ralph iteration, provide a concise summary of what was done, what was found, and what the next steps are (Save as file including Start and end full date and time (Jerusalem time)). Be transparent about any blockers or uncertainties. I will be available to review findings and provide guidance after each iteration, so keep me in the loop.
+14. **ETHICS**: This is a security assessment for a product about to launch. The goal is to find and report vulnerabilities, not to exploit them. Do not attempt to access any systems or data beyond what is necessary for the assessment, and do not use any findings for personal gain. This is a professional engagement with the goal of improving security for users.
+
+---
+
+## RALPH WIGGUM AUTONOMOUS SECURITY ASSESSMENT — ITERATION PROMPT
+
+You are one iteration of an autonomous security assessment loop.
+Previous iterations may have already completed work. Your job:
+find the next task, execute it, write findings, update state, exit cleanly.
+
+**CRITICAL**: You do NOT fix code. You do NOT change source. You FIND
+vulnerabilities, VERIFY them, and WRITE findings. That's it.
+
+**MOST CRITICAL FOCUS**: Docker & Confidential Computing. But cover EVERYTHING.
+
+## STEP 0: ORIENT (do this EVERY iteration, no exceptions)
+
+Your prompt already contains these files inline — do NOT re-read them:
+- `RALPH_STATE.md` — current loop state (phase, task, iteration count)
+- `RALPH_TASKS.md` — full 66-task state machine with statuses and dependencies
+- `findings/SECURITY_REPORT.md` — cumulative findings report
+- **Agent/Team/Skill Maps Digest** (`.GM/agent-skills-maps.txt`) — see below
+
+`CLAUDE.md` is auto-loaded by Claude Code as project instructions.
+
+If any state file appears missing or corrupted, recreate from `.GM/` reference docs.
+
+### YOUR ARSENAL (from maps digest included below)
+
+**16 Security Agents** — each audits a specific domain. Agent files at `.claude/agents/security-*.md`:
+| # | Agent | Priority | File |
+|---|-------|----------|------|
+| 1 | Crypto Primitives | CRITICAL | `security-crypto-primitives.md` |
+| 2 | Cross-Language Parity | CRITICAL | `security-cross-language.md` |
+| 3 | Memory Safety | CRITICAL | `security-memory-safety.md` |
+| 4 | Input Validation | CRITICAL | `security-input-validation.md` |
+| 5 | Docker & Container | CRITICAL | `security-docker-container.md` |
+| 6 | Web Integration | HIGH | `security-web-integration.md` |
+| 7 | Auth & Session | HIGH | `security-auth-session.md` |
+| 8 | Transport Protocol | HIGH | `security-transport-protocol.md` |
+| 9 | Browser & WASM | HIGH | `security-browser-wasm.md` |
+| 10 | CI/CD & Supply Chain | HIGH | `security-cicd-supply-chain.md` |
+| 11 | Error Disclosure | HIGH | `security-error-disclosure.md` |
+| 12 | Mobile Platform | MEDIUM | `security-mobile-platform.md` |
+| 13 | Confidential TEE | MEDIUM | `security-confidential-tee.md` |
+| 14 | Streaming & Group | MEDIUM | `security-streaming-group.md` |
+| 15 | Signatures & 2FA | MEDIUM | `security-signatures-2fa.md` |
+| 16 | Fingerprint | MEDIUM | `security-fingerprint.md` |
+
+**7 Cross-Domain Teams** — each builds attack chains. Team files at `.claude/agents/team-*.md`:
+| Team | Name | Priority | Phase |
+|------|------|----------|-------|
+| T6 | Crypto Oracle & Error Leakage | CRITICAL | 4 |
+| T7 | Supply Chain to Runtime | HIGH | 4 |
+| T8 | Cross-Language Interop Exploit | CRITICAL | 4 |
+| T9 | Key Lifecycle & Exposure | CRITICAL | 5 |
+| T10 | Auth & Transport MITM | HIGH | 5 |
+| T11 | Config & Deployment Drift | HIGH | 4 |
+| T12 | Launch Readiness (Go/No-Go) | CRITICAL | 6 |
+
+**Key Skills** (42 total, invoke via Skill tool `/skill-name`):
+| Need | Skill |
+|------|-------|
+| Navigate codebase | `/skill-shield-file-navigator` |
+| Scan across languages | `/skill-multi-lang-symbol-scanner` |
+| Detect CWE patterns | `/skill-cwe-pattern-detector` |
+| Format a finding | `/skill-finding-formatter` |
+| Generate finding ID | `/skill-finding-id-generator` |
+| Collect evidence | `/skill-evidence-snapshot-collector` |
+| Build attack chain | `/skill-attack-chain-builder` |
+| Deduplicate findings | `/skill-finding-deduplicator` |
+| Full skill registry | See maps digest below or `.GM/skills-map.md` |
+
+The full maps digest (`.GM/agent-skills-maps.txt`) with file ownership matrix,
+execution DAG, pairwise coverage, and all 42 skills is included at the bottom of this prompt.
+
+### TOKEN-SAVING: Use `gitingest` for source code exploration
+When a task requires reading source code, use `gitingest` via Bash to digest
+entire directories into one compact file instead of reading files one-by-one:
+```bash
+gitingest shield-core/src/ --output .GM/task-digest.txt --exclude-pattern "branding/*"
+gitingest python/shield/ --output .GM/task-digest.txt --exclude-pattern "branding/*"
+gitingest c/src/ --output .GM/task-digest.txt --exclude-pattern "branding/*"
+```
+Then read `.GM/task-digest.txt`. ALWAYS exclude `branding/*`.
+
+Full repo digest is pre-built at `.GM/Digest.txt` — read it only when you need
+broad codebase context, not every iteration.
+
+## STEP 1: IDENTIFY NEXT TASK
+
+Parse `RALPH_TASKS.md` and find the next task to execute using this priority:
+1. Any task marked `[R] RESUME` (interrupted last iteration) → resume it
+2. Any task marked `[~] IN-PROGRESS` for >1 iteration → likely stalled, resume it
+3. First `[ ] PENDING` task whose ALL `Depends On` tasks are `[x] DONE`
+4. Among eligible PENDING tasks, pick by: CRITICAL > HIGH > MEDIUM priority
+5. Within same priority, pick Docker (A05) and TEE (A13) tasks first
+
+If NO eligible task exists:
+- If blocked tasks remain → log blocker in RALPH_STATE.md, attempt to unblock
+- If ALL tasks are DONE → proceed to STEP 5 (finalization)
+
+## STEP 2: EXECUTE THE TASK
+
+Update the task status to `[~] IN-PROGRESS` and set `Started: {timestamp}` in RALPH_TASKS.md.
+Update RALPH_STATE.md with current task.
+
+### For AGENT tasks:
+1. Read the agent file: `.claude/agents/{agent-file}.md`
+2. Read `.GM/SHIELD_SECURITY_CONTEXT.md` for recon data on the agent's target files
+3. Follow the agent's Audit Checklist item by item — DO NOT SKIP ITEMS
+4. For EACH file in the agent's ownership (from agent-map.md):
+   a. READ the actual source code — not just the recon summary
+   b. Analyze for every vulnerability class the agent covers
+   c. If you find something suspicious: VERIFY it by reading surrounding code, checking if it's exploitable
+   d. For each confirmed finding, classify:
+      - **VULN** — confirmed exploitable vulnerability
+      - **VERIFIED** — verified as real security issue
+      - **UN-VERIFIED** — looks suspicious but can't confirm from static analysis
+      - **NOT-SURE** — needs manual review or dynamic testing
+      - **NON-VULN** — investigated, determined safe (document WHY)
+5. Use skills listed in the agent file (invoke via skill tool)
+6. Generate finding IDs: `SHIELD-A{##}-{SEQ}` using /skill-finding-id-generator
+7. Format findings using /skill-finding-formatter
+8. Write findings to `findings/agents/A{##}-{agent-name}.md`
+
+### For TEAM tasks:
+1. Read the team file: `.claude/agents/team-{N}-{name}.md`
+2. Read ALL input agent findings from `findings/agents/` that this team consumes
+3. Follow the team's Coordination Flow
+4. Build attack chains using /skill-attack-chain-builder
+5. Look for CROSS-DOMAIN vulnerabilities that no single agent could find
+6. Cross-reference agent findings by SHIELD-A##-### ID — NEVER duplicate
+7. Any NEW cross-domain finding gets a TEAM finding ID: `SHIELD-T{##}-{SEQ}`
+8. Write findings to `findings/teams/T{##}-{team-name}.md`
+
+### For META tasks (setup, checkpoint, dedup, report):
+- Follow the specific instructions in the task description
+- Checkpoint tasks: verify all phase findings are written, count findings, update report
+- Dedup tasks: run /skill-finding-deduplicator across all findings
+- Report tasks: update SECURITY_REPORT.md with latest findings
+
+## STEP 3: UPDATE FINDINGS — IMMEDIATELY
+
+After EACH finding (not after all findings):
+1. Write finding to the agent/team output file
+2. Append finding summary to `findings/SECURITY_REPORT.md` in the correct section
+3. Update the Verification Matrix in the report with the finding's status tag
+4. If finding is CRITICAL or HIGH → also add to the Docker & Confidential Computing section if relevant
+5. Update finding counters in the report header
+
+### Finding Template (MANDATORY format):
+```markdown
+### SHIELD-{SOURCE}-{SEQ}: {Title}
+- **Tag**: VULN | VERIFIED | UN-VERIFIED | NOT-SURE | NON-VULN
+- **Severity**: CRITICAL | HIGH | MEDIUM | LOW | INFO
+- **CWE**: CWE-XXX
+- **Location**: `file/path.ext:line`
+- **Evidence**: {code snippet or output proving the issue}
+- **Impact**: {what an attacker achieves}
+- **Reproduction**: {steps to reproduce / verify}
+- **Fix Complexity**: LOW | MEDIUM | HIGH
+- **Remediation**: {specific fix — but DO NOT implement it}
+- **Verification Notes**: {why this tag — what you checked to confirm/deny}
+```
+
+## STEP 4: COMPLETE THE TASK
+
+1. Mark task as `[x] DONE` in RALPH_TASKS.md
+2. Set `Completed: {timestamp}` and `Findings Count: {N}`
+3. Update RALPH_STATE.md:
+   - Increment `Total Iterations`
+   - Set `Last Iteration: {timestamp}`
+   - Update `Findings Total`
+   - Set `Resume Point` to next eligible task
+   - Update `Current Phase` if phase just completed
+4. If this was the LAST task in a phase:
+   - Log phase completion in RALPH_STATE.md
+   - Run a quick checkpoint: are all phase findings written? Any gaps?
+
+## STEP 5: FINALIZATION (only when ALL tasks are DONE)
+
+If every task in RALPH_TASKS.md is `[x] DONE`:
+1. Run /skill-finding-deduplicator across ALL findings
+2. Run /skill-risk-matrix-generator for final risk matrix
+3. Update SECURITY_REPORT.md:
+   - Write Executive Summary
+   - Write Go/No-Go Recommendation
+   - Update all counters to final numbers
+   - Set Status: COMPLETE
+4. Write `findings/SUMMARY.md` — the Team 12 launch readiness output
+5. Update RALPH_STATE.md: set `Current Phase: COMPLETE`
+6. Log: "RALPH LOOP COMPLETE — ALL TASKS DONE — {total findings} findings across {total tasks} tasks"
+
+## RULES OF ENGAGEMENT
+1. **EVIDENCE OVER OPINION** — every finding requires file:line + code snippet
+2. **CWE MAPPING REQUIRED** — no finding without a CWE ID
+3. **VERIFY BEFORE TAGGING** — read the actual code, don't guess from function names
+4. **CROSS-REFERENCE, NEVER DUPLICATE** — teams reference agent finding IDs
+5. **WRITE AS YOU GO** — don't batch findings, write each immediately
+6. **NO CODE CHANGES** — findings only, zero fixes, zero patches
+7. **DOCKER & TEE FIRST** — when choosing between equal-priority tasks, pick these domains
+8. **COMPLETE > PERFECT** — a finding tagged UN-VERIFIED is better than a finding not reported
+9. **ONE TASK PER ITERATION** — execute exactly one task, update state, exit cleanly
+10. **STATE IS SACRED** — always update RALPH_TASKS.md and RALPH_STATE.md before exiting
+
+## ANTI-PATTERNS TO AVOID
+- Do NOT skip the ORIENT step. Ever. Even if you "remember" from last iteration. You don't. Read the files.
+- Do NOT mark a task DONE without writing at least the output file (even if 0 findings)
+- Do NOT start Phase N+1 tasks before ALL Phase N tasks are DONE
+- Do NOT re-analyze files already covered by a completed agent (teams reference, not re-audit)
+- Do NOT spend an entire iteration on setup/orientation — reserve 80%+ for actual analysis
+
+
+
+================================================
+FILE: SHIELD_SECURITY_CONTEXT.md
+================================================
+# SHIELD SECURITY CONTEXT MAP
+
+**Generated**: 2026-02-28
+**Scope**: Full codebase reconnaissance (Phase 0)
+**Method**: Static analysis of 167+ source files across 12 language implementations
+**Purpose**: Foundation for enterprise security assessment
+
+---
+
+## 1. EXECUTIVE SUMMARY
+
+Shield is a **symmetric-only EXPTIME-secure encryption library** implemented in 12 languages (Rust, Python, JavaScript, Go, C, Java, C#, Swift, Kotlin, Android, iOS, WebAssembly) with a Browser SDK. Architecture is a **single-crate Rust core** (`shield-core`) plus independent reimplementations in each language producing byte-identical ciphertext. The project ships as:
+
+- **CLI tool** (multi-platform binaries via GitHub Releases)
+- **Library packages** (crates.io, PyPI, npm, Go modules, NuGet, CocoaPods, Gradle)
+- **WASM module** (browser-side decryption)
+- **Web framework middleware** (FastAPI, Flask, Django, Express)
+- **Mobile SDKs** (Android Keystore, iOS Keychain/Secure Enclave)
+
+**Deployment model**: Library consumed by applications. No standalone server/service. Docker exists only for development/testing. CI/CD via GitHub Actions publishes to 4 registries (crates.io, PyPI, npm, GitHub Releases).
+
+**Crypto stack**: PBKDF2-SHA256 (100k iterations) → SHA256-CTR stream cipher → HMAC-SHA256 (128-bit truncated). Zero asymmetric cryptography. Zero external crypto dependencies in most languages.
+
+**Audit status**: Internal review only. No external third-party audit completed. Budget allocated ($33-52k) but not executed.
+
+---
+
+## 2. TECHNOLOGY INVENTORY
+
+### Languages & Versions
+
+| SDK | Language | Runtime/SDK | Build System | External Crypto Deps |
+|-----|----------|-------------|--------------|---------------------|
+| shield-core | Rust 2021 | stable/beta | Cargo | `ring` 0.17, `subtle` 2.5, `zeroize` 1.7 |
+| python | Python 3.8-3.12 | CPython | pyproject.toml | **None** (stdlib only) |
+| javascript | JavaScript | Node.js 16-20 | npm | **None** (stdlib `crypto`) |
+| browser | Rust+TypeScript | WASM+Rollup | Cargo+npm | shield-core (WASM) |
+| go | Go 1.24 | stdlib | go mod | `golang.org/x/crypto` v0.47.0 (PBKDF2 only) |
+| c | C (C99) | GCC | Makefile | **None** (inline SHA256/HMAC) |
+| java | Java 11-21 | JDK | Gradle | **None** (javax.crypto) |
+| csharp | C# | .NET 6-8 | dotnet | **None** (System.Security.Cryptography) |
+| swift | Swift 5.7+ | Foundation | SPM | **None** (CommonCrypto) |
+| kotlin | Kotlin 1.9 | JVM 11 | Gradle | **None** (javax.crypto) |
+| android | Kotlin 2.1 | API 23+ | Gradle | `androidx.security:security-crypto:1.1.0-alpha06` |
+| ios | Swift 5.7+ | iOS 13+ | SPM/CocoaPods | **None** (CommonCrypto + Security.framework) |
+
+### Infrastructure
+
+| Component | Technology | Version |
+|-----------|-----------|---------|
+| CI/CD | GitHub Actions | v4 actions |
+| Container | Docker (ubuntu:22.04) | Compose 3.8 |
+| Secret scanning | TruffleHog | @main |
+| Dependency audit | cargo-audit | latest |
+| Coverage | cargo-llvm-cov + pytest-cov | Codecov |
+| Linting | Clippy (-D warnings), cargo fmt | stable |
+| Release | Multi-platform binaries (5 targets) | softprops/action-gh-release |
+
+### Feature Flags (Rust)
+
+| Feature | Adds | Network I/O | Default |
+|---------|------|-------------|---------|
+| `std` | Standard library | No | Yes |
+| `cli` | CLI binary (rpassword, getrandom) | No | Yes |
+| `wasm` | WASM bindings | No | No |
+| `async` | tokio + reqwest | Yes | No |
+| `confidential` | TEE attestation (ciborium, async-trait) | Yes | No |
+| `openapi` | API schema generation (utoipa) | No | No |
+| `fido2` | WebAuthn (webauthn-rs) | No | No |
+| `pgvector` | Postgres vectors (tokio-postgres) | Yes | No |
+
+---
+
+## 3. ARCHITECTURE MAP
+
+### Encryption Flow (All Implementations)
+
+```
+Password + Service
+       ↓
+  salt = SHA256("shield:" + service)
+       ↓
+  master_key = PBKDF2-SHA256(password, salt, 100_000 iterations, 32 bytes)
+       ↓
+  encryption_key = master_key[0:32]
+  mac_key = SHA256(master_key || "mac")
+       ↓
+  nonce = random(16 bytes)
+       ↓
+  [V2] inner = counter(8) || timestamp_ms(8) || pad_len(1) || random_padding(32-128) || plaintext
+       ↓
+  keystream = SHA256-CTR(encryption_key, nonce)   // SHA256(key || nonce || counter++) per block
+  ciphertext = inner XOR keystream
+       ↓
+  mac = HMAC-SHA256(mac_key, nonce || ciphertext)[0:16]
+       ↓
+  output = nonce(16) || ciphertext || mac(16)
+```
+
+### Module Architecture (per implementation)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          SHIELD CORE                                     │
+│  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌─────────────────────┐   │
+│  │  Shield   │  │ StreamCipher│ │ RatchetSession│ │ ShieldChannel      │   │
+│  │ encrypt() │  │ chunk enc  │  │ forward sec│  │ PAKE+Ratchet TLS  │   │
+│  │ decrypt() │  │ per-chunk  │  │ key ratchet│  │ sync + async      │   │
+│  └──────────┘  │ auth       │  └──────────┘  └─────────────────────┘   │
+│                 └───────────┘                                            │
+│  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌─────────────────────┐   │
+│  │  TOTP     │  │ Signatures │  │ Exchange  │  │ Group/Broadcast    │   │
+│  │ RFC 6238  │  │ HMAC+Lamport│ │ PAKE+QR   │  │ Multi-recipient   │   │
+│  │ Recovery  │  │ post-quantum│ │ KeySplit  │  │ Subgroup encrypt  │   │
+│  └──────────┘  └───────────┘  └──────────┘  └─────────────────────┘   │
+│  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌─────────────────────┐   │
+│  │ Identity  │  │ Rotation   │  │ Fingerprint│ │ Password Checker   │   │
+│  │ SSO/tokens│  │ versioned  │  │ device bind│ │ entropy calc      │   │
+│  │ sessions  │  │ zero-down  │  │ HW binding │ │ strength rating   │   │
+│  └──────────┘  └───────────┘  └──────────┘  └─────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     WEB INTEGRATIONS (Python)                            │
+│  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌─────────────────────┐   │
+│  │ FastAPI   │  │ Flask      │  │ Django    │  │ Express (JS)       │   │
+│  │ Middleware│  │ Extension  │  │ Middleware│  │ Middleware          │   │
+│  │ Auth deps │  │ Decorators │  │ Sessions  │  │ Route protection   │   │
+│  └──────────┘  └───────────┘  └──────────┘  └─────────────────────┘   │
+│  ┌──────────┐  ┌───────────┐  ┌──────────┐                            │
+│  │ Browser   │  │ Protection │  │ Cookies   │                            │
+│  │ Bridge    │  │ RateLimiter│  │ Encrypted │                            │
+│  │ Key exch  │  │ TokenBucket│  │ SameSite  │                            │
+│  └──────────┘  └───────────┘  └──────────┘                            │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                 CONFIDENTIAL COMPUTING (Rust + Python)                    │
+│  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌─────────────────────┐   │
+│  │ AWS Nitro │  │ GCP SEV    │  │ Azure MAA │  │ Intel SGX          │   │
+│  │ COSE/PCR  │  │ AMD SEV-SNP│  │ JWT/AKV   │  │ DCAP/Sealed       │   │
+│  │ Vsock     │  │ vTPM       │  │ Sidecar   │  │ Gramine           │   │
+│  └──────────┘  └───────────┘  └──────────┘  └─────────────────────┘   │
+│  TEEKeyManager: Attestation-gated key release with policy enforcement   │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      BROWSER SDK (WASM)                                  │
+│  ShieldBrowser.init(keyEndpoint) → fetch key → store in WASM memory     │
+│  Monkey-patch window.fetch() → detect {encrypted:true,data:"..."} →    │
+│  WASM quick_decrypt() → return plaintext response to application        │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        MOBILE SDKs                                       │
+│  Android: Shield + SecureKeyStore (Keystore/TEE/StrongBox) + Biometric  │
+│  iOS: Shield + SecureKeychain (Keychain/Secure Enclave) + FaceID/Touch  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Trust Boundaries
+
+```
+UNTRUSTED                          TRUST BOUNDARY                    TRUSTED
+─────────────────────────────────┬──────────────────────────────────────────
+User input (password, plaintext) │ → PBKDF2 key derivation         Key material
+Network traffic (ciphertext)     │ → HMAC verification             Decrypted data
+Browser fetch responses          │ → WASM decrypt envelope         Plaintext JSON
+API request bodies               │ → Middleware decrypt            Application data
+Cookie values                    │ → EncryptedCookie decode        Session data
+Token strings                    │ → HMAC verify + JSON parse      Identity claims
+Attestation evidence             │ → Provider verify               TEE measurements
+Hardware fingerprint             │ → OS system calls               Device identity
+```
+
+---
+
+## 4. ATTACK SURFACE CATALOG
+
+### Entry Points
+
+| Entry Point | Type | Languages | Auth Required | Input Vectors |
+|-------------|------|-----------|---------------|---------------|
+| `Shield.encrypt()` | Library API | All 12 | Password/Key | plaintext bytes, password string, service string |
+| `Shield.decrypt()` | Library API | All 12 | Password/Key | ciphertext bytes (nonce+ct+mac) |
+| `quick_encrypt/decrypt()` | Library API | All 12 | Pre-shared key [u8;32] | plaintext/ciphertext bytes |
+| `shield encrypt <file>` | CLI | Rust | Password prompt | file path, password, service, output path |
+| `shield decrypt <file>` | CLI | Rust | Password prompt | file path, password, output path |
+| `shield check <pass>` | CLI | Rust | None | password string (command-line arg) |
+| `shield keygen` | CLI | Rust | None | None |
+| `shield text` | CLI | Rust | Password | text string, password, service |
+| `ShieldMiddleware` | HTTP Middleware | Python (FastAPI/Flask/Django) | Configurable | HTTP request/response bodies |
+| `shieldMiddleware` | HTTP Middleware | JavaScript (Express) | Configurable | HTTP request/response bodies |
+| `shield_protected()` | Decorator | Python | Token/API key | Endpoint-specific |
+| `shield_required()` | Decorator | Python | Encrypted body | Request body |
+| `ShieldTokenAuth` | Dependency | Python (FastAPI) | Bearer token | Authorization header |
+| `ShieldAPIKeyAuth` | Dependency | Python (FastAPI) | API key header | X-API-Key header |
+| `BrowserBridge.generate_client_key()` | HTTP endpoint | Python | Session cookie | session_id, TTL |
+| `ShieldBrowser.init(endpoint)` | Browser API | TypeScript/WASM | same-origin | key endpoint URL |
+| `fetch()` interceptor | Browser hook | TypeScript | Auto (key valid) | All fetch responses |
+| `ShieldChannel` | TCP socket | Rust/Python/JS/Go | PAKE password | Raw TCP stream |
+| `AsyncShieldChannel` | TCP socket | Rust (tokio) | PAKE password | Raw TCP stream |
+| `PAKEExchange` | Protocol | All | Shared password | Contributions (32 bytes) |
+| `IdentityProvider.register()` | Library API | All | None (registration) | user_id, password, display_name |
+| `IdentityProvider.authenticate()` | Library API | All | Password | user_id, password |
+| `IdentityProvider.validate_token()` | Library API | All | Token string | Base64-encoded token |
+| `TOTP.verify()` | Library API | All | Secret | 6-8 digit code |
+| `Fido2Manager` | Library API | Rust | Challenge/Response | WebAuthn attestation |
+| `SecureKeyStore` (Android) | System API | Kotlin | Optional biometric | Key alias |
+| `SecureKeychain` (iOS) | System API | Swift | Optional biometric | Key alias |
+| `AttestationMiddleware` | HTTP Middleware | Python/Rust | TEE attestation | Evidence bytes, PCR values |
+| `collect_fingerprint()` | System API | All | OS access | Platform-specific system calls |
+
+### Input Validation Summary
+
+| Input | Validation | Gap |
+|-------|-----------|-----|
+| Password | `check_password()` entropy calculator (advisory only) | Not enforced on encrypt |
+| Ciphertext | Length check (min 40 bytes), HMAC verification | None identified |
+| Nonce | Fixed 16 bytes, extracted from ciphertext | None |
+| MAC | 16-byte constant-time comparison | None |
+| Pad length (v2) | Range check 32-128 after decryption | CVE-PENDING (see below) |
+| Timestamp (v2) | Range 2020-2100, age check vs max_age_ms | 5s future clock skew |
+| Token strings | Base64 decode + JSON parse + HMAC verify | None identified |
+| File paths (CLI) | Standard OS file I/O | No path traversal protection |
+| Session IDs | String, used as HMAC key derivation input | No format validation |
+| API keys | Encrypted comparison | None identified |
+
+---
+
+## 5. DEPENDENCY MANIFEST
+
+### Rust Core (shield-core/Cargo.toml)
+
+| Dependency | Version | Purpose | Always Loaded |
+|------------|---------|---------|---------------|
+| ring | 0.17 | PBKDF2, HMAC, SHA256, SystemRandom | Yes |
+| zeroize | 1.7 | Secure memory wipe (derive macros) | Yes |
+| subtle | 2.5 | Constant-time comparison | Yes |
+| thiserror | 1.0 | Error enum macros | Yes |
+| serde + serde_json | 1.0 | JSON serialization | Yes |
+| base64 | 0.21 | Base64 encoding | Yes |
+| hex | 0.4 | Hex encoding | Yes |
+| md5 | 0.7 | Hardware fingerprinting hash | Yes |
+| rpassword | 7.3 | CLI password prompt | cli feature |
+| getrandom | 0.2 | System RNG | cli/wasm feature |
+| tokio | 1.0 | Async runtime | async feature |
+| reqwest | 0.11 | HTTP client | async feature |
+| ciborium | 0.2 | CBOR encoding | confidential feature |
+| async-trait | 0.1 | Async trait support | confidential feature |
+| webauthn-rs | 0.4 | FIDO2/WebAuthn | fido2 feature |
+| tokio-postgres | 0.7 | PostgreSQL driver | pgvector feature |
+| utoipa | 4.2 | OpenAPI schemas | openapi feature |
+| wasm-bindgen | 0.2 | WASM JavaScript FFI | wasm feature |
+| js-sys + web-sys | 0.3 | Browser API bindings | wasm feature |
+
+### Python (pyproject.toml)
+
+| Dependency | Version | Purpose |
+|------------|---------|---------|
+| **None** | - | Pure Python, stdlib only |
+| pytest | >= 7.0 | Dev dependency |
+| pytest-cov | >= 4.0 | Dev dependency |
+
+### JavaScript (package.json)
+
+| Dependency | Version | Purpose |
+|------------|---------|---------|
+| **None** | - | Node.js `crypto` module only |
+
+### Go (go.mod)
+
+| Dependency | Version | Purpose |
+|------------|---------|---------|
+| golang.org/x/crypto | v0.47.0 | PBKDF2 (stdlib for everything else) |
+
+### Android (build.gradle.kts)
+
+| Dependency | Version | Purpose |
+|------------|---------|---------|
+| androidx.security:security-crypto | 1.1.0-alpha06 | EncryptedSharedPreferences |
+| androidx.core:core-ktx | 1.12.0 | Kotlin extensions |
+
+### Browser SDK (package.json + Cargo.toml)
+
+| Dependency | Version | Purpose |
+|------------|---------|---------|
+| shield-core | path | Core crypto (Rust→WASM) |
+| wasm-bindgen | 0.2 | JS↔WASM bridge |
+| web-sys | 0.3 | Browser APIs |
+| getrandom | 0.2 (js) | WASM-compatible RNG |
+
+### All Other Languages (C, Java, C#, Swift, Kotlin)
+
+**Zero external dependencies.** All use platform-provided crypto primitives.
+
+---
+
+## 6. SECURITY MECHANISM INVENTORY
+
+### Cryptographic Parameters
+
+| Parameter | Value | Standard |
+|-----------|-------|----------|
+| Key derivation | PBKDF2-SHA256 | RFC 8018 |
+| KDF iterations (core) | 100,000 | OWASP minimum |
+| KDF iterations (PAKE) | 200,000 | Higher for exchange |
+| Key size | 256 bits (32 bytes) | NIST approved |
+| Encryption | SHA256-CTR (custom) | SHA256 = FIPS 180-4 |
+| Authentication | HMAC-SHA256 | RFC 2104 |
+| MAC output | 128 bits (truncated) | Adequate for auth |
+| Nonce | 128 bits (random per message) | Probabilistic uniqueness |
+| TOTP | HMAC-SHA1 (RFC required) | RFC 6238 |
+| Lamport signatures | 256-bit chains | Post-quantum safe |
+
+### Memory Protection
+
+| Language | Mechanism | Automatic |
+|----------|-----------|-----------|
+| Rust | `Zeroize + ZeroizeOnDrop` on Shield, RatchetSession, SymmetricSignature, TOTP | Yes |
+| Rust | `#![forbid(unsafe_code)]` in lib.rs | Compile-time |
+| Python | No explicit zeroization (GC dependent) | No |
+| JavaScript | No explicit zeroization (V8 GC) | No |
+| Go | No explicit zeroization (Go GC) | No |
+| C | `memset(0)` caller responsibility | Manual |
+| Java | `Arrays.fill(key, (byte)0)` caller responsibility | Manual |
+| Android | `Arrays.fill(0)` + Keystore hardware | Partial |
+| iOS | Keychain + Secure Enclave hardware | Partial |
+
+### Timing Attack Protection
+
+| Implementation | MAC Comparison Method |
+|----------------|---------------------|
+| Rust | `subtle::ConstantTimeEq` (16 sites) |
+| Python | `hmac.compare_digest()` |
+| JavaScript | `crypto.timingSafeEqual()` |
+| Go | `crypto/subtle.ConstantTimeCompare()` |
+| C | Loop-based XOR accumulation (custom) |
+| Java | Loop-based OR accumulation (custom) |
+| C# | Loop-based XOR accumulation (custom) |
+| Swift | Bitwise OR accumulation (custom) |
+| Kotlin | Same as Java |
+
+### Rate Limiting (Python integrations)
+
+| Mechanism | Location | Details |
+|-----------|----------|---------|
+| RateLimiter | integrations/protection.py | Per-user/IP, encrypted counters |
+| TokenBucket | integrations/protection.py | Configurable refill rate |
+| APIProtector | integrations/protection.py | Combined: rate limit + IP filter + audit log |
+
+### Authentication Mechanisms
+
+| Mechanism | Location | Details |
+|-----------|----------|---------|
+| ShieldTokenAuth | Python FastAPI | Bearer token, HMAC-verified, TTL-enforced |
+| ShieldAPIKeyAuth | Python FastAPI | Header-based, encrypted key comparison |
+| FlaskAPIKeyAuth | Python Flask | Same as above for Flask |
+| IdentityProvider | All languages | PBKDF2-derived user keys, session tokens |
+| TOTP | All languages | RFC 6238, ±1 interval window |
+| RecoveryCodes | All languages | 10 one-time codes, 8 hex chars each |
+| FIDO2/WebAuthn | Rust (fido2 feature) | Challenge-response, encrypted credential store |
+| BrowserBridge | Python + Browser SDK | Session-derived keys, TTL-based |
+| EncryptedCookie | Python | Shield-encrypted, HttpOnly, SameSite=Strict |
+| SecureCORS | Python | HMAC-signed origin verification |
+| TEE Attestation | Rust + Python | Hardware-based identity verification |
+
+### Replay Protection
+
+| Layer | Mechanism | Default Window |
+|-------|-----------|---------------|
+| V2 messages | Timestamp validation | 60 seconds (configurable) |
+| V2 messages | Future clock skew rejection | 5 seconds |
+| RatchetSession | Monotonic counter | Strict sequence |
+| ShieldChannel | Counter per message | Strict sequence |
+| Tokens | Expiration timestamp | 3600 seconds |
+| Sessions | TTL + refresh | Configurable |
+| Recovery codes | One-time use flag | Single use |
+
+---
+
+## 7. RISK HOTSPOTS
+
+### Known Vulnerabilities
+
+| ID | Severity | Description | Affected | Status |
+|----|----------|-------------|----------|--------|
+| CVE-PENDING | MEDIUM | Missing padding length validation in v2 decryption. `pad_len` extracted from byte 16 of decrypted data without bounds checking (32-128). | Python, JS, Go, Java, C (all 5 checked implementations) | Fix merged (validation added), CVE not yet published |
+| C-MAC-01 | LOW | C implementation uses custom loop-based MAC comparison instead of `memcmp_s()` or `CRYPTO_memcmp()`. Correct constant-time pattern but not using a vetted library function. | C only | Needs verification |
+| C-TIMESTAMP-01 | LOW | C uses `time(NULL)` with 1-second precision (multiplied by 1000) instead of millisecond-precision clock. Reduces replay protection granularity. | C only | Needs `clock_gettime()` |
+
+### Memory Safety Concerns
+
+| Concern | Affected | Details |
+|---------|----------|---------|
+| No key zeroization | Python, JavaScript, Go, Java, C# | Relies on garbage collection; keys may persist in memory |
+| C buffer management | C | Caller must `free()` all returned buffers; `strcat()` used in fingerprint.c (lines 47, 54, 56) without bounds |
+| WASM `.unwrap()` | Rust WASM bindings | 4 instances of `.unwrap()` on `try_into()` (wasm.rs:67, 104, 115, 226); should return JsError |
+
+### Missing Tests
+
+| Area | Status |
+|------|--------|
+| Padding validation fuzzing | Missing across all languages |
+| Boundary cases (pad_len = 0, 31, 129, 255) | Missing |
+| Malformed ciphertext fuzzing | Missing |
+| Memory leak / zeroization verification | Missing |
+| Concurrent access / thread safety | Not tested |
+
+### Code Quality Flags
+
+| Pattern | Count | Locations |
+|---------|-------|-----------|
+| TODO/FIXME/HACK | 1 | release.yml:141 "TODO: Re-add build-wasm when ring WASM support is fixed" |
+| CVE-PENDING comments | 5 | core.py:242, shield.js:209, shield.go:282, Shield.java:246, shield.c:500 |
+| MD5 usage | 1 | shield-core fingerprint.rs:59, c/shield_fingerprint.c:65 (for device fingerprinting hash, not crypto) |
+| HMAC-SHA1 | 1 | shield-core totp.rs:69 (RFC 6238 required, ring warns "LEGACY_USE_ONLY") |
+
+### Code-Level Crypto Observations (from direct source reads)
+
+**Rust `shield.rs`:**
+- Line 83: `NonZeroU32::new(PBKDF2_ITERATIONS).unwrap()` — safe since constant is 100,000, but unwrap in crypto path
+- Line 197-199: Timestamp from `SystemTime::now()` uses `.unwrap_or_default()` — if system clock fails, timestamp = 0 (would fall outside v2 range, treated as v1)
+- Line 204: `pad_len` calculated as `(random_byte % 97) + 32` — modulo bias: 256 % 97 = 62, so values 32-93 are slightly more probable than 94-128. Not a security-critical bias but imperfect uniformity.
+- Line 224: HMAC key is the raw encryption key — same key used for both encryption and authentication. Not separated. (Python identical at line 197, JS identical at line 159)
+- Line 280: Constant-time comparison via `subtle::ConstantTimeEq` — correct
+- Line 295: `try_into().unwrap()` on timestamp bytes — safe since slice is exactly 8 bytes from bounds check at line 293
+- Line 300: `pad_len` as `usize` — no bounds validation in Rust impl (unlike Python/JS/Go/C/Java which have CVE-PENDING fix). **Rust is the ONLY implementation missing the padding validation.**
+- Line 381-383: `.key()` method exposes the derived key — available in ALL implementations for "testing/debugging"
+
+**Python `core.py`:**
+- Line 175-176: Counter incremented per encryption (Rust does NOT increment — always 0). Counter mismatch across implementations.
+- Line 183: Same modulo bias as Rust for padding length
+- Line 197: HMAC uses `self._key` directly as both enc and mac key (no key separation)
+- Line 242-244: Padding bounds check present (CVE-PENDING fix applied)
+
+**JavaScript `shield.js`:**
+- Line 39: `Buffer.concat()` in tight loop for keystream — O(n²) allocation pattern, potential DoS vector on very large messages
+- Line 66-68: `options.salt` — if caller passes truthy non-Buffer value, salt derivation is bypassed (type confusion)
+- Line 131: `BigInt()` conversion for counter — potential issues on older Node.js versions
+- Line 189: `crypto.timingSafeEqual()` — correct constant-time comparison
+- Line 207-212: Padding bounds check present
+- Line 343-348: `generateKeystream` is EXPORTED in module.exports — exposes internal crypto primitive to consumers
+
+**C `shield.c`:**
+- Line 249-256: `shield_secure_compare()` — uses `volatile uint8_t result` with XOR accumulation. Correct constant-time pattern.
+- Line 258-263: `shield_secure_wipe()` — uses `volatile` pointer write. Standard pattern but compiler may still optimize away.
+- Line 265-288: Random from `/dev/urandom` — single `read()` call returns error on partial read (line 283 checks `n != len`). Robust but does not retry on EINTR/partial; production hardening would loop until full read.
+- Line 294: Keystream buffer is stack-allocated `uint8_t block[32 + NONCE_SIZE + 4]` — fixed size, safe
+- Line 468: `shield_secure_compare()` used for MAC — correct
+- Line 498: `pad_len = decrypted[16]` is `uint8_t` — naturally bounded to 0-255
+- Line 500-505: Bounds check on pad_len 32-128 present
+- Line 517: `time(NULL) * 1000` — 1-second precision timestamps, reduces replay protection to 1-second granularity
+
+**C `shield_fingerprint.c`:**
+- Lines 40-56: `strcat()` into 512-byte buffer with 256-byte inputs — technically safe (256+1+256 < 512) but no bounds checking. If `get_motherboard_serial()` or `get_cpu_id()` ever returned > 255 chars, buffer overflow.
+- Lines 76, 107: `_popen("wmic ...")` — hardcoded commands, no injection risk from user input
+- Line 65: `md5_hash()` for combined fingerprint — MD5 is cryptographically broken, but here only used as a hash-to-string formatter
+
+**WASM `wasm.rs`:**
+- Lines 67, 104, 115: `.unwrap()` after length check + `try_into()` — safe but should use `.map_err()` for defensive coding in WASM boundary
+
+**Rust `exchange.rs`:**
+- Line 26: `NonZeroU32::new(iters).unwrap()` — would panic if `iterations = Some(0)` passed
+- Line 44-57: `PAKEExchange::combine()` sorts contributions then hashes — deterministic regardless of order, good
+- Line 98: `serde_json::to_string(&data).unwrap()` — safe since data is simple struct, but unwrap in public API
+
+**Key Separation Concern (ALL implementations):**
+The SAME 32-byte key is used for both XOR encryption (keystream generation) AND HMAC authentication. Best practice is to derive separate encryption and MAC keys from the master key. The PROTOCOL.md (line 39) actually specifies `mac_key = SHA256(master_key || "mac")` but NO implementation follows this — they all use the raw PBKDF2 output directly for both operations.
+
+### Architecture Observations
+
+| Observation | Detail |
+|------------|--------|
+| No version field in wire format | V1/V2 auto-detected by timestamp heuristic (2020-2100 range). False positive probability: ~0.0000024% |
+| Password strength advisory only | `check_password()` warns but doesn't prevent weak passwords |
+| Service as salt | Predictable salt from service name (by design for cross-platform determinism) |
+| MAC truncation | 128-bit truncated HMAC-SHA256 (adequate but reduced from 256-bit) |
+| CLI password in args | `shield check <password>` exposes password in shell history / process listing |
+| In-memory session state | BrowserBridge, RateLimiter, IdentityProvider store state in memory only (no persistence) |
+
+---
+
+## 8. EXTERNAL INTEGRATIONS
+
+### Cloud Services (Confidential Computing, optional features)
+
+| Provider | Integration | Authentication | Data Flow |
+|----------|------------|----------------|-----------|
+| AWS Nitro Enclaves | NitroAttestationProvider | COSE signatures, PCR validation | Attestation evidence → verify → key release |
+| AWS KMS | TEEKeyManager | IAM roles | Encrypted key material |
+| AWS CloudHSM | Example: PyKCS11 | HSM PIN (env var) | PKCS#11 key operations |
+| GCP Confidential VMs | SEVAttestationProvider | vTPM attestation | SEV-SNP evidence → verify |
+| GCP Secret Manager | ConfidentialSpaceProvider | Service account | Secret retrieval |
+| Azure MAA | MAAAttestationProvider | JWT validation | Attestation token → verify |
+| Azure Key Vault | Secure Key Release | Managed identity | Key release policy |
+| Intel SGX | SGXAttestationProvider | DCAP quotes | MRENCLAVE/MRSIGNER |
+| HashiCorp Vault | Example: hvac client | Token/role | Transit encrypt/decrypt |
+
+### Package Registries (Publishing)
+
+| Registry | Package | Auth Secret |
+|----------|---------|-------------|
+| crates.io | shield-core | `CARGO_REGISTRY_TOKEN` |
+| PyPI | shield-crypto | `PYPI_API_TOKEN` |
+| npm | @guard8/shield | `NPM_TOKEN` |
+| npm | @guard8/shield-browser | `NPM_TOKEN` |
+| GitHub Releases | CLI binaries | `GITHUB_TOKEN` (auto) |
+| Codecov | Coverage reports | `CODECOV_TOKEN` |
+
+### Third-Party Actions (CI/CD)
+
+| Action | Version | Purpose |
+|--------|---------|---------|
+| actions/checkout | v4 | Repository checkout |
+| dtolnay/rust-toolchain | stable | Rust installation |
+| actions/setup-python | v5 | Python matrix |
+| actions/setup-node | v4 | Node.js matrix |
+| actions/setup-go | v5 | Go matrix |
+| actions/setup-java | v4 | Java/Android |
+| actions/cache | v4 | Build caching |
+| gradle/actions/setup-gradle | v3 | Gradle wrapper |
+| android-actions/setup-android | v3 | Android SDK |
+| swift-actions/setup-swift | v2 | Swift toolchain |
+| actions/setup-dotnet | v4 | .NET SDK |
+| trufflesecurity/trufflehog | @main | Secret scanning |
+| codecov/codecov-action | v4 | Coverage upload |
+| softprops/action-gh-release | v1 | GitHub Release creation |
+
+---
+
+## 9. UNKNOWNS & GAPS
+
+### Cannot Determine from Static Analysis
+
+| Unknown | Why | Impact |
+|---------|-----|--------|
+| Actual deployment environment | Library is consumed by downstream apps; no Shield-specific servers | Cannot assess runtime configuration |
+| Key storage in production | Depends on integrator implementation | Critical - weak storage defeats crypto |
+| TLS enforcement | Application-level responsibility | Ciphertext visible but secure; keys in transit may not be |
+| Password strength in practice | Advisory only, no enforcement | Weak passwords directly reduce security |
+| Clock synchronization | Replay protection depends on synchronized clocks | Affects v2 replay window |
+| Ring crate internal safety | `ring` uses `unsafe` internally | Audited by Mozilla/Google but not verified here |
+| C constant-time correctness | Custom loop-based comparison | Not formally verified |
+| WASM memory isolation | Browser sandbox model | WASM linear memory may be inspectable by JS |
+| Side-channel resistance (hardware) | Cannot test timing/power/EM from code | Depends on deployment hardware |
+| Thread safety of in-memory state | BrowserBridge sessions, RateLimiter counters | Race conditions possible under load |
+
+### Not Tested / Not Verified
+
+| Gap | Detail |
+|-----|--------|
+| No external security audit | Budget allocated ($33-52k), auditor candidates listed, not executed |
+| No fuzzing suite | Mentioned in audit doc, not implemented |
+| No formal verification | Listed as "Planned" in SECURITY.md |
+| No SAST tooling beyond Clippy | No Semgrep, CodeQL, or Bandit in CI |
+| No DAST testing | No runtime security testing |
+| No dependency pinning verification | Go sum verified, others use lockfiles but no integrity checks in CI |
+| No supply chain verification | No SLSA, SBOM, or Sigstore integration |
+| WASM binary integrity | No checksum verification of WASM module before loading |
+| Browser SDK CSP compatibility | No Content-Security-Policy testing documented |
+| Mobile SDK obfuscation | No ProGuard/R8 config for Android, no code stripping for iOS release |
+
+### Documentation vs Implementation Discrepancies
+
+| Claim | Reality |
+|-------|---------|
+| "Uses `ring` crate (same as Firefox, 1Password)" | True for Rust core; other languages use platform primitives |
+| "Zero dependencies" | True for most languages; Rust has ring+subtle+zeroize+serde+base64+hex+md5 |
+| "10 language implementations" | Actually 12 (Rust, Python, JS, Go, C, Java, C#, Swift, Kotlin, Android, iOS, WASM) |
+| "95 tests (Rust)" | Actual count appears to be 234 across the Rust codebase |
+| "Constant-time code (we do)" | True for Rust (subtle crate), Python (hmac.compare_digest), JS (timingSafeEqual). C/Java/C#/Swift use custom implementations |
+| "Keys are wiped after use" | True for Rust (Zeroize). Not implemented in Python, JS, Go, Java, C# |
+| SECURITY.md: "Formal verification: Planned" | Not started |
+| SECURITY.md: "External audit: Planned" | Not started |
+
+---
+
+*This document captures the state of the Shield codebase as of 2026-02-28. All findings are based on static analysis of source code. No runtime testing, penetration testing, or dynamic analysis was performed. This is a fact-finding document; no remediation recommendations are included.*
+
+
+
+================================================
+FILE: skills-map.md
+================================================
+# Shield Security Skills Map
+
+> 42 security assessment skills organized by layer and category
+> Skills are in `~/.claude/skills/{skill-name}/SKILL.md`
+
+## Complete Skills Registry
+
+| # | Skill Name | Category | Layer | Used By |
+|---|-----------|----------|-------|---------|
+| 1 | skill-pbkdf2-param-auditor | Crypto Validation | L2 | A1, A2, T8 |
+| 2 | skill-function-diff-comparator | Code Analysis | L2 | A2, A14, T8 |
+| 3 | skill-cwe-pattern-detector | Basic Scanning | L1 | A3, A4, A16, A11 |
+| 4 | skill-error-message-cataloger | Code Analysis | L2 | A11, A6, T6 |
+| 5 | skill-multi-lang-symbol-scanner | Basic Scanning | L1 | A1-A4, A14, A15, T8, T9 |
+| 6 | skill-key-accessor-mapper | Basic Scanning | L1 | A3, A9, T9 |
+| 7 | skill-constant-time-verifier | Code Analysis | L2 | A1, A2, A8, A11 |
+| 8 | skill-cross-lang-constant-audit | Code Analysis | L2 | A1, A2, T8 |
+| 9 | skill-ctr-mode-verifier | Crypto Validation | L2 | A1, A2, A14 |
+| 10 | skill-mac-verification-auditor | Crypto Validation | L2 | A1, A2, A8 |
+| 11 | skill-nonce-generation-auditor | Crypto Validation | L2 | A1, A2 |
+| 12 | skill-zeroization-verifier | Crypto Validation | L2 | A3, T9 |
+| 13 | skill-protocol-handshake-tracer | Protocol | L2 | A8, T10 |
+| 14 | skill-dockerfile-security-auditor | Infrastructure | L2 | A5, T7, T11 |
+| 15 | skill-github-actions-auditor | Infrastructure | L2 | A10, T7 |
+| 16 | skill-shell-script-injection-checker | Infrastructure | L2 | A5, A10, A16 |
+| 17 | skill-dependency-audit-scanner | Basic Scanning | L1 | A10, T7 |
+| 18 | skill-cookie-security-auditor | Application | L2 | A6, A7 |
+| 19 | skill-route-exclusion-bypass-checker | Application | L2 | A6 |
+| 20 | skill-middleware-error-propagation-tracer | Application | L2 | A6, A11, T6 |
+| 21 | skill-token-lifecycle-auditor | Application | L2 | A7, T10 |
+| 22 | skill-totp-rfc-compliance-checker | Application | L2 | A7, A15 |
+| 23 | skill-rate-limiter-bypass-analyzer | Application | L2 | A7, T6 |
+| 24 | skill-android-keystore-auditor | Platform | L2 | A12, T9 |
+| 25 | skill-ios-keychain-auditor | Platform | L2 | A12, T9 |
+| 26 | skill-tee-attestation-auditor | Platform | L2 | A13, T9 |
+| 27 | skill-fingerprint-security-assessor | Platform | L2 | A16, A3 |
+| 28 | skill-wasm-memory-isolation-checker | Platform | L2 | A9, A3, T9 |
+| 29 | skill-crypto-oracle-feasibility-assessor | Cross-Domain | L3 | T6 |
+| 30 | skill-interop-exploit-matrix-builder | Cross-Domain | L3 | T8 |
+| 31 | skill-key-exposure-surface-mapper | Cross-Domain | L3 | T9, A3 |
+| 32 | skill-attack-chain-builder | Cross-Domain | L3 | T6-T12 |
+| 33 | skill-config-drift-detector | Cross-Domain | L3 | T11 |
+| 34 | skill-shield-file-navigator | Foundation | L0 | All agents, All teams |
+| 35 | skill-finding-deduplicator | Reporting | L3 | T12 |
+| 36 | skill-risk-matrix-generator | Reporting | L3 | T12 |
+| 37 | skill-finding-formatter | Foundation | L0 | All agents, All teams |
+| 38 | skill-remediation-roadmap-builder | Reporting | L3 | T12 |
+| 39 | skill-finding-id-generator | Foundation | L0 | All agents, All teams |
+| 40 | skill-test-vector-generator | Utility | L2 | A2, A4, T8 |
+| 41 | skill-evidence-snapshot-collector | Foundation | L0 | All agents, All teams |
+| 42 | skill-audit-progress-tracker | Reporting | L3 | T12, Orchestrator |
+
+## Layer Architecture
+
+```
+L3: Cross-Domain & Reporting  (#29-33, #35-36, #38, #42)
+    depends on
+L2: Domain-Specific Skills     (#1-2, #4, #7-16, #18-28, #40)
+    depends on
+L1: Basic Scanning             (#3, #5, #6, #17)
+    depends on
+L0: Foundation                 (#34, #37, #39, #41)
+```
+
+| Layer | Count | Purpose |
+|-------|-------|---------|
+| L0 | 4 | Navigation, formatting, IDs, evidence -- used by everything |
+| L1 | 4 | Pattern scanning, symbol search, dependency audit |
+| L2 | 26 | Domain-specific auditors and validators |
+| L3 | 8 | Cross-domain analysis, reporting, consolidation |
+
+## Category Groupings
+
+| Category | Skills | Count |
+|----------|--------|-------|
+| Foundation | #34, #37, #39, #41 | 4 |
+| Basic Scanning | #3, #5, #6, #17 | 4 |
+| Crypto Validation | #1, #9, #10, #11, #12 | 5 |
+| Code Analysis | #2, #4, #7, #8 | 4 |
+| Infrastructure | #14, #15, #16 | 3 |
+| Application | #18, #19, #20, #21, #22, #23 | 6 |
+| Platform | #24, #25, #26, #27, #28 | 5 |
+| Protocol | #13 | 1 |
+| Cross-Domain | #29, #30, #31, #32, #33 | 5 |
+| Reporting | #35, #36, #38, #42 | 4 |
+| Utility | #40 | 1 |
+
+## Agent-to-Skill Coverage Matrix
+
+| Agent | Primary Skills | Supporting Skills |
+|-------|---------------|-------------------|
+| A1 (Crypto Primitives) | #1, #9, #10, #11 | #5, #7, #8, #34 |
+| A2 (Cross-Language) | #2, #8, #30 | #1, #5, #9, #10, #11, #40 |
+| A3 (Memory Safety) | #3, #12, #27 | #5, #6, #31 |
+| A4 (Input Validation) | #3, #40 | #4, #5 |
+| A5 (Docker/Container) | #14 | #16 |
+| A6 (Web Integration) | #18, #19, #20 | #4 |
+| A7 (Auth & Session) | #21, #22, #23 | #18 |
+| A8 (Transport Protocol) | #13 | #7, #10 |
+| A9 (Browser & WASM) | #28 | #6 |
+| A10 (CI/CD Supply Chain) | #15, #17 | #16 |
+| A11 (Error Disclosure) | #4, #20 | #3, #7 |
+| A12 (Mobile Platform) | #24, #25 | -- |
+| A13 (Confidential TEE) | #26 | -- |
+| A14 (Streaming/Group) | #9 | #2, #5 |
+| A15 (Signatures/2FA) | #22 | #5 |
+| A16 (Fingerprint) | #27 | #3, #16 |
+
+## Team-to-Skill Coverage Matrix
+
+| Team | Primary Skills | Supporting Skills |
+|------|---------------|-------------------|
+| T6 (Crypto Oracle) | #29 | #4, #20, #23, #32 |
+| T7 (Supply Chain) | #14, #15, #17 | #32 |
+| T8 (Cross-Lang Interop) | #30, #40 | #1, #2, #5, #8 |
+| T9 (Key Lifecycle) | #31 | #6, #12, #24, #25, #26, #28 |
+| T10 (Auth Transport MITM) | #13, #21 | #32 |
+| T11 (Config Drift) | #33 | #14, #32 |
+| T12 (Final Report) | #35, #36, #38, #42 | #32 |
+
+## Dependency Map
+
+```
+skill-shield-file-navigator (#34) <-- used by all skills for navigation
+skill-finding-formatter (#37) <-- used by all skills for output
+skill-finding-id-generator (#39) <-- used by all skills for finding IDs
+skill-evidence-snapshot-collector (#41) <-- used by all skills for evidence
+
+skill-cwe-pattern-detector (#3) <-- used by #27 (fingerprint), #12 (zeroization)
+skill-multi-lang-symbol-scanner (#5) <-- used by #2, #7, #8, #9, #10, #11
+skill-key-accessor-mapper (#6) <-- used by #28 (WASM), #31 (key exposure)
+
+skill-finding-deduplicator (#35) <-- feeds into #36, #38
+skill-risk-matrix-generator (#36) <-- feeds into #38
+skill-remediation-roadmap-builder (#38) <-- final output
+skill-audit-progress-tracker (#42) <-- monitors all agents
+```
+
+## Quick Reference: Skill by Trigger
+
+| When You Need To... | Use Skill |
+|---------------------|-----------|
+| Navigate Shield codebase | #34 skill-shield-file-navigator |
+| Scan for a symbol across languages | #5 skill-multi-lang-symbol-scanner |
+| Find CWE patterns in code | #3 skill-cwe-pattern-detector |
+| Audit PBKDF2 parameters | #1 skill-pbkdf2-param-auditor |
+| Check CTR mode implementation | #9 skill-ctr-mode-verifier |
+| Verify MAC implementation | #10 skill-mac-verification-auditor |
+| Check nonce/random generation | #11 skill-nonce-generation-auditor |
+| Verify key zeroization | #12 skill-zeroization-verifier |
+| Check constant-time operations | #7 skill-constant-time-verifier |
+| Compare cross-language constants | #8 skill-cross-lang-constant-audit |
+| Diff functions across languages | #2 skill-function-diff-comparator |
+| Catalog error messages | #4 skill-error-message-cataloger |
+| Trace error propagation | #20 skill-middleware-error-propagation-tracer |
+| Audit Dockerfiles | #14 skill-dockerfile-security-auditor |
+| Audit GitHub Actions | #15 skill-github-actions-auditor |
+| Check shell script injection | #16 skill-shell-script-injection-checker |
+| Audit dependencies | #17 skill-dependency-audit-scanner |
+| Audit cookie security | #18 skill-cookie-security-auditor |
+| Check route bypass | #19 skill-route-exclusion-bypass-checker |
+| Audit token lifecycle | #21 skill-token-lifecycle-auditor |
+| Check TOTP compliance | #22 skill-totp-rfc-compliance-checker |
+| Analyze rate limiter bypass | #23 skill-rate-limiter-bypass-analyzer |
+| Audit Android Keystore | #24 skill-android-keystore-auditor |
+| Audit iOS Keychain | #25 skill-ios-keychain-auditor |
+| Audit TEE attestation | #26 skill-tee-attestation-auditor |
+| Assess fingerprint security | #27 skill-fingerprint-security-assessor |
+| Check WASM memory isolation | #28 skill-wasm-memory-isolation-checker |
+| Trace protocol handshake | #13 skill-protocol-handshake-tracer |
+| Assess crypto oracle risk | #29 skill-crypto-oracle-feasibility-assessor |
+| Build interop exploit matrix | #30 skill-interop-exploit-matrix-builder |
+| Map key exposure surface | #31 skill-key-exposure-surface-mapper |
+| Build attack chains | #32 skill-attack-chain-builder |
+| Detect config drift | #33 skill-config-drift-detector |
+| Generate test vectors | #40 skill-test-vector-generator |
+| Deduplicate findings | #35 skill-finding-deduplicator |
+| Generate risk matrix | #36 skill-risk-matrix-generator |
+| Build remediation roadmap | #38 skill-remediation-roadmap-builder |
+| Track audit progress | #42 skill-audit-progress-tracker |
+| Find key accessors | #6 skill-key-accessor-mapper |
+| Format findings | #37 skill-finding-formatter |
+| Generate finding IDs | #39 skill-finding-id-generator |
+| Collect evidence snapshots | #41 skill-evidence-snapshot-collector |
+
+
