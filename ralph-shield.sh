@@ -345,18 +345,16 @@ generate_digests() {
 }
 
 build_prompt() {
-  # Keep prompt SMALL to avoid "Prompt is too long" errors.
-  # Pipe: iteration prompt + state (tiny) + maps (small)
-  # Reference: RALPH_TASKS.md, SECURITY_REPORT.md, Digest.txt (Claude reads them)
+  # Pipe all context inline. Maps digest trimmed to 27KB (was 90KB).
+  # Total: ~170KB (prompt 13K + state 14K + tasks 62K + report 53K + maps 27K)
 
   cat <<'PROMPT_HEADER'
 You are executing one iteration of the Ralph Wiggum autonomous security assessment loop.
 
-INLINE BELOW: iteration instructions, RALPH_STATE.md, and agent/team/skill maps.
-
-YOUR FIRST TOOL CALLS (before anything else):
-1. Read RALPH_TASKS.md — find next task
-2. Read findings/SECURITY_REPORT.md — know current findings
+CONTEXT PROVIDED BELOW (do NOT re-read these files):
+- Iteration instructions
+- RALPH_STATE.md, RALPH_TASKS.md, SECURITY_REPORT.md (current state)
+- Agent/team/skill maps
 
 AVAILABLE ON DISK (read when needed):
 - .GM/SHIELD_SECURITY_CONTEXT.md — full recon data, risk hotspots
@@ -375,6 +373,14 @@ PROMPT_HEADER
   echo ""
   echo "=== RALPH_STATE.md ==="
   cat "$STATE_FILE"
+
+  echo ""
+  echo "=== RALPH_TASKS.md ==="
+  cat "$TASKS_FILE"
+
+  echo ""
+  echo "=== findings/SECURITY_REPORT.md ==="
+  cat "$REPORT_FILE"
 
   echo ""
   echo "=== AGENT / TEAM / SKILL MAPS ==="
