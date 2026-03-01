@@ -45,7 +45,7 @@ ITERATION_LOG_DIR=".GM/iterations"
 
 # Defaults
 MAX_ITERATIONS=0          # 0 = no limit
-MODEL="opus"
+MODEL="claude-opus-4-6[1m]"  # 1M context — "opus" alias only gives 200K
 DRY_RUN=false
 COOLDOWN_INTERVAL=300     # 5 minutes between limit-hit retries
 MAX_CRASH_RETRIES=3       # retries per iteration before moving on
