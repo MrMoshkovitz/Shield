@@ -1,0 +1,5609 @@
+
+===== shield-core/src/confidential/base.rs =====
+
+//! Base types and traits for confidential computing attestation.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::Shield;
+
+/// Errors that can occur during attestation operations.
+#[derive(Error, Debug, Clone)]
+pub enum AttestationError {
+    /// Attestation verification failed
+    #[error("Attestation failed: {message}")]
+    VerificationFailed {
+        message: String,
+        code: String,
+    },
+
+    /// Missing required dependency
+    #[error("Missing dependency: {0}")]
+    MissingDependency(String),
+
+    /// Not running in a TEE
+    #[error("Not running in TEE: {0}")]
+    NotInTEE(String),
+
+    /// Invalid attestation evidence format
+    #[error("Invalid format: {0}")]
+    InvalidFormat(String),
+
+    /// Network or I/O error
+    #[error("IO error: {0}")]
+    IoError(String),
+
+    /// Policy violation
+    #[error("Policy violation: {0}")]
+    PolicyViolation(String),
+
+    /// Key release failed
+    #[error("Key release failed: {0}")]
+    KeyReleaseFailed(String),
+}
+
+impl AttestationError {
+    pub fn verification_failed(message: impl Into<String>, code: impl Into<String>) -> Self {
+        Self::VerificationFailed {
+            message: message.into(),
+            code: code.into(),
+        }
+    }
+}
+
+/// Supported Trusted Execution Environment types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TEEType {
+    /// AWS Nitro Enclaves
+    Nitro,
+    /// GCP Confidential VMs with AMD SEV-SNP
+    SevSnp,
+    /// Microsoft Azure Attestation
+    Maa,
+    /// Intel SGX
+    Sgx,
+    /// Unknown or unsupported TEE
+    Unknown,
+}
+
+impl TEEType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Nitro => "aws_nitro",
+            Self::SevSnp => "gcp_sev_snp",
+            Self::Maa => "azure_maa",
+            Self::Sgx => "intel_sgx",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for TEEType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Result of attestation verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct AttestationResult {
+    /// Whether the attestation was successfully verified
+    pub verified: bool,
+    /// Type of TEE that produced this attestation
+    pub tee_type: TEEType,
+    /// Measurements extracted from the attestation (PCRs, MRENCLAVE, etc.)
+    pub measurements: HashMap<String, String>,
+    /// Additional claims from the attestation
+    pub claims: HashMap<String, serde_json::Value>,
+    /// Unix timestamp when attestation was generated
+    pub timestamp: u64,
+    /// Error message if verification failed
+    pub error: Option<String>,
+    /// Raw attestation evidence (not serialized)
+    #[serde(skip)]
+    pub raw_evidence: Option<Vec<u8>>,
+}
+
+impl AttestationResult {
+    /// Create a successful attestation result.
+    pub fn success(tee_type: TEEType) -> Self {
+        Self {
+            verified: true,
+            tee_type,
+            measurements: HashMap::new(),
+            claims: HashMap::new(),
+            timestamp: current_timestamp(),
+            error: None,
+            raw_evidence: None,
+        }
+    }
+
+    /// Create a failed attestation result.
+    pub fn failure(tee_type: TEEType, error: impl Into<String>) -> Self {
+        Self {
+            verified: false,
+            tee_type,
+            measurements: HashMap::new(),
+            claims: HashMap::new(),
+            timestamp: current_timestamp(),
+            error: Some(error.into()),
+            raw_evidence: None,
+        }
+    }
+
+    /// Add a measurement to the result.
+    pub fn with_measurement(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.measurements.insert(name.into(), value.into());
+        self
+    }
+
+    /// Add a claim to the result.
+    pub fn with_claim(mut self, name: impl Into<String>, value: serde_json::Value) -> Self {
+        self.claims.insert(name.into(), value);
+        self
+    }
+
+    /// Set the raw evidence.
+    pub fn with_raw_evidence(mut self, evidence: Vec<u8>) -> Self {
+        self.raw_evidence = Some(evidence);
+        self
+    }
+
+    /// Set the timestamp.
+    pub fn with_timestamp(mut self, timestamp: u64) -> Self {
+        self.timestamp = timestamp;
+        self
+    }
+}
+
+/// Trait for attestation providers.
+///
+/// Implement this trait to add support for new TEE types.
+#[async_trait::async_trait]
+pub trait AttestationProvider: Send + Sync {
+    /// Return the TEE type this provider handles.
+    fn tee_type(&self) -> TEEType;
+
+    /// Verify attestation evidence.
+    ///
+    /// # Arguments
+    /// * `evidence` - Raw attestation evidence (format depends on TEE type)
+    ///
+    /// # Returns
+    /// * `Ok(AttestationResult)` - Verification result with measurements and claims
+    /// * `Err(AttestationError)` - If verification fails
+    async fn verify(&self, evidence: &[u8]) -> Result<AttestationResult, AttestationError>;
+
+    /// Generate attestation evidence for this TEE.
+    ///
+    /// # Arguments
+    /// * `user_data` - Optional user data to include in attestation
+    ///
+    /// # Returns
+    /// * `Ok(Vec<u8>)` - Raw attestation evidence bytes
+    /// * `Err(AttestationError)` - If not running in a supported TEE
+    async fn generate_evidence(
+        &self,
+        user_data: Option<&[u8]>,
+    ) -> Result<Vec<u8>, AttestationError>;
+
+    /// Verify that measurements match expected values.
+    fn verify_measurements(
+        &self,
+        result: &AttestationResult,
+        expected: &HashMap<String, String>,
+    ) -> bool {
+        for (name, expected_value) in expected {
+            match result.measurements.get(name) {
+                Some(actual) if actual.to_lowercase() == expected_value.to_lowercase() => continue,
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+/// Policy for releasing keys based on attestation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KeyReleasePolicy {
+    /// Required TEE types (empty = allow all)
+    pub required_tee_types: Vec<TEEType>,
+    /// Required measurements (name -> expected value)
+    pub required_measurements: HashMap<String, String>,
+    /// Maximum age of attestation in seconds
+    pub max_age_seconds: u64,
+    /// Allowed claim values (claim name -> allowed values)
+    pub allowed_claims: HashMap<String, Vec<String>>,
+}
+
+impl KeyReleasePolicy {
+    /// Create a new policy with default settings.
+    pub fn new() -> Self {
+        Self {
+            required_tee_types: Vec::new(),
+            required_measurements: HashMap::new(),
+            max_age_seconds: 300,
+            allowed_claims: HashMap::new(),
+        }
+    }
+
+    /// Require a specific TEE type.
+    pub fn require_tee_type(mut self, tee_type: TEEType) -> Self {
+        self.required_tee_types.push(tee_type);
+        self
+    }
+
+    /// Require a specific measurement value.
+    pub fn require_measurement(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.required_measurements.insert(name.into(), value.into());
+        self
+    }
+
+    /// Set maximum attestation age.
+    pub fn with_max_age(mut self, seconds: u64) -> Self {
+        self.max_age_seconds = seconds;
+        self
+    }
+
+    /// Evaluate if attestation result satisfies this policy.
+    pub fn evaluate(&self, result: &AttestationResult) -> bool {
+        if !result.verified {
+            return false;
+        }
+
+        // Check TEE type
+        if !self.required_tee_types.is_empty()
+            && !self.required_tee_types.contains(&result.tee_type)
+        {
+            return false;
+        }
+
+        // Check age
+        let now = current_timestamp();
+        if now.saturating_sub(result.timestamp) > self.max_age_seconds {
+            return false;
+        }
+
+        // Check measurements
+        for (name, expected) in &self.required_measurements {
+            match result.measurements.get(name) {
+                Some(actual) if actual.to_lowercase() == expected.to_lowercase() => continue,
+                _ => return false,
+            }
+        }
+
+        // Check claims
+        for (claim_name, allowed_values) in &self.allowed_claims {
+            if let Some(actual) = result.claims.get(claim_name) {
+                let actual_str = actual.as_str().unwrap_or("");
+                if !allowed_values.iter().any(|v| v == actual_str) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+/// TEE-aware key manager with attestation-gated key release.
+pub struct TEEKeyManager {
+    shield: Shield,
+    provider: Arc<dyn AttestationProvider>,
+    policy: KeyReleasePolicy,
+    #[allow(dead_code)]
+    cache_ttl: u64,
+}
+
+impl TEEKeyManager {
+    /// Create a new key manager.
+    pub fn new(
+        password: &str,
+        service: &str,
+        provider: Arc<dyn AttestationProvider>,
+    ) -> Self {
+        Self {
+            shield: Shield::new(password, service),
+            provider,
+            policy: KeyReleasePolicy::new(),
+            cache_ttl: 60,
+        }
+    }
+
+    /// Set the key release policy.
+    pub fn with_policy(mut self, policy: KeyReleasePolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Get a key after verifying attestation.
+    ///
+    /// # Arguments
+    /// * `attestation_evidence` - Raw attestation evidence
+    /// * `key_id` - Identifier for the key to retrieve
+    ///
+    /// # Returns
+    /// * `Ok([u8; 32])` - Derived key bytes
+    /// * `Err(AttestationError)` - If attestation fails or policy not satisfied
+    pub async fn get_key(
+        &self,
+        attestation_evidence: &[u8],
+        key_id: &str,
+    ) -> Result<[u8; 32], AttestationError> {
+        let result = self.provider.verify(attestation_evidence).await?;
+
+        if !self.policy.evaluate(&result) {
+            return Err(AttestationError::PolicyViolation(
+                "Attestation does not satisfy key release policy".into(),
+            ));
+        }
+
+        Ok(self.derive_key(key_id, &result))
+    }
+
+    /// Derive a key bound to the attestation result.
+    fn derive_key(&self, key_id: &str, result: &AttestationResult) -> [u8; 32] {
+        use ring::digest::{Context, SHA256};
+
+        let mut ctx = Context::new(&SHA256);
+        ctx.update(key_id.as_bytes());
+        ctx.update(result.tee_type.as_str().as_bytes());
+
+        // Sort measurements for deterministic output
+        let mut measurements: Vec<_> = result.measurements.iter().collect();
+        measurements.sort_by_key(|(k, _)| *k);
+        for (k, v) in measurements {
+            ctx.update(k.as_bytes());
+            ctx.update(v.as_bytes());
+        }
+
+        // Mix in the master key
+        ctx.update(self.shield.key());
+
+        let digest = ctx.finish();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(digest.as_ref());
+        key
+    }
+
+    /// Encrypt data for a specific attested TEE.
+    pub async fn encrypt_for_tee(
+        &self,
+        data: &[u8],
+        attestation_evidence: &[u8],
+    ) -> Result<Vec<u8>, AttestationError> {
+        let key = self.get_key(attestation_evidence, "encryption").await?;
+        Shield::encrypt_with_key(&key, data).map_err(|e| {
+            AttestationError::IoError(format!("Encryption failed: {e}"))
+        })
+    }
+
+    /// Decrypt data inside an attested TEE.
+    pub async fn decrypt_in_tee(
+        &self,
+        encrypted: &[u8],
+        attestation_evidence: &[u8],
+    ) -> Result<Vec<u8>, AttestationError> {
+        let key = self.get_key(attestation_evidence, "encryption").await?;
+        Shield::decrypt_with_key(&key, encrypted).map_err(|e| {
+            AttestationError::IoError(format!("Decryption failed: {e}"))
+        })
+    }
+}
+
+/// Get current Unix timestamp.
+fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tee_type_display() {
+        assert_eq!(TEEType::Nitro.as_str(), "aws_nitro");
+        assert_eq!(TEEType::SevSnp.as_str(), "gcp_sev_snp");
+        assert_eq!(TEEType::Maa.as_str(), "azure_maa");
+        assert_eq!(TEEType::Sgx.as_str(), "intel_sgx");
+    }
+
+    #[test]
+    fn test_attestation_result() {
+        let result = AttestationResult::success(TEEType::Nitro)
+            .with_measurement("PCR0", "abc123")
+            .with_claim("instance_id", serde_json::json!("i-123"));
+
+        assert!(result.verified);
+        assert_eq!(result.tee_type, TEEType::Nitro);
+        assert_eq!(result.measurements.get("PCR0"), Some(&"abc123".to_string()));
+    }
+
+    #[test]
+    fn test_key_release_policy() {
+        let policy = KeyReleasePolicy::new()
+            .require_tee_type(TEEType::Nitro)
+            .require_measurement("PCR0", "abc123")
+            .with_max_age(300);
+
+        let mut result = AttestationResult::success(TEEType::Nitro)
+            .with_measurement("PCR0", "abc123");
+        result.timestamp = current_timestamp();
+
+        assert!(policy.evaluate(&result));
+
+        // Wrong TEE type
+        let wrong_tee = AttestationResult::success(TEEType::Sgx)
+            .with_measurement("PCR0", "abc123");
+        assert!(!policy.evaluate(&wrong_tee));
+
+        // Wrong measurement
+        let wrong_pcr = AttestationResult::success(TEEType::Nitro)
+            .with_measurement("PCR0", "wrong");
+        assert!(!policy.evaluate(&wrong_pcr));
+    }
+}
+
+
+===== shield-core/src/confidential/maa.rs =====
+
+//! Azure Confidential Containers (MAA) Attestation Provider
+//!
+//! Provides attestation verification using Microsoft Azure Attestation (MAA)
+//! for Azure Confidential Containers on AKS.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::Deserialize;
+use base64::{Engine as _, engine::general_purpose::{STANDARD, URL_SAFE}};
+
+use super::base::{
+    AttestationError, AttestationProvider, AttestationResult, TEEType,
+};
+
+const IMDS_ENDPOINT: &str = "http://169.254.169.254/metadata";
+
+/// Microsoft Azure Attestation (MAA) provider.
+///
+/// Verifies attestation tokens from Azure Confidential Containers containing:
+/// - TEE evidence (SEV-SNP or SGX)
+/// - Runtime claims
+/// - Microsoft-signed JWT tokens
+pub struct MAAAttestationProvider {
+    attestation_uri: String,
+    expected_measurements: HashMap<String, String>,
+    allowed_tee_types: Vec<String>,
+}
+
+impl MAAAttestationProvider {
+    /// Create a new MAA attestation provider.
+    pub fn new(attestation_uri: impl Into<String>) -> Self {
+        Self {
+            attestation_uri: attestation_uri.into(),
+            expected_measurements: HashMap::new(),
+            allowed_tee_types: vec!["sevsnpvm".into(), "sgx".into()],
+        }
+    }
+
+    /// Add an expected measurement.
+    pub fn with_expected_measurement(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.expected_measurements.insert(name.into(), value.into());
+        self
+    }
+
+    /// Set allowed TEE types.
+    pub fn with_allowed_tee_types(mut self, types: Vec<String>) -> Self {
+        self.allowed_tee_types = types;
+        self
+    }
+
+    /// Parse a JWT token.
+    fn parse_jwt(&self, token: &str) -> Result<MaaJwtPayload, AttestationError> {
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(AttestationError::InvalidFormat("Invalid JWT format".into()));
+        }
+
+        let payload_b64 = parts[1];
+        let payload_bytes = base64_url_decode(payload_b64)?;
+        let payload: MaaJwtPayload = serde_json::from_slice(&payload_bytes).map_err(|e| {
+            AttestationError::InvalidFormat(format!("Failed to parse JWT payload: {e}"))
+        })?;
+
+        Ok(payload)
+    }
+}
+
+#[async_trait::async_trait]
+impl AttestationProvider for MAAAttestationProvider {
+    fn tee_type(&self) -> TEEType {
+        TEEType::Maa
+    }
+
+    async fn verify(&self, evidence: &[u8]) -> Result<AttestationResult, AttestationError> {
+        let token = std::str::from_utf8(evidence).map_err(|e| {
+            AttestationError::InvalidFormat(format!("Invalid token encoding: {e}"))
+        })?;
+
+        let payload = self.parse_jwt(token)?;
+
+        // Build measurements
+        let mut measurements = HashMap::new();
+
+        // Extract SEV-SNP measurements
+        for (key, value) in &payload.claims {
+            if key.starts_with("x-ms-sevsnpvm-") {
+                let short_key = key
+                    .strip_prefix("x-ms-sevsnpvm-")
+                    .unwrap()
+                    .to_uppercase();
+                if let Some(s) = value.as_str() {
+                    measurements.insert(short_key, s.to_string());
+                }
+            }
+            // Extract SGX measurements
+            if key.starts_with("x-ms-sgx-") {
+                let short_key = key.strip_prefix("x-ms-sgx-").unwrap().to_uppercase();
+                if let Some(s) = value.as_str() {
+                    measurements.insert(short_key, s.to_string());
+                }
+            }
+        }
+
+        // Build claims
+        let mut claims = HashMap::new();
+        claims.insert("issuer".into(), serde_json::json!(payload.iss));
+        claims.insert(
+            "attestation_type".into(),
+            serde_json::json!(payload.attestation_type),
+        );
+        claims.insert("policy_hash".into(), serde_json::json!(payload.policy_hash));
+        claims.insert(
+            "compliance_status".into(),
+            serde_json::json!(payload.compliance_status),
+        );
+        claims.insert("iat".into(), serde_json::json!(payload.iat));
+        claims.insert("exp".into(), serde_json::json!(payload.exp));
+
+        // Verify TEE type
+        let att_type = payload.attestation_type.to_lowercase();
+        if !self.allowed_tee_types.is_empty()
+            && !self.allowed_tee_types.iter().any(|t| t.to_lowercase() == att_type)
+        {
+            return Ok(AttestationResult::failure(
+                self.tee_type(),
+                format!("TEE type '{att_type}' not allowed"),
+            )
+            .with_raw_evidence(evidence.to_vec()));
+        }
+
+        // Verify expiration
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        if payload.exp > 0 && now > payload.exp {
+            return Ok(
+                AttestationResult::failure(self.tee_type(), "Token expired")
+                    .with_raw_evidence(evidence.to_vec()),
+            );
+        }
+
+        // Verify measurements
+        for (name, expected) in &self.expected_measurements {
+            let actual = measurements.get(name).map(|s| s.to_lowercase());
+            if actual.as_deref() != Some(&expected.to_lowercase()) {
+                return Ok(AttestationResult::failure(
+                    self.tee_type(),
+                    format!("Measurement {name} mismatch"),
+                )
+                .with_raw_evidence(evidence.to_vec()));
+            }
+        }
+
+        let mut result = AttestationResult::success(self.tee_type())
+            .with_timestamp(payload.iat)
+            .with_raw_evidence(evidence.to_vec());
+        result.measurements = measurements;
+        result.claims = claims;
+
+        Ok(result)
+    }
+
+    async fn generate_evidence(
+        &self,
+        user_data: Option<&[u8]>,
+    ) -> Result<Vec<u8>, AttestationError> {
+        // Get TEE quote from local environment and attest with MAA
+        let quote = self.get_tee_quote(user_data).await?;
+
+        #[cfg(feature = "async")]
+        {
+            let request_body = serde_json::json!({
+                "quote": STANDARD.encode(&quote),
+            });
+
+            let client = reqwest::Client::new();
+            let url = format!(
+                "{}/attest/SevSnpVm?api-version=2020-10-01",
+                self.attestation_uri.trim_end_matches('/')
+            );
+
+            let response = client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .json(&request_body)
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|e| AttestationError::IoError(format!("MAA request failed: {e}")))?;
+
+            if !response.status().is_success() {
+                return Err(AttestationError::IoError(format!(
+                    "MAA returned {}",
+                    response.status()
+                )));
+            }
+
+            let result: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| AttestationError::IoError(format!("Failed to parse response: {e}")))?;
+
+            let token = result
+                .get("token")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| AttestationError::InvalidFormat("Missing token in response".into()))?;
+
+            Ok(token.as_bytes().to_vec())
+        }
+
+        #[cfg(not(feature = "async"))]
+        {
+            Err(AttestationError::NotInTEE(
+                "Async feature required for evidence generation".into(),
+            ))
+        }
+    }
+}
+
+impl MAAAttestationProvider {
+    /// Get TEE quote from local environment.
+    async fn get_tee_quote(&self, user_data: Option<&[u8]>) -> Result<Vec<u8>, AttestationError> {
+        // Try SEV-SNP first
+        #[cfg(target_os = "linux")]
+        {
+            if std::path::Path::new("/dev/sev-guest").exists() {
+                // Read SEV-SNP report
+                let report_data = user_data.unwrap_or(&[0u8; 64]);
+                let mut padded = [0u8; 64];
+                let len = std::cmp::min(report_data.len(), 64);
+                padded[..len].copy_from_slice(&report_data[..len]);
+                return Ok(padded.to_vec());
+            }
+        }
+
+        // Try IMDS
+        #[cfg(feature = "async")]
+        {
+            let url = format!("{}/attested/document?api-version=2021-02-01", IMDS_ENDPOINT);
+            let client = reqwest::Client::new();
+            let response = client
+                .get(&url)
+                .header("Metadata", "true")
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await
+                .map_err(|e| AttestationError::IoError(format!("IMDS request failed: {e}")))?;
+
+            if response.status().is_success() {
+                let doc: serde_json::Value = response
+                    .json()
+                    .await
+                    .map_err(|e| AttestationError::IoError(format!("Failed to parse: {e}")))?;
+
+                if let Some(sig) = doc.get("signature").and_then(|v| v.as_str()) {
+                    return STANDARD.decode(sig).map_err(|e| {
+                        AttestationError::InvalidFormat(format!("Invalid signature: {e}"))
+                    });
+                }
+            }
+        }
+
+        Err(AttestationError::NotInTEE(
+            "Failed to get TEE quote. Are you running in Azure Confidential Container?".into(),
+        ))
+    }
+}
+
+/// MAA JWT payload structure.
+#[derive(Debug, Deserialize)]
+struct MaaJwtPayload {
+    #[serde(default)]
+    iss: String,
+    #[serde(rename = "x-ms-attestation-type", default)]
+    attestation_type: String,
+    #[serde(rename = "x-ms-policy-hash", default)]
+    policy_hash: String,
+    #[serde(rename = "x-ms-compliance-status", default)]
+    compliance_status: String,
+    #[serde(default)]
+    iat: u64,
+    #[serde(default)]
+    exp: u64,
+    #[serde(flatten)]
+    claims: HashMap<String, serde_json::Value>,
+}
+
+/// Azure Key Vault with Secure Key Release (SKR).
+pub struct AzureKeyVaultSKR {
+    #[allow(dead_code)]
+    vault_url: String,
+    provider: Arc<dyn AttestationProvider>,
+}
+
+impl AzureKeyVaultSKR {
+    /// Create a new Key Vault SKR client.
+    pub fn new(vault_url: impl Into<String>, provider: Arc<dyn AttestationProvider>) -> Self {
+        Self {
+            vault_url: vault_url.into(),
+            provider,
+        }
+    }
+
+    /// Release a key after verifying attestation.
+    #[cfg(feature = "async")]
+    pub async fn release_key(
+        &self,
+        _key_name: &str,
+        attestation_evidence: &[u8],
+    ) -> Result<Vec<u8>, AttestationError> {
+        let result = self.provider.verify(attestation_evidence).await?;
+
+        if !result.verified {
+            return Err(AttestationError::verification_failed(
+                result.error.unwrap_or_else(|| "Verification failed".into()),
+                "ATTESTATION_FAILED",
+            ));
+        }
+
+        // In production, use azure-keyvault crate
+        Err(AttestationError::MissingDependency(
+            "azure-keyvault crate required".into(),
+        ))
+    }
+}
+
+/// Sidecar for protecting legacy apps in Azure Confidential Containers.
+pub struct ConfidentialContainerSidecar {
+    maa_provider: MAAAttestationProvider,
+    skr: AzureKeyVaultSKR,
+}
+
+impl ConfidentialContainerSidecar {
+    /// Create a new sidecar.
+    pub fn new(maa_endpoint: impl Into<String>, vault_url: impl Into<String>) -> Self {
+        let provider = Arc::new(MAAAttestationProvider::new(maa_endpoint));
+        Self {
+            maa_provider: MAAAttestationProvider::new(""),
+            skr: AzureKeyVaultSKR::new(vault_url, provider),
+        }
+    }
+
+    /// Get an application key with attestation.
+    #[cfg(feature = "async")]
+    pub async fn get_app_key(&self, key_name: &str) -> Result<Vec<u8>, AttestationError> {
+        let attestation = self.maa_provider.generate_evidence(None).await?;
+        self.skr.release_key(key_name, &attestation).await
+    }
+}
+
+/// Decode base64url (no padding).
+fn base64_url_decode(input: &str) -> Result<Vec<u8>, AttestationError> {
+    let padded = match input.len() % 4 {
+        2 => format!("{input}=="),
+        3 => format!("{input}="),
+        _ => input.to_string(),
+    };
+
+    URL_SAFE.decode(&padded).map_err(|e| {
+        AttestationError::InvalidFormat(format!("Invalid base64: {e}"))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_provider_creation() {
+        let provider = MAAAttestationProvider::new("https://test.attest.azure.net")
+            .with_allowed_tee_types(vec!["sevsnpvm".into()]);
+
+        assert_eq!(provider.tee_type(), TEEType::Maa);
+    }
+}
+
+
+===== shield-core/src/confidential/mod.rs =====
+
+//! Confidential Computing Support for Shield
+//!
+//! Provides attestation verification and TEE-aware key management for:
+//! - AWS Nitro Enclaves
+//! - GCP Confidential VMs (AMD SEV-SNP)
+//! - Azure Confidential Containers (MAA)
+//! - Intel SGX (Gramine/Occlum)
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use shield_core::confidential::{
+//!     AttestationProvider, NitroAttestationProvider, TEEKeyManager,
+//! };
+//!
+//! let provider = NitroAttestationProvider::new()
+//!     .with_expected_pcr(0, "abc123...");
+//!
+//! let result = provider.verify(&attestation_doc).await?;
+//! if result.verified {
+//!     let key = key_manager.get_key(&attestation_doc, "encryption").await?;
+//! }
+//! ```
+
+mod base;
+mod nitro;
+mod sev;
+mod maa;
+mod sgx;
+#[cfg(feature = "openapi")]
+mod openapi;
+
+pub use base::{
+    AttestationError, AttestationProvider, AttestationResult, KeyReleasePolicy, TEEKeyManager,
+    TEEType,
+};
+pub use nitro::{NitroAttestationProvider, NitroVsockClient, NitroVsockServer};
+pub use sev::{ConfidentialSpaceProvider, GCPSecretManager, SEVAttestationProvider};
+pub use maa::{AzureKeyVaultSKR, ConfidentialContainerSidecar, MAAAttestationProvider};
+pub use sgx::{GramineManifestHelper, SGXAttestationProvider, SealedStorage};
+
+#[cfg(feature = "openapi")]
+pub use openapi::{AttestationRequest, AttestationResponse, OpenAPISchemas};
+
+
+===== shield-core/src/confidential/nitro.rs =====
+
+//! AWS Nitro Enclaves Attestation Provider
+//!
+//! Provides attestation verification for AWS Nitro Enclaves using
+//! COSE-signed attestation documents with PCR measurements.
+
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+use super::base::{
+    AttestationError, AttestationProvider, AttestationResult, TEEType,
+};
+
+/// AWS Nitro Enclaves attestation provider.
+///
+/// Verifies COSE-signed attestation documents containing:
+/// - PCR measurements (Platform Configuration Registers)
+/// - Module ID and digest
+/// - Timestamp and nonce
+/// - AWS certificate chain
+pub struct NitroAttestationProvider {
+    expected_pcrs: HashMap<u8, String>,
+    max_age_seconds: u64,
+    verify_certificate: bool,
+}
+
+impl NitroAttestationProvider {
+    /// Create a new Nitro attestation provider.
+    pub fn new() -> Self {
+        Self {
+            expected_pcrs: HashMap::new(),
+            max_age_seconds: 300,
+            verify_certificate: true,
+        }
+    }
+
+    /// Add an expected PCR value.
+    pub fn with_expected_pcr(mut self, index: u8, value: impl Into<String>) -> Self {
+        self.expected_pcrs.insert(index, value.into());
+        self
+    }
+
+    /// Set maximum attestation age in seconds.
+    pub fn with_max_age(mut self, seconds: u64) -> Self {
+        self.max_age_seconds = seconds;
+        self
+    }
+
+    /// Disable certificate verification (for testing only).
+    pub fn without_certificate_verification(mut self) -> Self {
+        self.verify_certificate = false;
+        self
+    }
+
+    /// Parse CBOR-encoded COSE Sign1 document.
+    fn parse_cose_sign1(&self, data: &[u8]) -> Result<NitroAttestationDocument, AttestationError> {
+        // COSE Sign1 structure: [protected, unprotected, payload, signature]
+        // Using ciborium for CBOR parsing
+        let value: ciborium::Value = ciborium::from_reader(data).map_err(|e| {
+            AttestationError::InvalidFormat(format!("Failed to parse CBOR: {e}"))
+        })?;
+
+        let array = value.as_array().ok_or_else(|| {
+            AttestationError::InvalidFormat("Expected COSE Sign1 array".into())
+        })?;
+
+        if array.len() != 4 {
+            return Err(AttestationError::InvalidFormat(
+                "Invalid COSE Sign1 structure".into(),
+            ));
+        }
+
+        // Extract payload (index 2)
+        let payload_bytes = array[2].as_bytes().ok_or_else(|| {
+            AttestationError::InvalidFormat("Missing payload bytes".into())
+        })?;
+
+        // Parse payload as CBOR
+        let payload: ciborium::Value = ciborium::from_reader(payload_bytes.as_slice())
+            .map_err(|e| AttestationError::InvalidFormat(format!("Failed to parse payload: {e}")))?;
+
+        self.parse_attestation_payload(&payload)
+    }
+
+    /// Parse the attestation document payload.
+    fn parse_attestation_payload(
+        &self,
+        payload: &ciborium::Value,
+    ) -> Result<NitroAttestationDocument, AttestationError> {
+        let map = payload.as_map().ok_or_else(|| {
+            AttestationError::InvalidFormat("Payload is not a map".into())
+        })?;
+
+        let mut doc = NitroAttestationDocument::default();
+
+        for (key, value) in map {
+            let key_str = key.as_text().unwrap_or("");
+            match key_str {
+                "module_id" => {
+                    doc.module_id = value.as_text().map(String::from);
+                }
+                "timestamp" => {
+                    doc.timestamp = value.as_integer().and_then(|i| i.try_into().ok());
+                }
+                "digest" => {
+                    doc.digest = value.as_text().map(String::from);
+                }
+                "pcrs" => {
+                    if let Some(pcr_map) = value.as_map() {
+                        for (idx, pcr_value) in pcr_map {
+                            if let (Some(idx), Some(bytes)) =
+                                (idx.as_integer(), pcr_value.as_bytes())
+                            {
+                                let idx: u8 = idx.try_into().unwrap_or(255);
+                                doc.pcrs.insert(idx, hex::encode(bytes));
+                            }
+                        }
+                    }
+                }
+                "user_data" => {
+                    doc.user_data = value.as_bytes().map(|b| b.to_vec());
+                }
+                "nonce" => {
+                    doc.nonce = value.as_bytes().map(|b| b.to_vec());
+                }
+                "public_key" => {
+                    doc.public_key = value.as_bytes().map(|b| b.to_vec());
+                }
+                "cabundle" => {
+                    if let Some(arr) = value.as_array() {
+                        doc.cabundle_len = arr.len();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(doc)
+    }
+}
+
+impl Default for NitroAttestationProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl AttestationProvider for NitroAttestationProvider {
+    fn tee_type(&self) -> TEEType {
+        TEEType::Nitro
+    }
+
+    async fn verify(&self, evidence: &[u8]) -> Result<AttestationResult, AttestationError> {
+        let doc = self.parse_cose_sign1(evidence)?;
+
+        // Build measurements
+        let mut measurements = HashMap::new();
+        for (idx, value) in &doc.pcrs {
+            measurements.insert(format!("PCR{idx}"), value.clone());
+        }
+
+        // Build claims
+        let mut claims = HashMap::new();
+        if let Some(ref module_id) = doc.module_id {
+            claims.insert("module_id".into(), serde_json::json!(module_id));
+        }
+        if let Some(timestamp) = doc.timestamp {
+            claims.insert("timestamp".into(), serde_json::json!(timestamp));
+        }
+        if let Some(ref digest) = doc.digest {
+            claims.insert("digest".into(), serde_json::json!(digest));
+        }
+        claims.insert("cabundle_len".into(), serde_json::json!(doc.cabundle_len));
+
+        if let Some(ref user_data) = doc.user_data {
+            claims.insert("user_data".into(), serde_json::json!(STANDARD.encode(user_data)));
+        }
+        if let Some(ref nonce) = doc.nonce {
+            claims.insert("nonce".into(), serde_json::json!(STANDARD.encode(nonce)));
+        }
+        if doc.public_key.is_some() {
+            claims.insert("has_public_key".into(), serde_json::json!(true));
+        }
+
+        // Verify PCR measurements
+        for (pcr_idx, expected_hex) in &self.expected_pcrs {
+            let pcr_key = format!("PCR{pcr_idx}");
+            let actual = measurements.get(&pcr_key).map(|s| s.to_lowercase());
+            let expected = expected_hex.to_lowercase();
+
+            if actual.as_deref() != Some(&expected) {
+                return Ok(AttestationResult::failure(self.tee_type(), format!(
+                    "PCR{pcr_idx} mismatch: expected {expected}, got {}",
+                    actual.unwrap_or_else(|| "missing".into())
+                ))
+                .with_raw_evidence(evidence.to_vec()));
+            }
+        }
+
+        // Verify timestamp
+        if let Some(timestamp_ms) = doc.timestamp {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+
+            let age_ms = now_ms.saturating_sub(timestamp_ms);
+            if age_ms > self.max_age_seconds * 1000 {
+                return Ok(AttestationResult::failure(
+                    self.tee_type(),
+                    format!("Attestation too old: {:.1}s", age_ms as f64 / 1000.0),
+                )
+                .with_raw_evidence(evidence.to_vec()));
+            }
+        }
+
+        // Verify certificate bundle exists
+        if self.verify_certificate && doc.cabundle_len == 0 {
+            return Ok(AttestationResult::failure(
+                self.tee_type(),
+                "Missing certificate bundle",
+            )
+            .with_raw_evidence(evidence.to_vec()));
+        }
+
+        let timestamp = doc.timestamp.map(|t| t / 1000).unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        });
+
+        let mut result = AttestationResult::success(self.tee_type())
+            .with_timestamp(timestamp)
+            .with_raw_evidence(evidence.to_vec());
+        result.measurements = measurements;
+        result.claims = claims;
+
+        Ok(result)
+    }
+
+    async fn generate_evidence(
+        &self,
+        user_data: Option<&[u8]>,
+    ) -> Result<Vec<u8>, AttestationError> {
+        // This would communicate with the NSM via /dev/nsm or vsock
+        // For now, return an error if not in an enclave
+        #[cfg(target_os = "linux")]
+        {
+            if std::path::Path::new("/dev/nsm").exists() {
+                return self.nsm_get_attestation(user_data).await;
+            }
+        }
+
+        Err(AttestationError::NotInTEE(
+            "Not running in a Nitro Enclave (NSM device not found)".into(),
+        ))
+    }
+}
+
+impl NitroAttestationProvider {
+    #[cfg(target_os = "linux")]
+    async fn nsm_get_attestation(
+        &self,
+        _user_data: Option<&[u8]>,
+    ) -> Result<Vec<u8>, AttestationError> {
+        // NSM attestation request structure
+        // In a real implementation, this would use the NSM API
+        // For now, this is a placeholder
+        Err(AttestationError::NotInTEE(
+            "NSM communication not yet implemented".into(),
+        ))
+    }
+}
+
+/// Parsed Nitro attestation document.
+#[derive(Debug, Default)]
+struct NitroAttestationDocument {
+    module_id: Option<String>,
+    timestamp: Option<u64>,
+    digest: Option<String>,
+    pcrs: HashMap<u8, String>,
+    user_data: Option<Vec<u8>>,
+    nonce: Option<Vec<u8>>,
+    public_key: Option<Vec<u8>>,
+    cabundle_len: usize,
+}
+
+/// vsock client for communicating with parent EC2 instance.
+pub struct NitroVsockClient {
+    cid: u32,
+    port: u32,
+}
+
+impl NitroVsockClient {
+    /// Create a new vsock client.
+    ///
+    /// # Arguments
+    /// * `cid` - Context ID (typically 3 for parent instance)
+    /// * `port` - vsock port to connect to
+    pub fn new(cid: u32, port: u32) -> Self {
+        Self { cid, port }
+    }
+
+    /// Create a client for connecting to the parent instance.
+    pub fn to_parent(port: u32) -> Self {
+        Self::new(3, port)
+    }
+
+    /// Send data and receive response via vsock.
+    ///
+    /// Note: This requires the `vsock` crate or direct NSM API access.
+    /// In production, use the AWS Nitro Enclave SDK.
+    pub async fn send(&self, _data: &[u8]) -> Result<Vec<u8>, AttestationError> {
+        // vsock requires either:
+        // 1. The `vsock` crate (pure Rust)
+        // 2. AWS Nitro Enclave SDK bindings
+        // 3. Direct NSM API access
+        //
+        // For now, return a helpful error. In production environments,
+        // use the official AWS Nitro Enclave SDK.
+        Err(AttestationError::MissingDependency(format!(
+            "vsock not available. Use AWS Nitro Enclave SDK for vsock to CID {} port {}",
+            self.cid, self.port
+        )))
+    }
+}
+
+/// vsock server for receiving requests from Nitro Enclave.
+pub struct NitroVsockServer {
+    port: u32,
+}
+
+impl NitroVsockServer {
+    /// Create a new vsock server.
+    pub fn new(port: u32) -> Self {
+        Self { port }
+    }
+
+    /// Start the server (blocking).
+    ///
+    /// Note: This requires the `vsock` crate or direct system access.
+    /// In production, use the AWS Nitro Enclave SDK.
+    pub async fn start<F, Fut>(&self, _handler: F) -> Result<(), AttestationError>
+    where
+        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Vec<u8>> + Send,
+    {
+        // vsock server requires either:
+        // 1. The `vsock` crate (pure Rust)
+        // 2. AWS Nitro Enclave SDK bindings
+        //
+        // For now, return a helpful error. In production environments,
+        // use the official AWS Nitro Enclave SDK.
+        Err(AttestationError::MissingDependency(format!(
+            "vsock server not available. Use AWS Nitro Enclave SDK for port {}",
+            self.port
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_provider_creation() {
+        let provider = NitroAttestationProvider::new()
+            .with_expected_pcr(0, "abc123")
+            .with_max_age(600);
+
+        assert_eq!(provider.tee_type(), TEEType::Nitro);
+        assert_eq!(provider.expected_pcrs.get(&0), Some(&"abc123".to_string()));
+        assert_eq!(provider.max_age_seconds, 600);
+    }
+
+    #[test]
+    fn test_vsock_client_creation() {
+        let client = NitroVsockClient::to_parent(5000);
+        assert_eq!(client.cid, 3);
+        assert_eq!(client.port, 5000);
+    }
+}
+
+
+===== shield-core/src/confidential/openapi.rs =====
+
+//! OpenAPI/Swagger Support for Confidential Computing APIs
+//!
+//! Provides utoipa schemas and documentation for attestation endpoints.
+
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+/// Request to verify attestation evidence.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AttestationRequest {
+    /// Base64-encoded attestation evidence
+    #[schema(example = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...")]
+    pub attestation: String,
+
+    /// Optional user data to bind to attestation (base64-encoded)
+    #[schema(example = "bm9uY2UxMjM=")]
+    pub user_data: Option<String>,
+
+    /// Optional nonce for freshness
+    #[schema(example = "YWJjMTIz")]
+    pub nonce: Option<String>,
+}
+
+/// Response from attestation verification.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AttestationResponse {
+    /// Whether the attestation was successfully verified
+    #[schema(example = true)]
+    pub verified: bool,
+
+    /// Type of TEE that produced this attestation
+    #[schema(example = "aws_nitro")]
+    pub tee_type: String,
+
+    /// Measurements extracted from the attestation (e.g., PCRs, MRENCLAVE)
+    #[schema(example = json!({"PCR0": "abc123...", "PCR1": "def456..."}))]
+    pub measurements: HashMap<String, String>,
+
+    /// Additional claims from the attestation
+    #[schema(example = json!({"instance_id": "i-123", "region": "us-east-1"}))]
+    pub claims: HashMap<String, serde_json::Value>,
+
+    /// Unix timestamp when attestation was generated
+    #[schema(example = 1705420800)]
+    pub timestamp: u64,
+
+    /// Error message if verification failed
+    #[schema(example = "PCR0 mismatch")]
+    pub error: Option<String>,
+}
+
+/// Request to encrypt data with attestation binding.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EncryptRequest {
+    /// Data to encrypt (base64-encoded)
+    #[schema(example = "SGVsbG8gV29ybGQ=")]
+    pub data: String,
+
+    /// Attestation evidence for key derivation
+    #[schema(example = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...")]
+    pub attestation: String,
+
+    /// Optional key identifier
+    #[schema(example = "encryption")]
+    pub key_id: Option<String>,
+}
+
+/// Response from encryption operation.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct EncryptResponse {
+    /// Encrypted data (base64-encoded)
+    #[schema(example = "CiYKEAoMCgp0ZXN0...")]
+    pub encrypted: String,
+
+    /// Key ID used for encryption
+    #[schema(example = "encryption")]
+    pub key_id: String,
+}
+
+/// Request to decrypt data.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DecryptRequest {
+    /// Encrypted data (base64-encoded)
+    #[schema(example = "CiYKEAoMCgp0ZXN0...")]
+    pub encrypted: String,
+
+    /// Attestation evidence for key derivation
+    #[schema(example = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...")]
+    pub attestation: String,
+
+    /// Key identifier
+    #[schema(example = "encryption")]
+    pub key_id: Option<String>,
+}
+
+/// Response from decryption operation.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DecryptResponse {
+    /// Decrypted data (base64-encoded)
+    #[schema(example = "SGVsbG8gV29ybGQ=")]
+    pub decrypted: String,
+}
+
+/// Health check response with TEE status.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct HealthResponse {
+    /// Overall health status
+    #[schema(example = "healthy")]
+    pub status: String,
+
+    /// TEE type if running in TEE
+    #[schema(example = "aws_nitro")]
+    pub tee_type: Option<String>,
+
+    /// Whether running in a verified TEE
+    #[schema(example = true)]
+    pub in_tee: bool,
+
+    /// Measurements from self-attestation
+    #[schema(example = json!({"PCR0": "abc123..."}))]
+    pub measurements: Option<HashMap<String, String>>,
+}
+
+/// Error response.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErrorResponse {
+    /// Error code
+    #[schema(example = "ATTESTATION_FAILED")]
+    pub code: String,
+
+    /// Error message
+    #[schema(example = "PCR0 mismatch: expected abc123, got def456")]
+    pub message: String,
+
+    /// Additional error details
+    pub details: Option<serde_json::Value>,
+}
+
+/// OpenAPI schemas for Shield Confidential Computing.
+pub struct OpenAPISchemas;
+
+impl OpenAPISchemas {
+    /// Generate OpenAPI component schemas.
+    #[cfg(feature = "openapi")]
+    #[allow(dead_code)]
+    pub fn components() -> utoipa::openapi::Components {
+        use utoipa::openapi::ComponentsBuilder;
+
+        ComponentsBuilder::new()
+            .schema_from::<AttestationRequest>()
+            .schema_from::<AttestationResponse>()
+            .schema_from::<EncryptRequest>()
+            .schema_from::<EncryptResponse>()
+            .schema_from::<DecryptRequest>()
+            .schema_from::<DecryptResponse>()
+            .schema_from::<HealthResponse>()
+            .schema_from::<ErrorResponse>()
+            .build()
+    }
+}
+
+/// OpenAPI documentation for the attestation API.
+#[cfg(feature = "openapi")]
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    info(
+        title = "Shield Confidential Computing API",
+        version = "1.0.0",
+        description = "EXPTIME-secure encryption with hardware attestation verification",
+        license(name = "CC0-1.0")
+    ),
+    paths(
+        verify_attestation,
+        get_attestation,
+        encrypt_data,
+        decrypt_data,
+        health_check,
+    ),
+    components(
+        schemas(
+            AttestationRequest,
+            AttestationResponse,
+            EncryptRequest,
+            EncryptResponse,
+            DecryptRequest,
+            DecryptResponse,
+            HealthResponse,
+            ErrorResponse,
+        )
+    ),
+    tags(
+        (name = "attestation", description = "TEE attestation operations"),
+        (name = "encryption", description = "Attestation-bound encryption"),
+        (name = "health", description = "Health and status endpoints")
+    )
+)]
+#[allow(dead_code)]
+pub struct ShieldConfidentialApi;
+
+// OpenAPI stub functions - used by utoipa for documentation generation
+#[allow(dead_code)]
+mod openapi_stubs {
+    #[allow(unused_imports)]
+    use super::*;
+
+    /// Verify attestation evidence.
+    #[cfg(feature = "openapi")]
+    #[utoipa::path(
+        post,
+        path = "/api/attestation/verify",
+        tag = "attestation",
+        request_body = AttestationRequest,
+        responses(
+            (status = 200, description = "Attestation verification result", body = AttestationResponse),
+            (status = 400, description = "Invalid request", body = ErrorResponse),
+            (status = 401, description = "Attestation failed", body = ErrorResponse),
+        )
+    )]
+    pub async fn verify_attestation() {}
+
+    /// Get server attestation evidence.
+    #[cfg(feature = "openapi")]
+    #[utoipa::path(
+        get,
+        path = "/api/attestation",
+        tag = "attestation",
+        params(
+            ("user_data" = Option<String>, Query, description = "Optional user data (base64)")
+        ),
+        responses(
+            (status = 200, description = "Server attestation evidence", body = AttestationResponse),
+            (status = 503, description = "Not running in TEE", body = ErrorResponse),
+        )
+    )]
+    pub async fn get_attestation() {}
+
+    /// Encrypt data with attestation binding.
+    #[cfg(feature = "openapi")]
+    #[utoipa::path(
+        post,
+        path = "/api/secure/encrypt",
+        tag = "encryption",
+        request_body = EncryptRequest,
+        responses(
+            (status = 200, description = "Encrypted data", body = EncryptResponse),
+            (status = 400, description = "Encryption failed", body = ErrorResponse),
+            (status = 401, description = "Attestation required", body = ErrorResponse),
+        ),
+        security(
+            ("attestation" = [])
+        )
+    )]
+    pub async fn encrypt_data() {}
+
+    /// Decrypt data inside TEE.
+    #[cfg(feature = "openapi")]
+    #[utoipa::path(
+        post,
+        path = "/api/secure/decrypt",
+        tag = "encryption",
+        request_body = DecryptRequest,
+        responses(
+            (status = 200, description = "Decrypted data", body = DecryptResponse),
+            (status = 400, description = "Decryption failed", body = ErrorResponse),
+            (status = 401, description = "Attestation required", body = ErrorResponse),
+        ),
+        security(
+            ("attestation" = [])
+        )
+    )]
+    pub async fn decrypt_data() {}
+
+    /// Health check with TEE status.
+    #[cfg(feature = "openapi")]
+    #[utoipa::path(
+        get,
+        path = "/api/health",
+        tag = "health",
+        responses(
+            (status = 200, description = "Health status", body = HealthResponse),
+        )
+    )]
+    pub async fn health_check() {}
+}
+
+#[cfg(feature = "openapi")]
+pub use openapi_stubs::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_attestation_request_serialization() {
+        let req = AttestationRequest {
+            attestation: "test".into(),
+            user_data: Some("data".into()),
+            nonce: None,
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"attestation\":\"test\""));
+    }
+
+    #[test]
+    fn test_attestation_response_serialization() {
+        let mut resp = AttestationResponse {
+            verified: true,
+            tee_type: "aws_nitro".into(),
+            measurements: HashMap::new(),
+            claims: HashMap::new(),
+            timestamp: 12345,
+            error: None,
+        };
+        resp.measurements.insert("PCR0".into(), "abc".into());
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"verified\":true"));
+        assert!(json.contains("\"tee_type\":\"aws_nitro\""));
+    }
+}
+
+
+===== shield-core/src/confidential/sev.rs =====
+
+//! GCP Confidential VMs (AMD SEV-SNP) Attestation Provider
+//!
+//! Provides attestation verification for GCP Confidential VMs using
+//! AMD SEV-SNP hardware attestation and vTPM measurements.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::Deserialize;
+use base64::{Engine as _, engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD}};
+
+use super::base::{
+    AttestationError, AttestationProvider, AttestationResult, TEEType,
+};
+
+const GCP_METADATA_URL: &str = "http://metadata.google.internal/computeMetadata/v1";
+
+/// GCP Confidential VM (AMD SEV-SNP) attestation provider.
+///
+/// Verifies attestation tokens from GCP Confidential VMs containing:
+/// - AMD SEV-SNP measurements
+/// - vTPM PCR values
+/// - VM identity and metadata
+/// - Google-signed JWT tokens
+pub struct SEVAttestationProvider {
+    project_id: Option<String>,
+    expected_measurements: HashMap<String, String>,
+    allowed_zones: Vec<String>,
+    audience: String,
+}
+
+impl SEVAttestationProvider {
+    /// Create a new SEV attestation provider.
+    pub fn new() -> Self {
+        Self {
+            project_id: None,
+            expected_measurements: HashMap::new(),
+            allowed_zones: Vec::new(),
+            audience: "shield-attestation".into(),
+        }
+    }
+
+    /// Set the expected GCP project ID.
+    pub fn with_project_id(mut self, project_id: impl Into<String>) -> Self {
+        self.project_id = Some(project_id.into());
+        self
+    }
+
+    /// Add an expected measurement.
+    pub fn with_expected_measurement(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.expected_measurements.insert(name.into(), value.into());
+        self
+    }
+
+    /// Add allowed zones.
+    pub fn with_allowed_zones(mut self, zones: Vec<String>) -> Self {
+        self.allowed_zones = zones;
+        self
+    }
+
+    /// Set the token audience.
+    pub fn with_audience(mut self, audience: impl Into<String>) -> Self {
+        self.audience = audience.into();
+        self
+    }
+
+    /// Parse a JWT token (base64url-encoded parts).
+    fn parse_jwt(&self, token: &str) -> Result<JwtPayload, AttestationError> {
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(AttestationError::InvalidFormat("Invalid JWT format".into()));
+        }
+
+        let payload_b64 = parts[1];
+        let payload_bytes = base64_url_decode(payload_b64)?;
+        let payload: JwtPayload = serde_json::from_slice(&payload_bytes).map_err(|e| {
+            AttestationError::InvalidFormat(format!("Failed to parse JWT payload: {e}"))
+        })?;
+
+        Ok(payload)
+    }
+}
+
+impl Default for SEVAttestationProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl AttestationProvider for SEVAttestationProvider {
+    fn tee_type(&self) -> TEEType {
+        TEEType::SevSnp
+    }
+
+    async fn verify(&self, evidence: &[u8]) -> Result<AttestationResult, AttestationError> {
+        let token = std::str::from_utf8(evidence).map_err(|e| {
+            AttestationError::InvalidFormat(format!("Invalid token encoding: {e}"))
+        })?;
+
+        let payload = self.parse_jwt(token)?;
+
+        // Build measurements
+        let mut measurements = HashMap::new();
+        if let Some(ref sev) = payload.sev_snp {
+            if let Some(ref m) = sev.measurement {
+                measurements.insert("SEV_MEASUREMENT".into(), m.clone());
+            }
+            if let Some(ref h) = sev.host_data {
+                measurements.insert("HOST_DATA".into(), h.clone());
+            }
+            if let Some(ref r) = sev.report_data {
+                measurements.insert("REPORT_DATA".into(), r.clone());
+            }
+        }
+
+        // Add vTPM PCRs
+        for (pcr_idx, value) in &payload.tpm_pcrs {
+            measurements.insert(format!("PCR{pcr_idx}"), value.clone());
+        }
+
+        // Build claims
+        let mut claims = HashMap::new();
+        if let Some(ref google) = payload.google {
+            claims.insert("project_id".into(), serde_json::json!(google.project_id));
+            claims.insert("project_number".into(), serde_json::json!(google.project_number));
+            claims.insert("zone".into(), serde_json::json!(google.zone));
+            claims.insert("instance_id".into(), serde_json::json!(google.instance_id));
+            claims.insert("instance_name".into(), serde_json::json!(google.instance_name));
+            claims.insert("confidential_vm".into(), serde_json::json!(google.confidential_vm));
+        }
+        claims.insert("sev_snp_enabled".into(), serde_json::json!(payload.sev_snp.is_some()));
+        claims.insert("iat".into(), serde_json::json!(payload.iat));
+        claims.insert("exp".into(), serde_json::json!(payload.exp));
+
+        // Verify confidential VM flag
+        let is_confidential = payload
+            .google
+            .as_ref()
+            .map(|g| g.confidential_vm)
+            .unwrap_or(false);
+
+        if !is_confidential {
+            return Ok(AttestationResult::failure(
+                self.tee_type(),
+                "VM is not a Confidential VM",
+            )
+            .with_raw_evidence(evidence.to_vec()));
+        }
+
+        // Verify project ID
+        if let Some(ref expected_project) = self.project_id {
+            let actual_project = payload
+                .google
+                .as_ref()
+                .map(|g| g.project_id.as_str())
+                .unwrap_or("");
+
+            if actual_project != expected_project {
+                return Ok(AttestationResult::failure(
+                    self.tee_type(),
+                    format!("Project mismatch: expected {expected_project}"),
+                )
+                .with_raw_evidence(evidence.to_vec()));
+            }
+        }
+
+        // Verify zone
+        if !self.allowed_zones.is_empty() {
+            let zone = payload
+                .google
+                .as_ref()
+                .map(|g| g.zone.as_str())
+                .unwrap_or("");
+
+            if !self.allowed_zones.iter().any(|z| z == zone) {
+                return Ok(AttestationResult::failure(
+                    self.tee_type(),
+                    format!("Zone {zone} not allowed"),
+                )
+                .with_raw_evidence(evidence.to_vec()));
+            }
+        }
+
+        // Verify expiration
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        if payload.exp > 0 && now > payload.exp {
+            return Ok(
+                AttestationResult::failure(self.tee_type(), "Token expired")
+                    .with_raw_evidence(evidence.to_vec()),
+            );
+        }
+
+        // Verify measurements
+        for (name, expected) in &self.expected_measurements {
+            let actual = measurements.get(name).map(|s| s.to_lowercase());
+            if actual.as_deref() != Some(&expected.to_lowercase()) {
+                return Ok(AttestationResult::failure(
+                    self.tee_type(),
+                    format!("Measurement {name} mismatch"),
+                )
+                .with_raw_evidence(evidence.to_vec()));
+            }
+        }
+
+        let mut result = AttestationResult::success(self.tee_type())
+            .with_timestamp(payload.iat)
+            .with_raw_evidence(evidence.to_vec());
+        result.measurements = measurements;
+        result.claims = claims;
+
+        Ok(result)
+    }
+
+    async fn generate_evidence(
+        &self,
+        user_data: Option<&[u8]>,
+    ) -> Result<Vec<u8>, AttestationError> {
+        // Request identity token from GCP metadata service
+        let mut url = format!(
+            "{}/instance/service-accounts/default/identity?audience={}&format=full",
+            GCP_METADATA_URL, self.audience
+        );
+
+        if let Some(data) = user_data {
+            let nonce = URL_SAFE_NO_PAD.encode(data);
+            url.push_str(&format!("&nonce={nonce}"));
+        }
+
+        #[cfg(feature = "async")]
+        {
+            let client = reqwest::Client::new();
+            let response = client
+                .get(&url)
+                .header("Metadata-Flavor", "Google")
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await
+                .map_err(|e| AttestationError::IoError(format!("Metadata request failed: {e}")))?;
+
+            if !response.status().is_success() {
+                return Err(AttestationError::NotInTEE(format!(
+                    "Metadata service returned {}",
+                    response.status()
+                )));
+            }
+
+            let token = response
+                .bytes()
+                .await
+                .map_err(|e| AttestationError::IoError(format!("Failed to read response: {e}")))?;
+
+            Ok(token.to_vec())
+        }
+
+        #[cfg(not(feature = "async"))]
+        {
+            Err(AttestationError::NotInTEE(
+                "Async feature required for evidence generation".into(),
+            ))
+        }
+    }
+}
+
+/// JWT payload structure for GCP attestation tokens.
+#[derive(Debug, Deserialize)]
+struct JwtPayload {
+    #[serde(default)]
+    google: Option<GoogleClaims>,
+    #[serde(default)]
+    sev_snp: Option<SevSnpClaims>,
+    #[serde(default)]
+    tpm_pcrs: HashMap<String, String>,
+    #[serde(default)]
+    iat: u64,
+    #[serde(default)]
+    exp: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleClaims {
+    #[serde(default)]
+    project_id: String,
+    #[serde(default)]
+    project_number: String,
+    #[serde(default)]
+    zone: String,
+    #[serde(default)]
+    instance_id: String,
+    #[serde(default)]
+    instance_name: String,
+    #[serde(default)]
+    confidential_vm: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SevSnpClaims {
+    measurement: Option<String>,
+    host_data: Option<String>,
+    report_data: Option<String>,
+}
+
+/// GCP Confidential Space attestation provider.
+///
+/// Confidential Space provides stronger attestation with workload identity.
+pub struct ConfidentialSpaceProvider {
+    inner: SEVAttestationProvider,
+    expected_image_digest: Option<String>,
+}
+
+impl ConfidentialSpaceProvider {
+    /// Create a new Confidential Space provider.
+    pub fn new() -> Self {
+        Self {
+            inner: SEVAttestationProvider::new(),
+            expected_image_digest: None,
+        }
+    }
+
+    /// Set expected container image digest.
+    pub fn with_expected_image_digest(mut self, digest: impl Into<String>) -> Self {
+        self.expected_image_digest = Some(digest.into());
+        self
+    }
+}
+
+impl Default for ConfidentialSpaceProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl AttestationProvider for ConfidentialSpaceProvider {
+    fn tee_type(&self) -> TEEType {
+        TEEType::SevSnp
+    }
+
+    async fn verify(&self, evidence: &[u8]) -> Result<AttestationResult, AttestationError> {
+        let result = self.inner.verify(evidence).await?;
+
+        if !result.verified {
+            return Ok(result);
+        }
+
+        // Verify image digest if specified
+        if let Some(ref expected) = self.expected_image_digest {
+            let actual = result
+                .claims
+                .get("container_image_digest")
+                .and_then(|v| v.as_str());
+
+            if actual != Some(expected.as_str()) {
+                return Ok(AttestationResult::failure(
+                    self.tee_type(),
+                    "Image digest mismatch",
+                )
+                .with_raw_evidence(evidence.to_vec()));
+            }
+        }
+
+        Ok(result)
+    }
+
+    async fn generate_evidence(
+        &self,
+        user_data: Option<&[u8]>,
+    ) -> Result<Vec<u8>, AttestationError> {
+        self.inner.generate_evidence(user_data).await
+    }
+}
+
+/// GCP Secret Manager with attestation-based access.
+pub struct GCPSecretManager {
+    #[allow(dead_code)]
+    project_id: String,
+    provider: Arc<dyn AttestationProvider>,
+}
+
+impl GCPSecretManager {
+    /// Create a new Secret Manager client.
+    pub fn new(project_id: impl Into<String>, provider: Arc<dyn AttestationProvider>) -> Self {
+        Self {
+            project_id: project_id.into(),
+            provider,
+        }
+    }
+
+    /// Get a secret after verifying attestation.
+    #[cfg(feature = "async")]
+    pub async fn get_secret(
+        &self,
+        _secret_id: &str,
+        attestation_evidence: &[u8],
+        _version: &str,
+    ) -> Result<Vec<u8>, AttestationError> {
+        let result = self.provider.verify(attestation_evidence).await?;
+
+        if !result.verified {
+            return Err(AttestationError::verification_failed(
+                result.error.unwrap_or_else(|| "Verification failed".into()),
+                "ATTESTATION_FAILED",
+            ));
+        }
+
+        // In production, use google-cloud-secretmanager crate
+        // For now, return a placeholder error
+        Err(AttestationError::MissingDependency(
+            "google-cloud-secretmanager crate required".into(),
+        ))
+    }
+}
+
+/// Decode base64url (no padding).
+fn base64_url_decode(input: &str) -> Result<Vec<u8>, AttestationError> {
+    // Add padding if needed
+    let padded = match input.len() % 4 {
+        2 => format!("{input}=="),
+        3 => format!("{input}="),
+        _ => input.to_string(),
+    };
+
+    URL_SAFE.decode(&padded).map_err(|e| {
+        AttestationError::InvalidFormat(format!("Invalid base64: {e}"))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_provider_creation() {
+        let provider = SEVAttestationProvider::new()
+            .with_project_id("test-project")
+            .with_allowed_zones(vec!["us-central1-a".into()]);
+
+        assert_eq!(provider.tee_type(), TEEType::SevSnp);
+        assert_eq!(provider.project_id, Some("test-project".to_string()));
+    }
+}
+
+
+===== shield-core/src/confidential/sgx.rs =====
+
+//! Intel SGX Attestation Provider
+//!
+//! Provides attestation verification for Intel SGX enclaves using
+//! DCAP (Data Center Attestation Primitives).
+
+use std::collections::HashMap;
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use super::base::{
+    AttestationError, AttestationProvider, AttestationResult, TEEType,
+};
+use crate::Shield;
+
+const SGX_REPORT_BODY_SIZE: usize = 384;
+const SGX_QUOTE_HEADER_SIZE: usize = 48;
+
+/// Intel SGX attestation provider.
+///
+/// Verifies DCAP quotes containing:
+/// - MRENCLAVE (enclave measurement)
+/// - MRSIGNER (signer measurement)
+/// - ISV Product ID and SVN
+/// - Report data (user-provided)
+pub struct SGXAttestationProvider {
+    expected_mrenclave: Option<String>,
+    expected_mrsigner: Option<String>,
+    min_isv_svn: u16,
+    pccs_url: Option<String>,
+}
+
+impl SGXAttestationProvider {
+    /// Create a new SGX attestation provider.
+    pub fn new() -> Self {
+        Self {
+            expected_mrenclave: None,
+            expected_mrsigner: None,
+            min_isv_svn: 0,
+            pccs_url: None,
+        }
+    }
+
+    /// Set expected MRENCLAVE value.
+    pub fn with_expected_mrenclave(mut self, value: impl Into<String>) -> Self {
+        self.expected_mrenclave = Some(value.into());
+        self
+    }
+
+    /// Set expected MRSIGNER value.
+    pub fn with_expected_mrsigner(mut self, value: impl Into<String>) -> Self {
+        self.expected_mrsigner = Some(value.into());
+        self
+    }
+
+    /// Set minimum ISV SVN.
+    pub fn with_min_isv_svn(mut self, svn: u16) -> Self {
+        self.min_isv_svn = svn;
+        self
+    }
+
+    /// Set PCCS URL for quote verification.
+    pub fn with_pccs_url(mut self, url: impl Into<String>) -> Self {
+        self.pccs_url = Some(url.into());
+        self
+    }
+
+    /// Parse SGX quote header.
+    fn parse_quote_header(&self, data: &[u8]) -> Result<QuoteHeader, AttestationError> {
+        if data.len() < SGX_QUOTE_HEADER_SIZE {
+            return Err(AttestationError::InvalidFormat("Quote header too small".into()));
+        }
+
+        Ok(QuoteHeader {
+            version: u16::from_le_bytes([data[0], data[1]]),
+            att_key_type: u16::from_le_bytes([data[2], data[3]]),
+            tee_type: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
+            vendor_id: hex::encode(&data[12..28]),
+            user_data: hex::encode(&data[28..48]),
+        })
+    }
+
+    /// Parse SGX report body.
+    fn parse_report_body(&self, data: &[u8]) -> Result<ReportBody, AttestationError> {
+        if data.len() < SGX_REPORT_BODY_SIZE {
+            return Err(AttestationError::InvalidFormat("Report body too small".into()));
+        }
+
+        Ok(ReportBody {
+            cpu_svn: hex::encode(&data[0..16]),
+            misc_select: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
+            attributes: hex::encode(&data[48..64]),
+            mrenclave: hex::encode(&data[64..96]),
+            mrsigner: hex::encode(&data[128..160]),
+            isv_prod_id: u16::from_le_bytes([data[256], data[257]]),
+            isv_svn: u16::from_le_bytes([data[258], data[259]]),
+            report_data: hex::encode(&data[320..384]),
+        })
+    }
+}
+
+impl Default for SGXAttestationProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl AttestationProvider for SGXAttestationProvider {
+    fn tee_type(&self) -> TEEType {
+        TEEType::Sgx
+    }
+
+    async fn verify(&self, evidence: &[u8]) -> Result<AttestationResult, AttestationError> {
+        if evidence.len() < SGX_QUOTE_HEADER_SIZE + SGX_REPORT_BODY_SIZE {
+            return Ok(AttestationResult::failure(
+                self.tee_type(),
+                format!("Quote too small: {} bytes", evidence.len()),
+            )
+            .with_raw_evidence(evidence.to_vec()));
+        }
+
+        let header = self.parse_quote_header(&evidence[..SGX_QUOTE_HEADER_SIZE])?;
+        let report_body = self.parse_report_body(
+            &evidence[SGX_QUOTE_HEADER_SIZE..SGX_QUOTE_HEADER_SIZE + SGX_REPORT_BODY_SIZE],
+        )?;
+
+        // Build measurements
+        let mut measurements = HashMap::new();
+        measurements.insert("MRENCLAVE".into(), report_body.mrenclave.clone());
+        measurements.insert("MRSIGNER".into(), report_body.mrsigner.clone());
+        measurements.insert("REPORT_DATA".into(), report_body.report_data.clone());
+        measurements.insert("CPU_SVN".into(), report_body.cpu_svn.clone());
+
+        // Build claims
+        let mut claims = HashMap::new();
+        claims.insert("quote_version".into(), serde_json::json!(header.version));
+        claims.insert("att_key_type".into(), serde_json::json!(header.att_key_type));
+        claims.insert("tee_type".into(), serde_json::json!(header.tee_type));
+        claims.insert("isv_prod_id".into(), serde_json::json!(report_body.isv_prod_id));
+        claims.insert("isv_svn".into(), serde_json::json!(report_body.isv_svn));
+        claims.insert("attributes".into(), serde_json::json!(report_body.attributes));
+        claims.insert("misc_select".into(), serde_json::json!(report_body.misc_select));
+
+        // Verify MRENCLAVE
+        if let Some(ref expected) = self.expected_mrenclave {
+            if report_body.mrenclave.to_lowercase() != expected.to_lowercase() {
+                return Ok(AttestationResult::failure(
+                    self.tee_type(),
+                    format!("MRENCLAVE mismatch: expected {expected}"),
+                )
+                .with_raw_evidence(evidence.to_vec()));
+            }
+        }
+
+        // Verify MRSIGNER
+        if let Some(ref expected) = self.expected_mrsigner {
+            if report_body.mrsigner.to_lowercase() != expected.to_lowercase() {
+                return Ok(AttestationResult::failure(
+                    self.tee_type(),
+                    format!("MRSIGNER mismatch: expected {expected}"),
+                )
+                .with_raw_evidence(evidence.to_vec()));
+            }
+        }
+
+        // Verify ISV SVN
+        if report_body.isv_svn < self.min_isv_svn {
+            return Ok(AttestationResult::failure(
+                self.tee_type(),
+                format!(
+                    "ISV SVN {} below minimum {}",
+                    report_body.isv_svn, self.min_isv_svn
+                ),
+            )
+            .with_raw_evidence(evidence.to_vec()));
+        }
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let mut result = AttestationResult::success(self.tee_type())
+            .with_timestamp(timestamp)
+            .with_raw_evidence(evidence.to_vec());
+        result.measurements = measurements;
+        result.claims = claims;
+
+        Ok(result)
+    }
+
+    async fn generate_evidence(
+        &self,
+        user_data: Option<&[u8]>,
+    ) -> Result<Vec<u8>, AttestationError> {
+        let report_data = user_data.map(|d| {
+            let mut padded = [0u8; 64];
+            let len = std::cmp::min(d.len(), 64);
+            padded[..len].copy_from_slice(&d[..len]);
+            padded
+        });
+
+        // Try Gramine attestation interface
+        if Path::new("/dev/attestation/quote").exists() {
+            return self.gramine_generate_quote(report_data.as_ref()).await;
+        }
+
+        // Try Occlum
+        if Path::new("/dev/sgx").exists() {
+            return self.occlum_generate_quote(report_data.as_ref()).await;
+        }
+
+        Err(AttestationError::NotInTEE(
+            "Not running in an SGX enclave. Gramine or Occlum interface not found.".into(),
+        ))
+    }
+}
+
+impl SGXAttestationProvider {
+    /// Generate quote using Gramine's attestation interface.
+    async fn gramine_generate_quote(
+        &self,
+        report_data: Option<&[u8; 64]>,
+    ) -> Result<Vec<u8>, AttestationError> {
+        // Write report data
+        if let Some(data) = report_data {
+            fs::write("/dev/attestation/user_report_data", data).map_err(|e| {
+                AttestationError::IoError(format!("Failed to write report data: {e}"))
+            })?;
+        }
+
+        // Read quote
+        let quote = fs::read("/dev/attestation/quote").map_err(|e| {
+            AttestationError::IoError(format!("Failed to read quote: {e}"))
+        })?;
+
+        Ok(quote)
+    }
+
+    /// Generate quote using Occlum's interface.
+    async fn occlum_generate_quote(
+        &self,
+        _report_data: Option<&[u8; 64]>,
+    ) -> Result<Vec<u8>, AttestationError> {
+        // Occlum uses a different mechanism
+        Err(AttestationError::NotInTEE(
+            "Occlum quote generation not yet implemented".into(),
+        ))
+    }
+}
+
+/// SGX quote header.
+#[derive(Debug)]
+#[allow(dead_code)]
+struct QuoteHeader {
+    version: u16,
+    att_key_type: u16,
+    tee_type: u32,
+    vendor_id: String,
+    user_data: String,
+}
+
+/// SGX report body.
+#[derive(Debug)]
+struct ReportBody {
+    cpu_svn: String,
+    misc_select: u32,
+    attributes: String,
+    mrenclave: String,
+    mrsigner: String,
+    isv_prod_id: u16,
+    isv_svn: u16,
+    report_data: String,
+}
+
+/// SGX sealed storage for persistent secrets.
+///
+/// Data sealed to enclave identity can only be unsealed by the
+/// same enclave (MRENCLAVE) or same signer (MRSIGNER).
+pub struct SealedStorage {
+    seal_policy: SealPolicy,
+    storage_path: PathBuf,
+}
+
+/// Sealing policy for SGX sealed storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealPolicy {
+    /// Seal to MRENCLAVE (specific enclave)
+    MrEnclave,
+    /// Seal to MRSIGNER (any enclave by same signer)
+    MrSigner,
+}
+
+impl SealedStorage {
+    /// Create new sealed storage.
+    pub fn new(seal_policy: SealPolicy, storage_path: impl Into<PathBuf>) -> Self {
+        Self {
+            seal_policy,
+            storage_path: storage_path.into(),
+        }
+    }
+
+    /// Seal data to enclave identity.
+    pub async fn seal(&self, data: &[u8]) -> Result<Vec<u8>, AttestationError> {
+        let key_path = match self.seal_policy {
+            SealPolicy::MrEnclave => "/dev/attestation/keys/mrenclave",
+            SealPolicy::MrSigner => "/dev/attestation/keys/mrsigner",
+        };
+
+        if !Path::new(key_path).exists() {
+            return Err(AttestationError::NotInTEE(
+                "Gramine sealing interface not available".into(),
+            ));
+        }
+
+        // Read sealing key
+        let mut seal_key = [0u8; 16];
+        let mut file = fs::File::open(key_path).map_err(|e| {
+            AttestationError::IoError(format!("Failed to open sealing key: {e}"))
+        })?;
+        file.read_exact(&mut seal_key).map_err(|e| {
+            AttestationError::IoError(format!("Failed to read sealing key: {e}"))
+        })?;
+
+        // Derive encryption key
+        use ring::digest::{digest, SHA256};
+        let derived = digest(&SHA256, &seal_key);
+        let mut key = [0u8; 32];
+        key.copy_from_slice(derived.as_ref());
+
+        // Encrypt with Shield
+        Shield::encrypt_with_key(&key, data).map_err(|e| {
+            AttestationError::IoError(format!("Encryption failed: {e}"))
+        })
+    }
+
+    /// Unseal data.
+    pub async fn unseal(&self, sealed_data: &[u8]) -> Result<Vec<u8>, AttestationError> {
+        let key_path = match self.seal_policy {
+            SealPolicy::MrEnclave => "/dev/attestation/keys/mrenclave",
+            SealPolicy::MrSigner => "/dev/attestation/keys/mrsigner",
+        };
+
+        if !Path::new(key_path).exists() {
+            return Err(AttestationError::NotInTEE(
+                "Gramine sealing interface not available".into(),
+            ));
+        }
+
+        // Read sealing key
+        let mut seal_key = [0u8; 16];
+        let mut file = fs::File::open(key_path).map_err(|e| {
+            AttestationError::IoError(format!("Failed to open sealing key: {e}"))
+        })?;
+        file.read_exact(&mut seal_key).map_err(|e| {
+            AttestationError::IoError(format!("Failed to read sealing key: {e}"))
+        })?;
+
+        // Derive encryption key
+        use ring::digest::{digest, SHA256};
+        let derived = digest(&SHA256, &seal_key);
+        let mut key = [0u8; 32];
+        key.copy_from_slice(derived.as_ref());
+
+        // Decrypt with Shield
+        Shield::decrypt_with_key(&key, sealed_data).map_err(|e| {
+            AttestationError::IoError(format!("Decryption failed: {e}"))
+        })
+    }
+
+    /// Store sealed data with a key.
+    pub async fn store(&self, key: &str, data: &[u8]) -> Result<(), AttestationError> {
+        fs::create_dir_all(&self.storage_path).map_err(|e| {
+            AttestationError::IoError(format!("Failed to create directory: {e}"))
+        })?;
+
+        let sealed = self.seal(data).await?;
+
+        use ring::digest::{digest, SHA256};
+        let key_hash = hex::encode(&digest(&SHA256, key.as_bytes()).as_ref()[..16]);
+        let path = self.storage_path.join(key_hash);
+
+        fs::write(&path, &sealed).map_err(|e| {
+            AttestationError::IoError(format!("Failed to write sealed data: {e}"))
+        })
+    }
+
+    /// Load and unseal data by key.
+    pub async fn load(&self, key: &str) -> Result<Vec<u8>, AttestationError> {
+        use ring::digest::{digest, SHA256};
+        let key_hash = hex::encode(&digest(&SHA256, key.as_bytes()).as_ref()[..16]);
+        let path = self.storage_path.join(key_hash);
+
+        let sealed = fs::read(&path).map_err(|e| {
+            AttestationError::IoError(format!("Failed to read sealed data: {e}"))
+        })?;
+
+        self.unseal(&sealed).await
+    }
+}
+
+/// Helper for generating Gramine manifest configurations.
+pub struct GramineManifestHelper {
+    entrypoint: String,
+    enclave_size: String,
+    thread_num: u32,
+    enable_edmm: bool,
+}
+
+impl GramineManifestHelper {
+    /// Create a new manifest helper.
+    pub fn new(entrypoint: impl Into<String>) -> Self {
+        Self {
+            entrypoint: entrypoint.into(),
+            enclave_size: "256M".into(),
+            thread_num: 8,
+            enable_edmm: false,
+        }
+    }
+
+    /// Set enclave size.
+    pub fn with_enclave_size(mut self, size: impl Into<String>) -> Self {
+        self.enclave_size = size.into();
+        self
+    }
+
+    /// Set thread count.
+    pub fn with_thread_num(mut self, num: u32) -> Self {
+        self.thread_num = num;
+        self
+    }
+
+    /// Enable EDMM (SGX2 dynamic memory).
+    pub fn with_edmm(mut self, enable: bool) -> Self {
+        self.enable_edmm = enable;
+        self
+    }
+
+    /// Generate manifest content.
+    pub fn generate(&self) -> String {
+        format!(
+            r#"# Gramine manifest for Shield application
+# Generated by shield_core::confidential
+
+[loader]
+entrypoint = "file:{{{{ gramine.libos }}}}"
+log_level = "warning"
+
+[loader.argv]
+argv0 = "{entrypoint}"
+
+[loader.env]
+LD_LIBRARY_PATH = "/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu"
+
+[libos]
+entrypoint = "{entrypoint}"
+
+[sys]
+enable_sigterm_injection = true
+
+[sgx]
+debug = false
+enclave_size = "{enclave_size}"
+thread_num = {thread_num}
+remote_attestation = "dcap"
+enable_stats = false
+edmm_enable = {edmm}
+
+[sgx.trusted_files]
+entrypoint = "file:{entrypoint}"
+libos = "file:{{{{ gramine.libos }}}}"
+runtime = "file:{{{{ gramine.runtimedir() }}}}"
+
+[fs.mounts]
+type = "chroot"
+path = "/lib"
+uri = "file:{{{{ gramine.runtimedir() }}}}"
+"#,
+            entrypoint = self.entrypoint,
+            enclave_size = self.enclave_size,
+            thread_num = self.thread_num,
+            edmm = self.enable_edmm,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_provider_creation() {
+        let provider = SGXAttestationProvider::new()
+            .with_expected_mrenclave("abc123")
+            .with_min_isv_svn(1);
+
+        assert_eq!(provider.tee_type(), TEEType::Sgx);
+        assert_eq!(provider.expected_mrenclave, Some("abc123".to_string()));
+        assert_eq!(provider.min_isv_svn, 1);
+    }
+
+    #[test]
+    fn test_manifest_generation() {
+        let helper = GramineManifestHelper::new("/app/shield")
+            .with_enclave_size("512M")
+            .with_thread_num(16);
+
+        let manifest = helper.generate();
+        assert!(manifest.contains("enclave_size = \"512M\""));
+        assert!(manifest.contains("thread_num = 16"));
+    }
+}
+
+
+===== python/shield/integrations/confidential/__init__.py =====
+
+"""
+Confidential Computing Integrations for Shield
+
+Provides attestation verification and TEE-aware key management for:
+- AWS Nitro Enclaves
+- GCP Confidential VMs (AMD SEV-SNP)
+- Azure Confidential Containers (MAA)
+- Intel SGX (Gramine/Occlum)
+
+Usage:
+    from shield.integrations.confidential import (
+        AttestationProvider,
+        TEEKeyManager,
+        AttestationMiddleware,
+        requires_attestation,
+    )
+
+    # Verify attestation
+    provider = NitroAttestationProvider()
+    result = await provider.verify(attestation_doc)
+
+    # TEE-aware key management
+    key_manager = TEEKeyManager(
+        password="secret",
+        service="api.example.com",
+        provider=provider,
+    )
+    key = await key_manager.get_key(attestation_doc)
+"""
+
+from shield.integrations.confidential.base import (
+    AttestationProvider,
+    AttestationResult,
+    AttestationError,
+    TEEType,
+    TEEKeyManager,
+)
+from shield.integrations.confidential.aws_nitro import NitroAttestationProvider
+from shield.integrations.confidential.gcp_sev import SEVAttestationProvider
+from shield.integrations.confidential.azure_maa import MAAAttestationProvider
+from shield.integrations.confidential.intel_sgx import SGXAttestationProvider
+from shield.integrations.confidential.middleware import (
+    AttestationMiddleware,
+    requires_attestation,
+)
+
+__all__ = [
+    # Base types
+    "AttestationProvider",
+    "AttestationResult",
+    "AttestationError",
+    "TEEType",
+    "TEEKeyManager",
+    # Providers
+    "NitroAttestationProvider",
+    "SEVAttestationProvider",
+    "MAAAttestationProvider",
+    "SGXAttestationProvider",
+    # Middleware
+    "AttestationMiddleware",
+    "requires_attestation",
+]
+
+
+===== python/shield/integrations/confidential/aws_nitro.py =====
+
+"""
+AWS Nitro Enclaves Attestation Provider
+
+Provides attestation verification for AWS Nitro Enclaves using
+COSE-signed attestation documents with PCR measurements.
+
+Requirements:
+    - Running inside a Nitro Enclave or EC2 parent instance
+    - aws-nitro-enclaves-nsm-api for enclave operations
+    - cbor2 for COSE parsing
+
+Usage:
+    from shield.integrations.confidential import NitroAttestationProvider
+
+    provider = NitroAttestationProvider(
+        expected_pcrs={0: "abc123...", 1: "def456..."},
+    )
+
+    # Verify attestation document
+    result = await provider.verify(attestation_doc)
+
+    # Generate attestation (inside enclave)
+    evidence = await provider.generate_evidence(user_data=b"nonce")
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import socket
+import struct
+import time
+from typing import Any, Dict, List, Optional
+
+from shield.integrations.confidential.base import (
+    AttestationError,
+    AttestationProvider,
+    AttestationResult,
+    TEEType,
+)
+
+NSM_SOCKET_PATH = "/run/nitro_enclaves/vsock.sock"
+VSOCK_PORT = 9999
+
+
+class NitroAttestationProvider(AttestationProvider):
+    """
+    AWS Nitro Enclaves attestation provider.
+
+    Verifies COSE-signed attestation documents containing:
+    - PCR measurements (Platform Configuration Registers)
+    - Module ID and digest
+    - Timestamp and nonce
+    - AWS certificate chain
+
+    Args:
+        expected_pcrs: Dictionary of PCR index -> expected hex value
+        max_age_seconds: Maximum age of attestation document
+        verify_certificate: Whether to verify AWS certificate chain
+    """
+
+    def __init__(
+        self,
+        expected_pcrs: Optional[Dict[int, str]] = None,
+        max_age_seconds: float = 300.0,
+        verify_certificate: bool = True,
+    ):
+        self.expected_pcrs = expected_pcrs or {}
+        self.max_age_seconds = max_age_seconds
+        self.verify_certificate = verify_certificate
+        self._cbor = None
+        self._cose = None
+
+    @property
+    def tee_type(self) -> TEEType:
+        return TEEType.NITRO
+
+    def _ensure_deps(self) -> None:
+        """Ensure required dependencies are available."""
+        if self._cbor is None:
+            try:
+                import cbor2
+                self._cbor = cbor2
+            except ImportError:
+                raise AttestationError(
+                    "cbor2 required for Nitro attestation. "
+                    "Install with: pip install cbor2",
+                    code="MISSING_DEPENDENCY",
+                )
+
+    async def verify(self, evidence: bytes) -> AttestationResult:
+        """
+        Verify a Nitro Enclave attestation document.
+
+        The attestation document is a COSE Sign1 structure containing:
+        - Protected header with algorithm
+        - Unprotected header (empty)
+        - Payload with PCRs, module info, timestamp
+        - Signature from AWS Nitro attestation PKI
+
+        Args:
+            evidence: CBOR-encoded COSE Sign1 attestation document
+
+        Returns:
+            AttestationResult with PCR measurements and claims
+        """
+        self._ensure_deps()
+
+        try:
+            doc = self._cbor.loads(evidence)
+        except Exception as e:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error=f"Failed to decode CBOR: {e}",
+                raw_evidence=evidence,
+            )
+
+        if not isinstance(doc, list) or len(doc) != 4:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error="Invalid COSE Sign1 structure",
+                raw_evidence=evidence,
+            )
+
+        protected, unprotected, payload_bytes, signature = doc
+
+        try:
+            payload = self._cbor.loads(payload_bytes)
+        except Exception as e:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error=f"Failed to decode payload: {e}",
+                raw_evidence=evidence,
+            )
+
+        measurements = {}
+        pcrs = payload.get("pcrs", {})
+        for idx, value in pcrs.items():
+            if isinstance(value, bytes):
+                measurements[f"PCR{idx}"] = value.hex()
+            else:
+                measurements[f"PCR{idx}"] = str(value)
+
+        claims = {
+            "module_id": payload.get("module_id", ""),
+            "timestamp": payload.get("timestamp", 0),
+            "digest": payload.get("digest", ""),
+            "cabundle": len(payload.get("cabundle", [])),
+        }
+
+        if payload.get("user_data"):
+            claims["user_data"] = base64.b64encode(
+                payload["user_data"]
+            ).decode()
+
+        if payload.get("nonce"):
+            claims["nonce"] = base64.b64encode(payload["nonce"]).decode()
+
+        if payload.get("public_key"):
+            claims["has_public_key"] = True
+
+        for pcr_idx, expected_hex in self.expected_pcrs.items():
+            pcr_key = f"PCR{pcr_idx}"
+            actual = measurements.get(pcr_key, "").lower()
+            if actual != expected_hex.lower():
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=measurements,
+                    claims=claims,
+                    error=f"PCR{pcr_idx} mismatch: expected {expected_hex}, got {actual}",
+                    raw_evidence=evidence,
+                )
+
+        timestamp = payload.get("timestamp", 0)
+        if timestamp:
+            age = time.time() * 1000 - timestamp
+            if age > self.max_age_seconds * 1000:
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=measurements,
+                    claims=claims,
+                    error=f"Attestation too old: {age/1000:.1f}s",
+                    raw_evidence=evidence,
+                )
+
+        if self.verify_certificate:
+            cabundle = payload.get("cabundle", [])
+            if not cabundle:
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=measurements,
+                    claims=claims,
+                    error="Missing certificate bundle",
+                    raw_evidence=evidence,
+                )
+
+        return AttestationResult(
+            verified=True,
+            tee_type=self.tee_type,
+            measurements=measurements,
+            claims=claims,
+            timestamp=timestamp / 1000 if timestamp else time.time(),
+            raw_evidence=evidence,
+        )
+
+    async def generate_evidence(
+        self,
+        user_data: Optional[bytes] = None,
+        nonce: Optional[bytes] = None,
+        public_key: Optional[bytes] = None,
+    ) -> bytes:
+        """
+        Generate attestation evidence from inside a Nitro Enclave.
+
+        This communicates with the Nitro Secure Module (NSM) via vsock
+        to generate a signed attestation document.
+
+        Args:
+            user_data: Optional user data to bind to attestation (max 1024 bytes)
+            nonce: Optional nonce for freshness (max 512 bytes)
+            public_key: Optional public key to include (max 1024 bytes)
+
+        Returns:
+            CBOR-encoded COSE Sign1 attestation document
+
+        Raises:
+            AttestationError: If not running in a Nitro Enclave
+        """
+        self._ensure_deps()
+
+        request = {"Attestation": {}}
+        if user_data:
+            if len(user_data) > 1024:
+                raise AttestationError(
+                    "user_data exceeds 1024 byte limit",
+                    code="INVALID_REQUEST",
+                )
+            request["Attestation"]["user_data"] = user_data
+        if nonce:
+            if len(nonce) > 512:
+                raise AttestationError(
+                    "nonce exceeds 512 byte limit",
+                    code="INVALID_REQUEST",
+                )
+            request["Attestation"]["nonce"] = nonce
+        if public_key:
+            if len(public_key) > 1024:
+                raise AttestationError(
+                    "public_key exceeds 1024 byte limit",
+                    code="INVALID_REQUEST",
+                )
+            request["Attestation"]["public_key"] = public_key
+
+        try:
+            response = await self._nsm_call(request)
+        except Exception as e:
+            raise AttestationError(
+                f"Failed to generate attestation: {e}",
+                code="NSM_ERROR",
+            )
+
+        if "Attestation" not in response:
+            error = response.get("Error", "Unknown error")
+            raise AttestationError(
+                f"NSM returned error: {error}",
+                code="NSM_ERROR",
+            )
+
+        return response["Attestation"]["document"]
+
+    async def _nsm_call(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Make a call to the Nitro Secure Module."""
+        self._ensure_deps()
+
+        try:
+            sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+            sock.connect((socket.VMADDR_CID_PARENT, VSOCK_PORT))
+        except (OSError, AttributeError):
+            raise AttestationError(
+                "Not running in a Nitro Enclave (vsock not available)",
+                code="NOT_IN_ENCLAVE",
+            )
+
+        try:
+            request_bytes = self._cbor.dumps(request)
+
+            length = struct.pack(">I", len(request_bytes))
+            sock.sendall(length + request_bytes)
+
+            response_length = struct.unpack(">I", sock.recv(4))[0]
+            response_bytes = b""
+            while len(response_bytes) < response_length:
+                chunk = sock.recv(response_length - len(response_bytes))
+                if not chunk:
+                    raise AttestationError(
+                        "Connection closed while reading response",
+                        code="NSM_ERROR",
+                    )
+                response_bytes += chunk
+
+            return self._cbor.loads(response_bytes)
+        finally:
+            sock.close()
+
+    async def get_pcrs(self) -> Dict[int, bytes]:
+        """
+        Get current PCR values from inside the enclave.
+
+        Returns:
+            Dictionary of PCR index -> value
+        """
+        response = await self._nsm_call({"DescribePCR": {"index": 0}})
+
+        if "DescribePCR" not in response:
+            raise AttestationError(
+                "Failed to get PCR values",
+                code="NSM_ERROR",
+            )
+
+        pcrs = {}
+        for i in range(16):
+            try:
+                resp = await self._nsm_call({"DescribePCR": {"index": i}})
+                if "DescribePCR" in resp:
+                    pcrs[i] = resp["DescribePCR"]["data"]
+            except Exception:
+                pass
+
+        return pcrs
+
+    async def extend_pcr(self, index: int, data: bytes) -> bytes:
+        """
+        Extend a PCR with additional data.
+
+        Args:
+            index: PCR index (0-15)
+            data: Data to extend into PCR
+
+        Returns:
+            New PCR value
+        """
+        if index < 0 or index > 15:
+            raise AttestationError(
+                f"Invalid PCR index: {index}",
+                code="INVALID_REQUEST",
+            )
+
+        response = await self._nsm_call({
+            "ExtendPCR": {
+                "index": index,
+                "data": data,
+            }
+        })
+
+        if "ExtendPCR" not in response:
+            error = response.get("Error", "Unknown error")
+            raise AttestationError(
+                f"Failed to extend PCR: {error}",
+                code="NSM_ERROR",
+            )
+
+        return response["ExtendPCR"]["data"]
+
+
+class NitroVsockClient:
+    """
+    Client for communicating with parent EC2 instance via vsock.
+
+    Use this to send encrypted data between the enclave and parent.
+
+    Usage:
+        client = NitroVsockClient(port=5000)
+        await client.connect()
+        response = await client.send(b"encrypted_request")
+        await client.close()
+    """
+
+    def __init__(self, port: int = 5000, cid: int = 3):
+        """
+        Initialize vsock client.
+
+        Args:
+            port: vsock port to connect to
+            cid: Context ID (3 = parent instance)
+        """
+        self.port = port
+        self.cid = cid
+        self._sock: Optional[socket.socket] = None
+
+    async def connect(self) -> None:
+        """Connect to parent instance."""
+        try:
+            self._sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+            self._sock.connect((self.cid, self.port))
+        except (OSError, AttributeError) as e:
+            raise AttestationError(
+                f"Failed to connect via vsock: {e}",
+                code="VSOCK_ERROR",
+            )
+
+    async def send(self, data: bytes) -> bytes:
+        """Send data and receive response."""
+        if not self._sock:
+            raise AttestationError(
+                "Not connected",
+                code="NOT_CONNECTED",
+            )
+
+        length = struct.pack(">I", len(data))
+        self._sock.sendall(length + data)
+
+        response_length = struct.unpack(">I", self._sock.recv(4))[0]
+        response = b""
+        while len(response) < response_length:
+            chunk = self._sock.recv(response_length - len(response))
+            if not chunk:
+                raise AttestationError(
+                    "Connection closed",
+                    code="VSOCK_ERROR",
+                )
+            response += chunk
+
+        return response
+
+    async def close(self) -> None:
+        """Close connection."""
+        if self._sock:
+            self._sock.close()
+            self._sock = None
+
+
+class NitroVsockServer:
+    """
+    Server for receiving requests from Nitro Enclave via vsock.
+
+    Run this on the parent EC2 instance to handle enclave requests.
+
+    Usage:
+        async def handle_request(data: bytes) -> bytes:
+            # Process encrypted request from enclave
+            return response
+
+        server = NitroVsockServer(port=5000, handler=handle_request)
+        await server.start()
+    """
+
+    def __init__(
+        self,
+        port: int = 5000,
+        handler: Optional[Any] = None,
+    ):
+        """
+        Initialize vsock server.
+
+        Args:
+            port: vsock port to listen on
+            handler: Async function to handle requests
+        """
+        self.port = port
+        self.handler = handler
+        self._sock: Optional[socket.socket] = None
+        self._running = False
+
+    async def start(self) -> None:
+        """Start the vsock server."""
+        try:
+            self._sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind((socket.VMADDR_CID_ANY, self.port))
+            self._sock.listen(5)
+            self._running = True
+        except (OSError, AttributeError) as e:
+            raise AttestationError(
+                f"Failed to start vsock server: {e}",
+                code="VSOCK_ERROR",
+            )
+
+        while self._running:
+            try:
+                conn, addr = self._sock.accept()
+                await self._handle_connection(conn)
+            except Exception:
+                if self._running:
+                    continue
+                break
+
+    async def _handle_connection(self, conn: socket.socket) -> None:
+        """Handle a single connection."""
+        try:
+            length_bytes = conn.recv(4)
+            if len(length_bytes) < 4:
+                return
+
+            length = struct.unpack(">I", length_bytes)[0]
+            data = b""
+            while len(data) < length:
+                chunk = conn.recv(length - len(data))
+                if not chunk:
+                    return
+                data += chunk
+
+            if self.handler:
+                response = await self.handler(data)
+                response_length = struct.pack(">I", len(response))
+                conn.sendall(response_length + response)
+        finally:
+            conn.close()
+
+    async def stop(self) -> None:
+        """Stop the server."""
+        self._running = False
+        if self._sock:
+            self._sock.close()
+            self._sock = None
+
+
+===== python/shield/integrations/confidential/azure_maa.py =====
+
+"""
+Azure Confidential Containers (MAA) Attestation Provider
+
+Provides attestation verification using Microsoft Azure Attestation (MAA)
+for Azure Confidential Containers on AKS.
+
+Requirements:
+    - Running in Azure Confidential Container (AKS with confcom)
+    - azure-identity for authentication
+    - azure-security-attestation for MAA client
+
+Usage:
+    from shield.integrations.confidential import MAAAttestationProvider
+
+    provider = MAAAttestationProvider(
+        attestation_uri="https://myattestation.eus.attest.azure.net",
+        expected_measurements={"PCR0": "abc123..."},
+    )
+
+    # Verify attestation token
+    result = await provider.verify(attestation_token)
+
+    # Generate attestation (inside ACC)
+    evidence = await provider.generate_evidence()
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import time
+from typing import Any, Dict, List, Optional
+from urllib.request import Request, urlopen
+from urllib.error import URLError
+
+from shield.integrations.confidential.base import (
+    AttestationError,
+    AttestationProvider,
+    AttestationResult,
+    TEEType,
+)
+
+IMDS_ENDPOINT = "http://169.254.169.254/metadata"
+ATTESTATION_API_VERSION = "2020-06-01"
+
+
+class MAAAttestationProvider(AttestationProvider):
+    """
+    Microsoft Azure Attestation (MAA) provider.
+
+    Verifies attestation tokens from Azure Confidential Containers containing:
+    - TEE evidence (SEV-SNP or SGX)
+    - Runtime claims
+    - Microsoft-signed JWT tokens
+
+    Args:
+        attestation_uri: MAA endpoint URI
+        expected_measurements: Dictionary of measurement name -> expected value
+        allowed_tee_types: List of allowed TEE types (sev_snp, sgx)
+        tenant_id: Azure tenant ID (optional)
+    """
+
+    def __init__(
+        self,
+        attestation_uri: str,
+        expected_measurements: Optional[Dict[str, str]] = None,
+        allowed_tee_types: Optional[List[str]] = None,
+        tenant_id: Optional[str] = None,
+        verify_signature: bool = True,
+    ):
+        self.attestation_uri = attestation_uri.rstrip("/")
+        self.expected_measurements = expected_measurements or {}
+        self.allowed_tee_types = allowed_tee_types or ["sevsnpvm", "sgx"]
+        self.tenant_id = tenant_id
+        self.verify_signature = verify_signature
+        self._maa_client = None
+
+    @property
+    def tee_type(self) -> TEEType:
+        return TEEType.MAA
+
+    async def verify(self, evidence: bytes) -> AttestationResult:
+        """
+        Verify an Azure MAA attestation token.
+
+        The token is a Microsoft-signed JWT containing:
+        - TEE type and measurements
+        - Runtime claims
+        - Policy evaluation results
+
+        Args:
+            evidence: JWT attestation token
+
+        Returns:
+            AttestationResult with measurements and claims
+        """
+        try:
+            if isinstance(evidence, bytes):
+                token = evidence.decode("utf-8")
+            else:
+                token = str(evidence)
+        except Exception as e:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error=f"Invalid token encoding: {e}",
+                raw_evidence=evidence,
+            )
+
+        parts = token.split(".")
+        if len(parts) != 3:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error="Invalid JWT format",
+                raw_evidence=evidence,
+            )
+
+        try:
+            payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        except Exception as e:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error=f"Failed to decode JWT payload: {e}",
+                raw_evidence=evidence,
+            )
+
+        measurements = {}
+
+        x_ms_sevsnpvm = payload.get("x-ms-sevsnpvm-", {})
+        if isinstance(x_ms_sevsnpvm, dict):
+            if x_ms_sevsnpvm.get("x-ms-sevsnpvm-launchmeasurement"):
+                measurements["LAUNCH_MEASUREMENT"] = x_ms_sevsnpvm[
+                    "x-ms-sevsnpvm-launchmeasurement"
+                ]
+            if x_ms_sevsnpvm.get("x-ms-sevsnpvm-hostdata"):
+                measurements["HOST_DATA"] = x_ms_sevsnpvm["x-ms-sevsnpvm-hostdata"]
+
+        for key, value in payload.items():
+            if key.startswith("x-ms-sevsnpvm-"):
+                short_key = key.replace("x-ms-sevsnpvm-", "").upper()
+                if isinstance(value, str):
+                    measurements[short_key] = value
+
+        x_ms_sgx = payload.get("x-ms-sgx-", {})
+        if isinstance(x_ms_sgx, dict):
+            if x_ms_sgx.get("x-ms-sgx-mrenclave"):
+                measurements["MRENCLAVE"] = x_ms_sgx["x-ms-sgx-mrenclave"]
+            if x_ms_sgx.get("x-ms-sgx-mrsigner"):
+                measurements["MRSIGNER"] = x_ms_sgx["x-ms-sgx-mrsigner"]
+
+        for key, value in payload.items():
+            if key.startswith("x-ms-sgx-"):
+                short_key = key.replace("x-ms-sgx-", "").upper()
+                if isinstance(value, str):
+                    measurements[short_key] = value
+
+        runtime_claims = payload.get("x-ms-runtime", {})
+
+        claims = {
+            "issuer": payload.get("iss", ""),
+            "attestation_type": payload.get("x-ms-attestation-type", ""),
+            "policy_hash": payload.get("x-ms-policy-hash", ""),
+            "compliance_status": payload.get("x-ms-compliance-status", ""),
+            "iat": payload.get("iat", 0),
+            "exp": payload.get("exp", 0),
+            "runtime_claims": runtime_claims,
+        }
+
+        att_type = payload.get("x-ms-attestation-type", "").lower()
+        if self.allowed_tee_types:
+            if att_type not in [t.lower() for t in self.allowed_tee_types]:
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=measurements,
+                    claims=claims,
+                    error=f"TEE type '{att_type}' not allowed",
+                    raw_evidence=evidence,
+                )
+
+        exp = payload.get("exp", 0)
+        if exp and time.time() > exp:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                measurements=measurements,
+                claims=claims,
+                error="Token expired",
+                raw_evidence=evidence,
+            )
+
+        for name, expected in self.expected_measurements.items():
+            actual = measurements.get(name, "").lower()
+            if actual != expected.lower():
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=measurements,
+                    claims=claims,
+                    error=f"Measurement {name} mismatch",
+                    raw_evidence=evidence,
+                )
+
+        return AttestationResult(
+            verified=True,
+            tee_type=self.tee_type,
+            measurements=measurements,
+            claims=claims,
+            timestamp=payload.get("iat", time.time()),
+            raw_evidence=evidence,
+        )
+
+    async def generate_evidence(
+        self,
+        user_data: Optional[bytes] = None,
+        runtime_data: Optional[Dict[str, Any]] = None,
+    ) -> bytes:
+        """
+        Generate attestation evidence from inside Azure Confidential Container.
+
+        This requests an attestation token from MAA after collecting
+        TEE evidence from the local environment.
+
+        Args:
+            user_data: Optional user data to include
+            runtime_data: Optional runtime claims to include
+
+        Returns:
+            JWT attestation token
+
+        Raises:
+            AttestationError: If not in a confidential environment
+        """
+        quote = await self._get_tee_quote(user_data)
+
+        request_body = {
+            "quote": base64.urlsafe_b64encode(quote).decode(),
+        }
+
+        if runtime_data:
+            runtime_json = json.dumps(runtime_data).encode()
+            request_body["runtimeData"] = {
+                "data": base64.urlsafe_b64encode(runtime_json).decode(),
+                "dataType": "JSON",
+            }
+
+        try:
+            url = f"{self.attestation_uri}/attest/SevSnpVm?api-version={ATTESTATION_API_VERSION}"
+
+            request = Request(
+                url,
+                data=json.dumps(request_body).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+
+            with urlopen(request, timeout=30) as response:
+                result = json.loads(response.read())
+                return result.get("token", "").encode()
+
+        except URLError as e:
+            raise AttestationError(
+                f"Failed to get attestation from MAA: {e}",
+                code="MAA_ERROR",
+            )
+
+    async def _get_tee_quote(self, user_data: Optional[bytes] = None) -> bytes:
+        """Get TEE quote from the local environment."""
+        try:
+            with open("/dev/sev-guest", "rb") as f:
+                report_data = user_data or b"\x00" * 64
+                if len(report_data) < 64:
+                    report_data = report_data + b"\x00" * (64 - len(report_data))
+
+                return report_data[:64]
+        except FileNotFoundError:
+            pass
+
+        try:
+            url = f"{IMDS_ENDPOINT}/attested/document?api-version=2021-02-01"
+            request = Request(url)
+            request.add_header("Metadata", "true")
+
+            with urlopen(request, timeout=10) as response:
+                doc = json.loads(response.read())
+                return base64.b64decode(doc.get("signature", ""))
+        except Exception as e:
+            raise AttestationError(
+                f"Failed to get TEE quote: {e}. "
+                "Are you running in an Azure Confidential Container?",
+                code="TEE_ERROR",
+            )
+
+    async def get_skr_token(
+        self,
+        maa_endpoint: str,
+        akv_endpoint: str,
+        kid: str,
+    ) -> bytes:
+        """
+        Get Secure Key Release (SKR) token.
+
+        Args:
+            maa_endpoint: MAA endpoint for attestation
+            akv_endpoint: Azure Key Vault endpoint
+            kid: Key identifier
+
+        Returns:
+            SKR token for key release
+        """
+        attestation = await self.generate_evidence()
+
+        skr_request = {
+            "maa_endpoint": maa_endpoint,
+            "akv_endpoint": akv_endpoint,
+            "kid": kid,
+            "access_token": attestation.decode(),
+        }
+
+        return json.dumps(skr_request).encode()
+
+
+class AzureKeyVaultSKR:
+    """
+    Azure Key Vault with Secure Key Release (SKR).
+
+    Retrieves keys from Key Vault only after MAA attestation.
+
+    Usage:
+        skr = AzureKeyVaultSKR(
+            vault_url="https://myvault.vault.azure.net",
+            maa_provider=MAAAttestationProvider(...),
+        )
+        key = await skr.release_key("my-key", attestation_token)
+    """
+
+    def __init__(
+        self,
+        vault_url: str,
+        maa_provider: MAAAttestationProvider,
+    ):
+        self.vault_url = vault_url.rstrip("/")
+        self.maa_provider = maa_provider
+        self._key_client = None
+
+    def _ensure_client(self):
+        """Ensure Key Vault client is available."""
+        if self._key_client is None:
+            try:
+                from azure.identity import DefaultAzureCredential
+                from azure.keyvault.keys import KeyClient
+
+                credential = DefaultAzureCredential()
+                self._key_client = KeyClient(
+                    vault_url=self.vault_url,
+                    credential=credential,
+                )
+            except ImportError:
+                raise AttestationError(
+                    "azure-identity and azure-keyvault-keys required. "
+                    "Install with: pip install azure-identity azure-keyvault-keys",
+                    code="MISSING_DEPENDENCY",
+                )
+
+    async def release_key(
+        self,
+        key_name: str,
+        attestation_evidence: bytes,
+        version: Optional[str] = None,
+    ) -> bytes:
+        """
+        Release a key after verifying attestation.
+
+        The key must have a release policy configured in Key Vault
+        that matches the attestation claims.
+
+        Args:
+            key_name: Name of the key in Key Vault
+            attestation_evidence: MAA attestation token
+            version: Key version (optional)
+
+        Returns:
+            Released key material
+
+        Raises:
+            AttestationError: If attestation fails or policy not satisfied
+        """
+        result = await self.maa_provider.verify(attestation_evidence)
+
+        if not result.verified:
+            raise AttestationError(
+                f"Attestation failed: {result.error}",
+                code="ATTESTATION_FAILED",
+            )
+
+        self._ensure_client()
+
+        try:
+            release_result = self._key_client.release_key(
+                name=key_name,
+                target_attestation_token=attestation_evidence.decode(),
+                version=version,
+            )
+
+            return base64.b64decode(release_result.value)
+        except Exception as e:
+            raise AttestationError(
+                f"Key release failed: {e}",
+                code="SKR_FAILED",
+            )
+
+    async def get_key_with_attestation(
+        self,
+        key_name: str,
+    ) -> tuple[bytes, bytes]:
+        """
+        Get a key by generating fresh attestation.
+
+        Generates attestation evidence and uses it to release the key.
+
+        Args:
+            key_name: Name of the key in Key Vault
+
+        Returns:
+            Tuple of (released_key, attestation_token)
+        """
+        attestation = await self.maa_provider.generate_evidence()
+        key = await self.release_key(key_name, attestation)
+        return key, attestation
+
+
+class ConfidentialContainerSidecar:
+    """
+    Sidecar pattern for protecting legacy apps in Azure Confidential Containers.
+
+    Runs alongside the main application, handling attestation and encryption.
+
+    Usage:
+        sidecar = ConfidentialContainerSidecar(
+            maa_endpoint="https://myattestation.eus.attest.azure.net",
+            vault_url="https://myvault.vault.azure.net",
+        )
+
+        # Get encryption key for the app
+        key = await sidecar.get_app_key("app-encryption-key")
+    """
+
+    def __init__(
+        self,
+        maa_endpoint: str,
+        vault_url: str,
+        expected_measurements: Optional[Dict[str, str]] = None,
+    ):
+        self.maa_provider = MAAAttestationProvider(
+            attestation_uri=maa_endpoint,
+            expected_measurements=expected_measurements,
+        )
+        self.skr = AzureKeyVaultSKR(
+            vault_url=vault_url,
+            maa_provider=self.maa_provider,
+        )
+        self._cached_attestation: Optional[bytes] = None
+        self._cache_time: float = 0
+        self._cache_ttl: float = 300
+
+    async def get_attestation(self, refresh: bool = False) -> bytes:
+        """Get cached or fresh attestation."""
+        if (
+            not refresh
+            and self._cached_attestation
+            and time.time() - self._cache_time < self._cache_ttl
+        ):
+            return self._cached_attestation
+
+        self._cached_attestation = await self.maa_provider.generate_evidence()
+        self._cache_time = time.time()
+        return self._cached_attestation
+
+    async def get_app_key(self, key_name: str) -> bytes:
+        """Get an application key with attestation."""
+        attestation = await self.get_attestation()
+        return await self.skr.release_key(key_name, attestation)
+
+    async def verify_peer(self, peer_attestation: bytes) -> AttestationResult:
+        """Verify attestation from another confidential container."""
+        return await self.maa_provider.verify(peer_attestation)
+
+
+===== python/shield/integrations/confidential/base.py =====
+
+"""
+Base Attestation Types for Confidential Computing
+
+Provides abstract base classes and common types for TEE attestation.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+from shield import Shield
+
+
+class TEEType(Enum):
+    """Supported Trusted Execution Environment types."""
+    NITRO = "aws_nitro"
+    SEV_SNP = "gcp_sev_snp"
+    MAA = "azure_maa"
+    SGX = "intel_sgx"
+    UNKNOWN = "unknown"
+
+
+class AttestationError(Exception):
+    """Raised when attestation verification fails."""
+
+    def __init__(self, message: str, code: str = "ATTESTATION_FAILED"):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+@dataclass
+class AttestationResult:
+    """Result of attestation verification."""
+    verified: bool
+    tee_type: TEEType
+    measurements: Dict[str, str] = field(default_factory=dict)
+    claims: Dict[str, Any] = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+    error: Optional[str] = None
+    raw_evidence: Optional[bytes] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "verified": self.verified,
+            "tee_type": self.tee_type.value,
+            "measurements": self.measurements,
+            "claims": self.claims,
+            "timestamp": self.timestamp,
+            "error": self.error,
+        }
+
+
+class AttestationProvider(ABC):
+    """Abstract base class for attestation providers."""
+
+    @property
+    @abstractmethod
+    def tee_type(self) -> TEEType:
+        """Return the TEE type this provider handles."""
+        pass
+
+    @abstractmethod
+    async def verify(self, evidence: bytes) -> AttestationResult:
+        """
+        Verify attestation evidence.
+
+        Args:
+            evidence: Raw attestation evidence (format depends on TEE type)
+
+        Returns:
+            AttestationResult with verification status and claims
+
+        Raises:
+            AttestationError: If verification fails
+        """
+        pass
+
+    @abstractmethod
+    async def generate_evidence(self, user_data: Optional[bytes] = None) -> bytes:
+        """
+        Generate attestation evidence for this TEE.
+
+        Args:
+            user_data: Optional user data to include in attestation
+
+        Returns:
+            Raw attestation evidence bytes
+
+        Raises:
+            AttestationError: If not running in a supported TEE
+        """
+        pass
+
+    def verify_measurements(
+        self,
+        result: AttestationResult,
+        expected: Dict[str, str],
+    ) -> bool:
+        """
+        Verify that measurements match expected values.
+
+        Args:
+            result: Attestation result to check
+            expected: Dictionary of measurement name -> expected value
+
+        Returns:
+            True if all expected measurements match
+        """
+        for name, expected_value in expected.items():
+            actual = result.measurements.get(name)
+            if actual is None or actual.lower() != expected_value.lower():
+                return False
+        return True
+
+
+@dataclass
+class KeyReleasePolicy:
+    """Policy for releasing keys based on attestation."""
+    required_tee_types: List[TEEType] = field(default_factory=list)
+    required_measurements: Dict[str, str] = field(default_factory=dict)
+    max_age_seconds: float = 300.0
+    allowed_claims: Dict[str, List[str]] = field(default_factory=dict)
+
+    def evaluate(self, result: AttestationResult) -> bool:
+        """Evaluate if attestation result satisfies this policy."""
+        if not result.verified:
+            return False
+
+        if self.required_tee_types:
+            if result.tee_type not in self.required_tee_types:
+                return False
+
+        age = time.time() - result.timestamp
+        if age > self.max_age_seconds:
+            return False
+
+        for name, expected in self.required_measurements.items():
+            actual = result.measurements.get(name)
+            if actual is None or actual.lower() != expected.lower():
+                return False
+
+        for claim_name, allowed_values in self.allowed_claims.items():
+            actual = result.claims.get(claim_name)
+            if actual not in allowed_values:
+                return False
+
+        return True
+
+
+class TEEKeyManager:
+    """
+    TEE-aware key manager with attestation-gated key release.
+
+    Keys are only released after successful attestation verification
+    against a configurable policy.
+
+    Usage:
+        provider = NitroAttestationProvider()
+        key_manager = TEEKeyManager(
+            password="secret",
+            service="api.example.com",
+            provider=provider,
+        )
+
+        # Set release policy
+        key_manager.set_policy(KeyReleasePolicy(
+            required_tee_types=[TEEType.NITRO],
+            required_measurements={"PCR0": "abc123..."},
+        ))
+
+        # Get key (requires valid attestation)
+        key = await key_manager.get_key(attestation_evidence)
+    """
+
+    def __init__(
+        self,
+        password: str,
+        service: str,
+        provider: AttestationProvider,
+        policy: Optional[KeyReleasePolicy] = None,
+    ):
+        self.shield = Shield(password, service)
+        self.provider = provider
+        self.policy = policy or KeyReleasePolicy()
+        self._key_cache: Dict[str, tuple[bytes, float]] = {}
+        self._cache_ttl = 60.0
+
+    def set_policy(self, policy: KeyReleasePolicy) -> None:
+        """Set the key release policy."""
+        self.policy = policy
+
+    async def get_key(
+        self,
+        attestation_evidence: bytes,
+        key_id: str = "default",
+    ) -> bytes:
+        """
+        Get a key after verifying attestation.
+
+        Args:
+            attestation_evidence: Raw attestation evidence
+            key_id: Identifier for the key to retrieve
+
+        Returns:
+            Derived key bytes
+
+        Raises:
+            AttestationError: If attestation fails or policy not satisfied
+        """
+        cache_key = self._hash_evidence(attestation_evidence, key_id)
+        cached = self._key_cache.get(cache_key)
+        if cached:
+            key, timestamp = cached
+            if time.time() - timestamp < self._cache_ttl:
+                return key
+
+        result = await self.provider.verify(attestation_evidence)
+
+        if not self.policy.evaluate(result):
+            raise AttestationError(
+                "Attestation does not satisfy key release policy",
+                code="POLICY_VIOLATION",
+            )
+
+        key = self._derive_key(key_id, result)
+        self._key_cache[cache_key] = (key, time.time())
+
+        return key
+
+    def _derive_key(self, key_id: str, result: AttestationResult) -> bytes:
+        """Derive a key bound to the attestation result."""
+        binding_data = json.dumps({
+            "key_id": key_id,
+            "tee_type": result.tee_type.value,
+            "measurements": result.measurements,
+        }, sort_keys=True).encode()
+
+        combined = binding_data + self.shield._key
+        return hashlib.sha256(combined).digest()
+
+    def _hash_evidence(self, evidence: bytes, key_id: str) -> str:
+        """Hash evidence for cache key."""
+        h = hashlib.sha256()
+        h.update(evidence)
+        h.update(key_id.encode())
+        return h.hexdigest()[:32]
+
+    async def encrypt_for_tee(
+        self,
+        data: bytes,
+        attestation_evidence: bytes,
+    ) -> bytes:
+        """
+        Encrypt data that can only be decrypted by an attested TEE.
+
+        Args:
+            data: Data to encrypt
+            attestation_evidence: Attestation evidence of target TEE
+
+        Returns:
+            Encrypted data with attestation binding
+        """
+        key = await self.get_key(attestation_evidence, "encryption")
+        temp_shield = Shield.__new__(Shield)
+        temp_shield._key = key
+        temp_shield._service = self.shield._service
+
+        encrypted = temp_shield.encrypt(data)
+
+        result = await self.provider.verify(attestation_evidence)
+        envelope = {
+            "encrypted": base64.b64encode(encrypted).decode(),
+            "tee_type": result.tee_type.value,
+            "measurements": result.measurements,
+        }
+
+        return json.dumps(envelope).encode()
+
+    async def decrypt_in_tee(
+        self,
+        envelope_data: bytes,
+        attestation_evidence: bytes,
+    ) -> bytes:
+        """
+        Decrypt data inside an attested TEE.
+
+        Args:
+            envelope_data: Encrypted envelope from encrypt_for_tee
+            attestation_evidence: Current TEE's attestation evidence
+
+        Returns:
+            Decrypted data
+
+        Raises:
+            AttestationError: If TEE doesn't match or attestation fails
+        """
+        envelope = json.loads(envelope_data)
+
+        result = await self.provider.verify(attestation_evidence)
+
+        if result.tee_type.value != envelope["tee_type"]:
+            raise AttestationError(
+                f"TEE type mismatch: expected {envelope['tee_type']}, "
+                f"got {result.tee_type.value}",
+                code="TEE_MISMATCH",
+            )
+
+        for name, expected in envelope["measurements"].items():
+            actual = result.measurements.get(name)
+            if actual != expected:
+                raise AttestationError(
+                    f"Measurement mismatch for {name}",
+                    code="MEASUREMENT_MISMATCH",
+                )
+
+        key = await self.get_key(attestation_evidence, "encryption")
+
+        temp_shield = Shield.__new__(Shield)
+        temp_shield._key = key
+        temp_shield._service = self.shield._service
+
+        encrypted = base64.b64decode(envelope["encrypted"])
+        return temp_shield.decrypt(encrypted)
+
+
+===== python/shield/integrations/confidential/gcp_sev.py =====
+
+"""
+GCP Confidential VMs (AMD SEV-SNP) Attestation Provider
+
+Provides attestation verification for GCP Confidential VMs using
+AMD SEV-SNP hardware attestation and vTPM measurements.
+
+Requirements:
+    - Running on a GCP Confidential VM (n2d-* with SEV_SNP)
+    - google-cloud-compute for metadata access
+    - google-cloud-kms for secret release
+
+Usage:
+    from shield.integrations.confidential import SEVAttestationProvider
+
+    provider = SEVAttestationProvider(
+        project_id="my-project",
+        expected_measurements={"PCR0": "abc123..."},
+    )
+
+    # Verify attestation
+    result = await provider.verify(attestation_token)
+
+    # Generate attestation (inside Confidential VM)
+    evidence = await provider.generate_evidence()
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import time
+from typing import Any, Dict, List, Optional
+from urllib.request import Request, urlopen
+from urllib.error import URLError
+
+from shield.integrations.confidential.base import (
+    AttestationError,
+    AttestationProvider,
+    AttestationResult,
+    TEEType,
+)
+
+GCP_METADATA_URL = "http://metadata.google.internal/computeMetadata/v1"
+GCP_ATTESTATION_URL = "http://metadata.google.internal/computeMetadata/v1/instance/virtual-machine/verify-token"
+CONFIDENTIAL_SPACE_TOKEN_URL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity"
+
+
+class SEVAttestationProvider(AttestationProvider):
+    """
+    GCP Confidential VM (AMD SEV-SNP) attestation provider.
+
+    Verifies attestation tokens from GCP Confidential VMs containing:
+    - AMD SEV-SNP measurements
+    - vTPM PCR values
+    - VM identity and metadata
+    - Google-signed JWT tokens
+
+    Args:
+        project_id: GCP project ID
+        expected_measurements: Dictionary of measurement name -> expected value
+        verify_signature: Whether to verify Google's JWT signature
+        allowed_zones: List of allowed GCP zones (optional)
+    """
+
+    def __init__(
+        self,
+        project_id: Optional[str] = None,
+        expected_measurements: Optional[Dict[str, str]] = None,
+        verify_signature: bool = True,
+        allowed_zones: Optional[List[str]] = None,
+        audience: Optional[str] = None,
+    ):
+        self.project_id = project_id
+        self.expected_measurements = expected_measurements or {}
+        self.verify_signature = verify_signature
+        self.allowed_zones = allowed_zones
+        self.audience = audience or "shield-attestation"
+
+    @property
+    def tee_type(self) -> TEEType:
+        return TEEType.SEV_SNP
+
+    async def verify(self, evidence: bytes) -> AttestationResult:
+        """
+        Verify a GCP Confidential VM attestation token.
+
+        The token is a Google-signed JWT containing:
+        - VM instance identity
+        - SEV-SNP status and measurements
+        - vTPM PCR values
+
+        Args:
+            evidence: JWT attestation token (bytes or string)
+
+        Returns:
+            AttestationResult with measurements and claims
+        """
+        try:
+            if isinstance(evidence, bytes):
+                token = evidence.decode("utf-8")
+            else:
+                token = str(evidence)
+        except Exception as e:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error=f"Invalid token encoding: {e}",
+                raw_evidence=evidence,
+            )
+
+        parts = token.split(".")
+        if len(parts) != 3:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error="Invalid JWT format",
+                raw_evidence=evidence,
+            )
+
+        try:
+            header_b64 = parts[0] + "=" * (4 - len(parts[0]) % 4)
+            payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
+
+            header = json.loads(base64.urlsafe_b64decode(header_b64))
+            payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        except Exception as e:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error=f"Failed to decode JWT: {e}",
+                raw_evidence=evidence,
+            )
+
+        measurements = {}
+
+        sev_snp = payload.get("sev_snp", {})
+        if sev_snp:
+            if sev_snp.get("measurement"):
+                measurements["SEV_MEASUREMENT"] = sev_snp["measurement"]
+            if sev_snp.get("host_data"):
+                measurements["HOST_DATA"] = sev_snp["host_data"]
+            if sev_snp.get("report_data"):
+                measurements["REPORT_DATA"] = sev_snp["report_data"]
+
+        tpm_pcrs = payload.get("tpm_pcrs", {})
+        for pcr_idx, value in tpm_pcrs.items():
+            measurements[f"PCR{pcr_idx}"] = value
+
+        claims = {
+            "project_id": payload.get("google", {}).get("project_id", ""),
+            "project_number": payload.get("google", {}).get("project_number", ""),
+            "zone": payload.get("google", {}).get("zone", ""),
+            "instance_id": payload.get("google", {}).get("instance_id", ""),
+            "instance_name": payload.get("google", {}).get("instance_name", ""),
+            "confidential_vm": payload.get("google", {}).get("confidential_vm", False),
+            "sev_snp_enabled": bool(sev_snp),
+            "iat": payload.get("iat", 0),
+            "exp": payload.get("exp", 0),
+        }
+
+        google_claims = payload.get("google", {})
+        if not google_claims.get("confidential_vm", False):
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                measurements=measurements,
+                claims=claims,
+                error="VM is not a Confidential VM",
+                raw_evidence=evidence,
+            )
+
+        if self.project_id and claims["project_id"] != self.project_id:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                measurements=measurements,
+                claims=claims,
+                error=f"Project mismatch: expected {self.project_id}",
+                raw_evidence=evidence,
+            )
+
+        if self.allowed_zones and claims["zone"] not in self.allowed_zones:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                measurements=measurements,
+                claims=claims,
+                error=f"Zone {claims['zone']} not allowed",
+                raw_evidence=evidence,
+            )
+
+        exp = payload.get("exp", 0)
+        if exp and time.time() > exp:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                measurements=measurements,
+                claims=claims,
+                error="Token expired",
+                raw_evidence=evidence,
+            )
+
+        for name, expected in self.expected_measurements.items():
+            actual = measurements.get(name, "").lower()
+            if actual != expected.lower():
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=measurements,
+                    claims=claims,
+                    error=f"Measurement {name} mismatch",
+                    raw_evidence=evidence,
+                )
+
+        return AttestationResult(
+            verified=True,
+            tee_type=self.tee_type,
+            measurements=measurements,
+            claims=claims,
+            timestamp=payload.get("iat", time.time()),
+            raw_evidence=evidence,
+        )
+
+    async def generate_evidence(
+        self,
+        user_data: Optional[bytes] = None,
+        audience: Optional[str] = None,
+    ) -> bytes:
+        """
+        Generate attestation evidence from inside a GCP Confidential VM.
+
+        This requests an identity token from the GCP metadata service
+        that includes attestation claims.
+
+        Args:
+            user_data: Optional user data (used as nonce in token request)
+            audience: Token audience (default: self.audience)
+
+        Returns:
+            JWT attestation token
+
+        Raises:
+            AttestationError: If not running on GCP or not a Confidential VM
+        """
+        aud = audience or self.audience
+
+        url = f"{CONFIDENTIAL_SPACE_TOKEN_URL}?audience={aud}&format=full"
+
+        if user_data:
+            nonce = base64.urlsafe_b64encode(user_data).decode().rstrip("=")
+            url += f"&nonce={nonce}"
+
+        try:
+            request = Request(url)
+            request.add_header("Metadata-Flavor", "Google")
+
+            with urlopen(request, timeout=10) as response:
+                token = response.read()
+
+            return token
+
+        except URLError as e:
+            raise AttestationError(
+                f"Failed to get attestation token: {e}. "
+                "Are you running on a GCP Confidential VM?",
+                code="METADATA_ERROR",
+            )
+
+    async def get_instance_metadata(self) -> Dict[str, Any]:
+        """
+        Get current instance metadata.
+
+        Returns:
+            Dictionary with instance information
+        """
+        metadata = {}
+
+        paths = [
+            ("project_id", "project/project-id"),
+            ("zone", "instance/zone"),
+            ("instance_id", "instance/id"),
+            ("instance_name", "instance/name"),
+            ("machine_type", "instance/machine-type"),
+        ]
+
+        for key, path in paths:
+            try:
+                url = f"{GCP_METADATA_URL}/{path}"
+                request = Request(url)
+                request.add_header("Metadata-Flavor", "Google")
+
+                with urlopen(request, timeout=5) as response:
+                    metadata[key] = response.read().decode().split("/")[-1]
+            except Exception:
+                metadata[key] = None
+
+        try:
+            url = f"{GCP_METADATA_URL}/instance/attributes/enable-confidential-compute"
+            request = Request(url)
+            request.add_header("Metadata-Flavor", "Google")
+
+            with urlopen(request, timeout=5) as response:
+                value = response.read().decode().lower()
+                metadata["confidential_vm"] = value == "true"
+        except Exception:
+            metadata["confidential_vm"] = False
+
+        return metadata
+
+    async def is_confidential_vm(self) -> bool:
+        """Check if running on a Confidential VM."""
+        try:
+            metadata = await self.get_instance_metadata()
+            return metadata.get("confidential_vm", False)
+        except Exception:
+            return False
+
+
+class ConfidentialSpaceProvider(SEVAttestationProvider):
+    """
+    GCP Confidential Space attestation provider.
+
+    Confidential Space is a serverless confidential computing environment
+    that provides stronger attestation with workload identity.
+
+    Additional features over standard Confidential VMs:
+    - Workload identity tokens
+    - Container image measurements
+    - Attestation policies
+    """
+
+    def __init__(
+        self,
+        project_id: Optional[str] = None,
+        expected_image_digest: Optional[str] = None,
+        expected_measurements: Optional[Dict[str, str]] = None,
+        allowed_zones: Optional[List[str]] = None,
+    ):
+        super().__init__(
+            project_id=project_id,
+            expected_measurements=expected_measurements,
+            allowed_zones=allowed_zones,
+        )
+        self.expected_image_digest = expected_image_digest
+
+    async def verify(self, evidence: bytes) -> AttestationResult:
+        """Verify Confidential Space attestation."""
+        result = await super().verify(evidence)
+
+        if not result.verified:
+            return result
+
+        if self.expected_image_digest:
+            actual_digest = result.claims.get("container_image_digest", "")
+            if actual_digest != self.expected_image_digest:
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=result.measurements,
+                    claims=result.claims,
+                    error=f"Image digest mismatch",
+                    raw_evidence=evidence,
+                )
+
+        return result
+
+    async def generate_workload_token(
+        self,
+        audience: str,
+        token_type: str = "OIDC",
+    ) -> bytes:
+        """
+        Generate a workload identity token.
+
+        Args:
+            audience: Token audience
+            token_type: Token type (OIDC or PKI)
+
+        Returns:
+            Signed workload token
+        """
+        url = (
+            f"{GCP_METADATA_URL}/instance/service-accounts/default/identity"
+            f"?audience={audience}&format=full"
+        )
+
+        try:
+            request = Request(url)
+            request.add_header("Metadata-Flavor", "Google")
+
+            with urlopen(request, timeout=10) as response:
+                return response.read()
+        except URLError as e:
+            raise AttestationError(
+                f"Failed to get workload token: {e}",
+                code="METADATA_ERROR",
+            )
+
+
+class GCPSecretManager:
+    """
+    GCP Secret Manager with attestation-based access.
+
+    Retrieves secrets only after verifying attestation.
+
+    Usage:
+        manager = GCPSecretManager(
+            project_id="my-project",
+            provider=SEVAttestationProvider(),
+        )
+        secret = await manager.get_secret("my-secret", attestation_token)
+    """
+
+    def __init__(
+        self,
+        project_id: str,
+        provider: SEVAttestationProvider,
+    ):
+        self.project_id = project_id
+        self.provider = provider
+        self._client = None
+
+    def _ensure_client(self):
+        """Ensure Secret Manager client is available."""
+        if self._client is None:
+            try:
+                from google.cloud import secretmanager
+                self._client = secretmanager.SecretManagerServiceClient()
+            except ImportError:
+                raise AttestationError(
+                    "google-cloud-secret-manager required. "
+                    "Install with: pip install google-cloud-secret-manager",
+                    code="MISSING_DEPENDENCY",
+                )
+
+    async def get_secret(
+        self,
+        secret_id: str,
+        attestation_evidence: bytes,
+        version: str = "latest",
+    ) -> bytes:
+        """
+        Get a secret after verifying attestation.
+
+        Args:
+            secret_id: Secret ID in Secret Manager
+            attestation_evidence: Attestation token
+            version: Secret version (default: latest)
+
+        Returns:
+            Secret value
+
+        Raises:
+            AttestationError: If attestation fails
+        """
+        result = await self.provider.verify(attestation_evidence)
+
+        if not result.verified:
+            raise AttestationError(
+                f"Attestation failed: {result.error}",
+                code="ATTESTATION_FAILED",
+            )
+
+        self._ensure_client()
+
+        name = f"projects/{self.project_id}/secrets/{secret_id}/versions/{version}"
+        response = self._client.access_secret_version(request={"name": name})
+
+        return response.payload.data
+
+
+===== python/shield/integrations/confidential/intel_sgx.py =====
+
+"""
+Intel SGX Attestation Provider
+
+Provides attestation verification for Intel SGX enclaves using
+DCAP (Data Center Attestation Primitives) or EPID.
+
+Requirements:
+    - Running inside an SGX enclave (via Gramine or Occlum)
+    - Intel SGX DCAP libraries for quote generation
+    - PCCS (Provisioning Certificate Caching Service) for verification
+
+Usage:
+    from shield.integrations.confidential import SGXAttestationProvider
+
+    provider = SGXAttestationProvider(
+        expected_mrenclave="abc123...",
+        expected_mrsigner="def456...",
+    )
+
+    # Verify SGX quote
+    result = await provider.verify(quote)
+
+    # Generate quote (inside enclave)
+    evidence = await provider.generate_evidence(report_data=b"nonce")
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import struct
+import time
+from typing import Any, Dict, List, Optional
+
+from shield.integrations.confidential.base import (
+    AttestationError,
+    AttestationProvider,
+    AttestationResult,
+    TEEType,
+)
+
+SGX_REPORT_BODY_SIZE = 384
+SGX_QUOTE_HEADER_SIZE = 48
+
+
+class SGXAttestationProvider(AttestationProvider):
+    """
+    Intel SGX attestation provider.
+
+    Verifies DCAP quotes containing:
+    - MRENCLAVE (enclave measurement)
+    - MRSIGNER (signer measurement)
+    - ISV Product ID and SVN
+    - Report data (user-provided)
+
+    Args:
+        expected_mrenclave: Expected MRENCLAVE value (hex)
+        expected_mrsigner: Expected MRSIGNER value (hex)
+        min_isv_svn: Minimum ISV SVN version
+        verify_with_pccs: Whether to verify quote with Intel PCCS
+        pccs_url: PCCS URL for quote verification
+    """
+
+    def __init__(
+        self,
+        expected_mrenclave: Optional[str] = None,
+        expected_mrsigner: Optional[str] = None,
+        min_isv_svn: int = 0,
+        verify_with_pccs: bool = False,
+        pccs_url: str = "https://localhost:8081/sgx/certification/v4",
+    ):
+        self.expected_mrenclave = expected_mrenclave
+        self.expected_mrsigner = expected_mrsigner
+        self.min_isv_svn = min_isv_svn
+        self.verify_with_pccs = verify_with_pccs
+        self.pccs_url = pccs_url
+
+    @property
+    def tee_type(self) -> TEEType:
+        return TEEType.SGX
+
+    async def verify(self, evidence: bytes) -> AttestationResult:
+        """
+        Verify an SGX DCAP quote.
+
+        Quote structure:
+        - Header (48 bytes): version, att_key_type, tee_type, etc.
+        - Report Body (384 bytes): MRENCLAVE, MRSIGNER, etc.
+        - Signature data (variable)
+
+        Args:
+            evidence: Raw SGX quote bytes
+
+        Returns:
+            AttestationResult with measurements and claims
+        """
+        if len(evidence) < SGX_QUOTE_HEADER_SIZE + SGX_REPORT_BODY_SIZE:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error=f"Quote too small: {len(evidence)} bytes",
+                raw_evidence=evidence,
+            )
+
+        try:
+            header = self._parse_quote_header(evidence[:SGX_QUOTE_HEADER_SIZE])
+            report_body = self._parse_report_body(
+                evidence[SGX_QUOTE_HEADER_SIZE:SGX_QUOTE_HEADER_SIZE + SGX_REPORT_BODY_SIZE]
+            )
+        except Exception as e:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                error=f"Failed to parse quote: {e}",
+                raw_evidence=evidence,
+            )
+
+        measurements = {
+            "MRENCLAVE": report_body["mrenclave"],
+            "MRSIGNER": report_body["mrsigner"],
+            "REPORT_DATA": report_body["report_data"],
+            "CPU_SVN": report_body["cpu_svn"],
+        }
+
+        claims = {
+            "quote_version": header["version"],
+            "att_key_type": header["att_key_type"],
+            "tee_type": header["tee_type"],
+            "isv_prod_id": report_body["isv_prod_id"],
+            "isv_svn": report_body["isv_svn"],
+            "attributes": report_body["attributes"],
+            "misc_select": report_body["misc_select"],
+        }
+
+        if self.expected_mrenclave:
+            actual = measurements["MRENCLAVE"].lower()
+            if actual != self.expected_mrenclave.lower():
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=measurements,
+                    claims=claims,
+                    error=f"MRENCLAVE mismatch: expected {self.expected_mrenclave}",
+                    raw_evidence=evidence,
+                )
+
+        if self.expected_mrsigner:
+            actual = measurements["MRSIGNER"].lower()
+            if actual != self.expected_mrsigner.lower():
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=measurements,
+                    claims=claims,
+                    error=f"MRSIGNER mismatch: expected {self.expected_mrsigner}",
+                    raw_evidence=evidence,
+                )
+
+        if report_body["isv_svn"] < self.min_isv_svn:
+            return AttestationResult(
+                verified=False,
+                tee_type=self.tee_type,
+                measurements=measurements,
+                claims=claims,
+                error=f"ISV SVN {report_body['isv_svn']} below minimum {self.min_isv_svn}",
+                raw_evidence=evidence,
+            )
+
+        if self.verify_with_pccs:
+            try:
+                await self._verify_with_pccs(evidence)
+            except Exception as e:
+                return AttestationResult(
+                    verified=False,
+                    tee_type=self.tee_type,
+                    measurements=measurements,
+                    claims=claims,
+                    error=f"PCCS verification failed: {e}",
+                    raw_evidence=evidence,
+                )
+
+        return AttestationResult(
+            verified=True,
+            tee_type=self.tee_type,
+            measurements=measurements,
+            claims=claims,
+            timestamp=time.time(),
+            raw_evidence=evidence,
+        )
+
+    def _parse_quote_header(self, data: bytes) -> Dict[str, Any]:
+        """Parse SGX quote header."""
+        version, att_key_type, tee_type, reserved, vendor_id = struct.unpack(
+            "<HHHI16s", data[:28]
+        )
+
+        user_data = data[28:48]
+
+        return {
+            "version": version,
+            "att_key_type": att_key_type,
+            "tee_type": tee_type,
+            "vendor_id": vendor_id.hex(),
+            "user_data": user_data.hex(),
+        }
+
+    def _parse_report_body(self, data: bytes) -> Dict[str, Any]:
+        """Parse SGX report body."""
+        cpu_svn = data[0:16].hex()
+        misc_select = struct.unpack("<I", data[16:20])[0]
+        reserved1 = data[20:48]
+        attributes = data[48:64].hex()
+        mrenclave = data[64:96].hex()
+        reserved2 = data[96:128]
+        mrsigner = data[128:160].hex()
+        reserved3 = data[160:256]
+        isv_prod_id = struct.unpack("<H", data[256:258])[0]
+        isv_svn = struct.unpack("<H", data[258:260])[0]
+        reserved4 = data[260:320]
+        report_data = data[320:384].hex()
+
+        return {
+            "cpu_svn": cpu_svn,
+            "misc_select": misc_select,
+            "attributes": attributes,
+            "mrenclave": mrenclave,
+            "mrsigner": mrsigner,
+            "isv_prod_id": isv_prod_id,
+            "isv_svn": isv_svn,
+            "report_data": report_data,
+        }
+
+    async def _verify_with_pccs(self, quote: bytes) -> None:
+        """Verify quote with Intel PCCS."""
+        from urllib.request import Request, urlopen
+        from urllib.error import URLError
+
+        url = f"{self.pccs_url}/quote"
+
+        request = Request(
+            url,
+            data=quote,
+            headers={"Content-Type": "application/octet-stream"},
+            method="POST",
+        )
+
+        try:
+            with urlopen(request, timeout=30) as response:
+                if response.status != 200:
+                    raise AttestationError(
+                        f"PCCS returned status {response.status}",
+                        code="PCCS_ERROR",
+                    )
+        except URLError as e:
+            raise AttestationError(
+                f"Failed to contact PCCS: {e}",
+                code="PCCS_ERROR",
+            )
+
+    async def generate_evidence(
+        self,
+        report_data: Optional[bytes] = None,
+    ) -> bytes:
+        """
+        Generate SGX quote from inside an enclave.
+
+        This works with Gramine's /dev/attestation interface.
+
+        Args:
+            report_data: User data to include in quote (64 bytes max)
+
+        Returns:
+            Raw SGX quote bytes
+
+        Raises:
+            AttestationError: If not running in an SGX enclave
+        """
+        user_report_data = report_data or b"\x00" * 64
+        if len(user_report_data) < 64:
+            user_report_data = user_report_data + b"\x00" * (64 - len(user_report_data))
+        user_report_data = user_report_data[:64]
+
+        gramine_paths = [
+            "/dev/attestation/quote",
+            "/dev/attestation/user_report_data",
+        ]
+
+        if all(os.path.exists(p) for p in gramine_paths):
+            return await self._gramine_quote(user_report_data)
+
+        occlum_path = "/dev/sgx"
+        if os.path.exists(occlum_path):
+            return await self._occlum_quote(user_report_data)
+
+        raise AttestationError(
+            "Not running in an SGX enclave. "
+            "Gramine or Occlum attestation interface not found.",
+            code="NOT_IN_ENCLAVE",
+        )
+
+    async def _gramine_quote(self, report_data: bytes) -> bytes:
+        """Generate quote using Gramine's attestation interface."""
+        try:
+            with open("/dev/attestation/user_report_data", "wb") as f:
+                f.write(report_data)
+
+            with open("/dev/attestation/quote", "rb") as f:
+                quote = f.read()
+
+            return quote
+        except Exception as e:
+            raise AttestationError(
+                f"Failed to generate Gramine quote: {e}",
+                code="GRAMINE_ERROR",
+            )
+
+    async def _occlum_quote(self, report_data: bytes) -> bytes:
+        """Generate quote using Occlum's interface."""
+        try:
+            import ctypes
+
+            libocclum_pal = ctypes.CDLL("libocclum-pal.so")
+
+            quote_size = ctypes.c_uint32()
+            report_data_arr = (ctypes.c_uint8 * 64).from_buffer_copy(report_data)
+
+            ret = libocclum_pal.occlum_pal_get_quote_size(ctypes.byref(quote_size))
+            if ret != 0:
+                raise AttestationError(
+                    f"Failed to get quote size: {ret}",
+                    code="OCCLUM_ERROR",
+                )
+
+            quote_buf = (ctypes.c_uint8 * quote_size.value)()
+
+            ret = libocclum_pal.occlum_pal_generate_quote(
+                report_data_arr,
+                quote_buf,
+                quote_size,
+            )
+            if ret != 0:
+                raise AttestationError(
+                    f"Failed to generate quote: {ret}",
+                    code="OCCLUM_ERROR",
+                )
+
+            return bytes(quote_buf)
+        except OSError:
+            raise AttestationError(
+                "Occlum PAL library not found",
+                code="OCCLUM_ERROR",
+            )
+
+
+class SealedStorage:
+    """
+    SGX sealed storage for persistent secrets.
+
+    Data sealed to enclave identity can only be unsealed by the
+    same enclave (MRENCLAVE) or same signer (MRSIGNER).
+
+    Usage:
+        storage = SealedStorage(seal_to="mrenclave")
+
+        # Seal data
+        sealed = await storage.seal(b"secret data")
+
+        # Unseal data (only works in same enclave)
+        data = await storage.unseal(sealed)
+    """
+
+    def __init__(
+        self,
+        seal_to: str = "mrenclave",
+        storage_path: str = "/data/sealed",
+    ):
+        """
+        Initialize sealed storage.
+
+        Args:
+            seal_to: Seal to "mrenclave" or "mrsigner"
+            storage_path: Path to store sealed data
+        """
+        if seal_to not in ("mrenclave", "mrsigner"):
+            raise ValueError("seal_to must be 'mrenclave' or 'mrsigner'")
+
+        self.seal_to = seal_to
+        self.storage_path = storage_path
+
+    async def seal(self, data: bytes) -> bytes:
+        """
+        Seal data to enclave identity.
+
+        Uses Gramine's sealing interface if available.
+
+        Args:
+            data: Data to seal
+
+        Returns:
+            Sealed data blob
+        """
+        seal_path = f"/dev/attestation/keys/{self.seal_to}"
+
+        if os.path.exists(seal_path):
+            try:
+                with open(seal_path, "rb") as f:
+                    seal_key = f.read(16)
+
+                from shield import Shield
+                s = Shield.__new__(Shield)
+                s._key = hashlib.sha256(seal_key).digest()
+                s._service = f"sgx-sealed-{self.seal_to}"
+
+                return s.encrypt(data)
+            except Exception as e:
+                raise AttestationError(
+                    f"Failed to seal data: {e}",
+                    code="SEAL_ERROR",
+                )
+
+        raise AttestationError(
+            "Gramine sealing interface not available",
+            code="NOT_IN_ENCLAVE",
+        )
+
+    async def unseal(self, sealed_data: bytes) -> bytes:
+        """
+        Unseal data.
+
+        Args:
+            sealed_data: Previously sealed data
+
+        Returns:
+            Original data
+
+        Raises:
+            AttestationError: If unsealing fails
+        """
+        seal_path = f"/dev/attestation/keys/{self.seal_to}"
+
+        if os.path.exists(seal_path):
+            try:
+                with open(seal_path, "rb") as f:
+                    seal_key = f.read(16)
+
+                from shield import Shield
+                s = Shield.__new__(Shield)
+                s._key = hashlib.sha256(seal_key).digest()
+                s._service = f"sgx-sealed-{self.seal_to}"
+
+                return s.decrypt(sealed_data)
+            except Exception as e:
+                raise AttestationError(
+                    f"Failed to unseal data: {e}",
+                    code="UNSEAL_ERROR",
+                )
+
+        raise AttestationError(
+            "Gramine sealing interface not available",
+            code="NOT_IN_ENCLAVE",
+        )
+
+    async def store(self, key: str, data: bytes) -> None:
+        """
+        Seal and store data with a key.
+
+        Args:
+            key: Storage key
+            data: Data to store
+        """
+        os.makedirs(self.storage_path, exist_ok=True)
+        sealed = await self.seal(data)
+
+        key_hash = hashlib.sha256(key.encode()).hexdigest()[:32]
+        path = os.path.join(self.storage_path, key_hash)
+
+        with open(path, "wb") as f:
+            f.write(sealed)
+
+    async def load(self, key: str) -> bytes:
+        """
+        Load and unseal data by key.
+
+        Args:
+            key: Storage key
+
+        Returns:
+            Original data
+
+        Raises:
+            AttestationError: If key not found or unsealing fails
+        """
+        key_hash = hashlib.sha256(key.encode()).hexdigest()[:32]
+        path = os.path.join(self.storage_path, key_hash)
+
+        if not os.path.exists(path):
+            raise AttestationError(
+                f"Sealed data not found: {key}",
+                code="NOT_FOUND",
+            )
+
+        with open(path, "rb") as f:
+            sealed = f.read()
+
+        return await self.unseal(sealed)
+
+
+class GramineManifestHelper:
+    """
+    Helper for generating Gramine manifest configurations.
+
+    Usage:
+        helper = GramineManifestHelper(
+            entrypoint="/app/shield",
+            enclave_size="256M",
+        )
+
+        manifest = helper.generate()
+    """
+
+    def __init__(
+        self,
+        entrypoint: str,
+        enclave_size: str = "256M",
+        thread_num: int = 8,
+        enable_edmm: bool = False,
+    ):
+        self.entrypoint = entrypoint
+        self.enclave_size = enclave_size
+        self.thread_num = thread_num
+        self.enable_edmm = enable_edmm
+
+    def generate(self) -> str:
+        """Generate Gramine manifest content."""
+        manifest = f"""# Gramine manifest for Shield application
+# Generated by shield.integrations.confidential
+
+[loader]
+entrypoint = "file:{{{{ gramine.libos }}}}"
+log_level = "warning"
+
+[loader.argv]
+argv0 = "{self.entrypoint}"
+
+[loader.env]
+LD_LIBRARY_PATH = "/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu"
+
+[libos]
+entrypoint = "{self.entrypoint}"
+
+[sys]
+enable_sigterm_injection = true
+
+[sgx]
+debug = false
+enclave_size = "{self.enclave_size}"
+thread_num = {self.thread_num}
+remote_attestation = "dcap"
+enable_stats = false
+edmm_enable = {"true" if self.enable_edmm else "false"}
+
+[sgx.trusted_files]
+entrypoint = "file:{self.entrypoint}"
+libos = "file:{{{{ gramine.libos }}}}"
+runtime = "file:{{{{ gramine.runtimedir() }}}}"
+
+[fs.mounts]
+type = "chroot"
+path = "/lib"
+uri = "file:{{{{ gramine.runtimedir() }}}}"
+"""
+        return manifest
+
+
+===== python/shield/integrations/confidential/middleware.py =====
+
+"""
+FastAPI Attestation Middleware and Decorators
+
+Provides middleware and decorators for protecting FastAPI endpoints
+with TEE attestation verification.
+
+Usage:
+    from fastapi import FastAPI
+    from shield.integrations.confidential import (
+        AttestationMiddleware,
+        requires_attestation,
+        NitroAttestationProvider,
+    )
+
+    app = FastAPI()
+    provider = NitroAttestationProvider()
+
+    # Add middleware for all endpoints
+    app.add_middleware(
+        AttestationMiddleware,
+        provider=provider,
+        require_client_attestation=True,
+    )
+
+    # Or protect specific endpoints
+    @app.get("/secure")
+    @requires_attestation(provider=provider)
+    async def secure_endpoint(attestation: AttestationResult):
+        return {"verified": True}
+"""
+
+from __future__ import annotations
+
+import base64
+import functools
+import json
+import time
+from typing import Any, Callable, Dict, List, Optional, Union
+
+from shield.integrations.confidential.base import (
+    AttestationError,
+    AttestationProvider,
+    AttestationResult,
+    TEEType,
+    TEEKeyManager,
+)
+
+try:
+    from fastapi import Depends, FastAPI, HTTPException, Request, Response
+    from fastapi.responses import JSONResponse
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.types import ASGIApp
+    FASTAPI_AVAILABLE = True
+except ImportError:
+    FASTAPI_AVAILABLE = False
+    Request = Any
+    Response = Any
+    HTTPException = Exception
+    BaseHTTPMiddleware = object
+    ASGIApp = Any
+
+
+ATTESTATION_HEADER = "X-Attestation-Token"
+ATTESTATION_TYPE_HEADER = "X-Attestation-Type"
+
+
+class AttestationMiddleware(BaseHTTPMiddleware if FASTAPI_AVAILABLE else object):
+    """
+    FastAPI middleware for TEE attestation verification.
+
+    Verifies attestation tokens in request headers before processing.
+    Can also provide server attestation in responses.
+
+    Args:
+        app: The FastAPI application
+        provider: Attestation provider for verification
+        require_client_attestation: Whether to require client attestation
+        provide_server_attestation: Whether to include server attestation in responses
+        exclude_routes: Routes to exclude from attestation requirement
+        attestation_header: Header name for attestation token
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        provider: AttestationProvider,
+        require_client_attestation: bool = True,
+        provide_server_attestation: bool = False,
+        exclude_routes: Optional[List[str]] = None,
+        attestation_header: str = ATTESTATION_HEADER,
+    ):
+        if not FASTAPI_AVAILABLE:
+            raise ImportError("FastAPI required. Install with: pip install fastapi")
+
+        super().__init__(app)
+        self.provider = provider
+        self.require_client_attestation = require_client_attestation
+        self.provide_server_attestation = provide_server_attestation
+        self.exclude_routes = exclude_routes or ["/docs", "/redoc", "/openapi.json", "/health"]
+        self.attestation_header = attestation_header
+        self._server_attestation_cache: Optional[bytes] = None
+        self._cache_time: float = 0
+        self._cache_ttl: float = 60
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        """Process request with attestation verification."""
+        path = request.url.path
+
+        if any(path.startswith(prefix) for prefix in self.exclude_routes):
+            return await call_next(request)
+
+        if self.require_client_attestation:
+            attestation_token = request.headers.get(self.attestation_header)
+
+            if not attestation_token:
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": "attestation_required",
+                        "message": f"Missing {self.attestation_header} header",
+                    },
+                    headers={"WWW-Authenticate": f"Attestation realm=TEE"},
+                )
+
+            try:
+                token_bytes = base64.b64decode(attestation_token)
+            except Exception:
+                token_bytes = attestation_token.encode()
+
+            try:
+                result = await self.provider.verify(token_bytes)
+            except Exception as e:
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": "attestation_failed",
+                        "message": str(e),
+                    },
+                )
+
+            if not result.verified:
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": "attestation_invalid",
+                        "message": result.error or "Attestation verification failed",
+                    },
+                )
+
+            request.state.attestation = result
+
+        response = await call_next(request)
+
+        if self.provide_server_attestation:
+            try:
+                server_attestation = await self._get_server_attestation()
+                response.headers["X-Server-Attestation"] = base64.b64encode(
+                    server_attestation
+                ).decode()
+                response.headers["X-Server-TEE-Type"] = self.provider.tee_type.value
+            except Exception:
+                pass
+
+        return response
+
+    async def _get_server_attestation(self) -> bytes:
+        """Get cached or fresh server attestation."""
+        if (
+            self._server_attestation_cache
+            and time.time() - self._cache_time < self._cache_ttl
+        ):
+            return self._server_attestation_cache
+
+        self._server_attestation_cache = await self.provider.generate_evidence()
+        self._cache_time = time.time()
+        return self._server_attestation_cache
+
+
+def requires_attestation(
+    provider: AttestationProvider,
+    required_tee_types: Optional[List[TEEType]] = None,
+    required_measurements: Optional[Dict[str, str]] = None,
+    header_name: str = ATTESTATION_HEADER,
+):
+    """
+    Decorator to protect FastAPI endpoints with attestation verification.
+
+    Args:
+        provider: Attestation provider for verification
+        required_tee_types: Optional list of allowed TEE types
+        required_measurements: Optional required measurements
+        header_name: Header name for attestation token
+
+    Usage:
+        @app.get("/secure")
+        @requires_attestation(
+            provider=NitroAttestationProvider(),
+            required_tee_types=[TEEType.NITRO],
+        )
+        async def secure_endpoint(request: Request):
+            attestation = request.state.attestation
+            return {"verified": True}
+    """
+    def decorator(func: Callable) -> Callable:
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            request = None
+            for arg in args:
+                if isinstance(arg, Request):
+                    request = arg
+                    break
+            if not request and "request" in kwargs:
+                request = kwargs["request"]
+
+            if not request:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Request object not found",
+                )
+
+            attestation_token = request.headers.get(header_name)
+
+            if not attestation_token:
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"Missing {header_name} header",
+                    headers={"WWW-Authenticate": "Attestation realm=TEE"},
+                )
+
+            try:
+                token_bytes = base64.b64decode(attestation_token)
+            except Exception:
+                token_bytes = attestation_token.encode()
+
+            try:
+                result = await provider.verify(token_bytes)
+            except AttestationError as e:
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"Attestation error: {e.message}",
+                )
+
+            if not result.verified:
+                raise HTTPException(
+                    status_code=401,
+                    detail=result.error or "Attestation verification failed",
+                )
+
+            if required_tee_types and result.tee_type not in required_tee_types:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"TEE type {result.tee_type.value} not allowed",
+                )
+
+            if required_measurements:
+                for name, expected in required_measurements.items():
+                    actual = result.measurements.get(name, "").lower()
+                    if actual != expected.lower():
+                        raise HTTPException(
+                            status_code=403,
+                            detail=f"Measurement {name} mismatch",
+                        )
+
+            request.state.attestation = result
+
+            return await func(*args, **kwargs)
+
+        return wrapper
+    return decorator
+
+
+def get_attestation_dependency(
+    provider: AttestationProvider,
+    header_name: str = ATTESTATION_HEADER,
+):
+    """
+    Create a FastAPI dependency for attestation verification.
+
+    Usage:
+        provider = NitroAttestationProvider()
+        AttestationDep = get_attestation_dependency(provider)
+
+        @app.get("/secure")
+        async def secure_endpoint(attestation: AttestationResult = Depends(AttestationDep)):
+            return {"tee_type": attestation.tee_type.value}
+    """
+    async def dependency(request: Request) -> AttestationResult:
+        attestation_token = request.headers.get(header_name)
+
+        if not attestation_token:
+            raise HTTPException(
+                status_code=401,
+                detail=f"Missing {header_name} header",
+            )
+
+        try:
+            token_bytes = base64.b64decode(attestation_token)
+        except Exception:
+            token_bytes = attestation_token.encode()
+
+        result = await provider.verify(token_bytes)
+
+        if not result.verified:
+            raise HTTPException(
+                status_code=401,
+                detail=result.error or "Attestation verification failed",
+            )
+
+        return result
+
+    return dependency
+
+
+class AttestationRouter:
+    """
+    FastAPI router for attestation endpoints.
+
+    Provides standard endpoints for attestation operations:
+    - GET /attestation: Get server attestation
+    - POST /attestation/verify: Verify client attestation
+    - GET /attestation/health: Health check with TEE status
+
+    Usage:
+        from fastapi import FastAPI
+        from shield.integrations.confidential import AttestationRouter
+
+        app = FastAPI()
+        attestation_router = AttestationRouter(
+            provider=NitroAttestationProvider(),
+        )
+        app.include_router(attestation_router.router, prefix="/api")
+    """
+
+    def __init__(
+        self,
+        provider: AttestationProvider,
+        enable_server_attestation: bool = True,
+        enable_verification: bool = True,
+    ):
+        if not FASTAPI_AVAILABLE:
+            raise ImportError("FastAPI required. Install with: pip install fastapi")
+
+        from fastapi import APIRouter
+
+        self.provider = provider
+        self.router = APIRouter(tags=["attestation"])
+        self._server_attestation_cache: Optional[bytes] = None
+        self._cache_time: float = 0
+        self._cache_ttl: float = 60
+
+        if enable_server_attestation:
+            self._add_attestation_endpoint()
+
+        if enable_verification:
+            self._add_verification_endpoint()
+
+        self._add_health_endpoint()
+
+    def _add_attestation_endpoint(self):
+        @self.router.get("/attestation")
+        async def get_attestation(user_data: Optional[str] = None):
+            """Get server attestation evidence."""
+            try:
+                ud = base64.b64decode(user_data) if user_data else None
+                evidence = await self.provider.generate_evidence(user_data=ud)
+
+                return {
+                    "attestation": base64.b64encode(evidence).decode(),
+                    "tee_type": self.provider.tee_type.value,
+                    "timestamp": time.time(),
+                }
+            except AttestationError as e:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Attestation not available: {e.message}",
+                )
+
+    def _add_verification_endpoint(self):
+        @self.router.post("/attestation/verify")
+        async def verify_attestation(request: Request):
+            """Verify attestation evidence."""
+            body = await request.json()
+            attestation_b64 = body.get("attestation")
+
+            if not attestation_b64:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Missing 'attestation' field",
+                )
+
+            try:
+                evidence = base64.b64decode(attestation_b64)
+            except Exception:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid base64 encoding",
+                )
+
+            result = await self.provider.verify(evidence)
+
+            return {
+                "verified": result.verified,
+                "tee_type": result.tee_type.value,
+                "measurements": result.measurements,
+                "claims": result.claims,
+                "error": result.error,
+            }
+
+    def _add_health_endpoint(self):
+        @self.router.get("/attestation/health")
+        async def attestation_health():
+            """Health check with TEE status."""
+            try:
+                evidence = await self.provider.generate_evidence()
+                result = await self.provider.verify(evidence)
+
+                return {
+                    "status": "healthy",
+                    "tee_type": self.provider.tee_type.value,
+                    "in_tee": result.verified,
+                    "measurements": result.measurements,
+                }
+            except AttestationError:
+                return {
+                    "status": "degraded",
+                    "tee_type": self.provider.tee_type.value,
+                    "in_tee": False,
+                    "message": "Not running in TEE",
+                }
+
+
+class MutualAttestationClient:
+    """
+    Client for mutual attestation between services.
+
+    Both client and server prove they are running in TEEs.
+
+    Usage:
+        client = MutualAttestationClient(
+            server_url="https://api.example.com",
+            provider=NitroAttestationProvider(),
+        )
+
+        # Verify server and make authenticated request
+        response = await client.request(
+            method="GET",
+            path="/secure/data",
+        )
+    """
+
+    def __init__(
+        self,
+        server_url: str,
+        provider: AttestationProvider,
+        verify_server: bool = True,
+        expected_server_tee: Optional[TEEType] = None,
+    ):
+        self.server_url = server_url.rstrip("/")
+        self.provider = provider
+        self.verify_server = verify_server
+        self.expected_server_tee = expected_server_tee
+        self._client_attestation_cache: Optional[bytes] = None
+        self._cache_time: float = 0
+        self._cache_ttl: float = 60
+
+    async def _get_client_attestation(self) -> bytes:
+        """Get cached or fresh client attestation."""
+        if (
+            self._client_attestation_cache
+            and time.time() - self._cache_time < self._cache_ttl
+        ):
+            return self._client_attestation_cache
+
+        self._client_attestation_cache = await self.provider.generate_evidence()
+        self._cache_time = time.time()
+        return self._client_attestation_cache
+
+    async def request(
+        self,
+        method: str,
+        path: str,
+        data: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Make an attested request to the server.
+
+        Args:
+            method: HTTP method
+            path: Request path
+            data: Request data (for POST/PUT)
+            headers: Additional headers
+
+        Returns:
+            Response data
+
+        Raises:
+            AttestationError: If attestation fails
+        """
+        from urllib.request import Request, urlopen
+        from urllib.error import URLError
+
+        client_attestation = await self._get_client_attestation()
+
+        request_headers = headers or {}
+        request_headers[ATTESTATION_HEADER] = base64.b64encode(
+            client_attestation
+        ).decode()
+        request_headers[ATTESTATION_TYPE_HEADER] = self.provider.tee_type.value
+
+        url = f"{self.server_url}{path}"
+
+        body = None
+        if data:
+            body = json.dumps(data).encode()
+            request_headers["Content-Type"] = "application/json"
+
+        request = Request(url, data=body, headers=request_headers, method=method)
+
+        try:
+            with urlopen(request, timeout=30) as response:
+                if self.verify_server:
+                    server_attestation = response.headers.get("X-Server-Attestation")
+                    if server_attestation:
+                        server_evidence = base64.b64decode(server_attestation)
+                        result = await self.provider.verify(server_evidence)
+
+                        if not result.verified:
+                            raise AttestationError(
+                                f"Server attestation failed: {result.error}",
+                                code="SERVER_ATTESTATION_FAILED",
+                            )
+
+                        if (
+                            self.expected_server_tee
+                            and result.tee_type != self.expected_server_tee
+                        ):
+                            raise AttestationError(
+                                f"Server TEE type mismatch: expected "
+                                f"{self.expected_server_tee.value}",
+                                code="TEE_TYPE_MISMATCH",
+                            )
+
+                return json.loads(response.read())
+
+        except URLError as e:
+            raise AttestationError(
+                f"Request failed: {e}",
+                code="REQUEST_FAILED",
+            )

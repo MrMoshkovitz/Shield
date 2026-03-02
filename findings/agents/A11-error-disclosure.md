@@ -3,10 +3,10 @@
 **Agent**: A11 — Error Disclosure
 **Phase**: 2
 **Priority**: HIGH
-**Auditor**: Ralph Loop (Iteration 35)
+**Auditor**: Ralph Loop (Iterations 35-37)
 **Date**: 2026-03-03
-**Files Audited**: error.rs, shield.rs, core.py, shield.js, shield.go, Shield.java, Shield.cs, shield.c (+ include/shield.h), Shield.swift, Shield.kt, fastapi.py, flask.py, express.js, browser.py, cli.py, confidential/middleware.py, confidential/base.py, fido2_api.py, pgvector_api.py, protection.py, channel.py, channel.js, identity.rs, identity.py, identity.js, identityProvider.kt/java/cs
-**Total Findings**: 25
+**Files Audited**: error.rs, shield.rs, core.py, shield.js, shield.go, Shield.java, Shield.cs, shield.c (+ include/shield.h), Shield.swift, Shield.kt, fastapi.py, flask.py, express.js, browser.py, cli.py, confidential/middleware.py, confidential/base.py, fido2_api.py, pgvector_api.py, protection.py, channel.py, channel.js, identity.rs, identity.py, identity.js, identityProvider.kt/java/cs, fido2/error.rs, fido2/credential.rs, fido2/config.rs, fido2/manager.rs, pgvector/error.rs, pgvector/config.rs, wasm.rs, fetch-hook.ts, index.ts, docker-compose.yml
+**Total Findings**: 35
 
 ---
 
@@ -569,15 +569,210 @@ FastAPI ShieldMiddleware (line 119): No try/except — encrypt failure would cra
 
 ---
 
+## TASK-2-025: Stack Trace & Debug Info Exposure (Iteration 37)
+
+> **Audit Focus**: Stack trace exposure in production, debug logging that leaks key material, thiserror derive macros, Debug trait on sensitive types, console.error/print patterns.
+> **Files Audited**: error.rs, shield.rs, wasm.rs, fido2/error.rs, fido2/credential.rs, fido2/config.rs, fido2/manager.rs, pgvector/error.rs, pgvector/config.rs, confidential/base.rs, cli.py, express.js, fetch-hook.ts, index.ts, docker-compose.yml, all example server.py files
+
+### SHIELD-A11-026: PgVectorConfig Debug Trait Exposes Database Connection String
+- **Tag**: VERIFIED
+- **Severity**: MEDIUM
+- **CWE**: CWE-532 (Insertion of Sensitive Information into Log File)
+- **Location**: `shield-core/src/pgvector/config.rs:90`
+- **Evidence**:
+```rust
+#[derive(Debug, Clone)]
+pub struct PgVectorConfig {
+    /// PostgreSQL connection string
+    pub connection_string: String,
+    // ...
+}
+```
+- **Impact**: `PgVectorConfig` derives `Debug`, and its `connection_string` field typically contains PostgreSQL credentials (e.g., `postgresql://user:password@host/db`). Any `{:?}` format on this struct (in logging, error messages, assertions, or `dbg!()` macros) will output the full connection string including database password. In production logging or error handler output, this leaks database credentials.
+- **Reproduction**: `let config = PgVectorConfig::new("postgresql://admin:s3cret@prod:5432/shield", 1536); println!("{:?}", config);` → outputs full connection string.
+- **Fix Complexity**: LOW
+- **Remediation**: Implement a custom `Debug` that redacts `connection_string`. Or remove `Debug` derive and implement manually.
+- **Verification Notes**: The connection_string field is public and set via `new()` — callers pass full Postgres URLs. The `Debug` derive auto-includes ALL fields.
+
+### SHIELD-A11-027: StoredCredential and ChallengeData Debug Trait Exposes Credential Bytes
+- **Tag**: VERIFIED
+- **Severity**: LOW
+- **CWE**: CWE-532
+- **Location**: `shield-core/src/fido2/credential.rs:11`, `shield-core/src/fido2/manager.rs:11`
+- **Evidence**:
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredCredential {
+    pub credential_id: Vec<u8>,
+    pub public_key: Vec<u8>,
+    pub counter: u32,
+    pub user_id: Vec<u8>,
+    // ...
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChallengeData {
+    pub challenge: Vec<u8>,
+    pub expires_at: u64,
+    pub user_id: Option<Vec<u8>>,
+}
+```
+- **Impact**: `Debug` on these structs outputs raw credential bytes, challenge data, and user IDs as byte arrays. If these structs appear in log output or error messages, FIDO2 credential material and challenge values (security-sensitive nonces) are exposed. Lower severity because credentials are stored encrypted and Debug outputs only public keys.
+- **Reproduction**: `println!("{:?}", challenge_data);` → outputs raw challenge bytes.
+- **Fix Complexity**: LOW
+- **Remediation**: Replace with custom Debug that redacts challenge/credential bytes.
+
+### SHIELD-A11-028: AttestationError Thiserror Display Exposes Internal Error Details
+- **Tag**: VERIFIED
+- **Severity**: LOW
+- **CWE**: CWE-209
+- **Location**: `shield-core/src/confidential/base.rs:13-45`
+- **Evidence**:
+```rust
+#[derive(Error, Debug, Clone)]
+pub enum AttestationError {
+    #[error("Attestation failed: {message}")]
+    VerificationFailed { message: String, code: String },
+    #[error("Missing dependency: {0}")]
+    MissingDependency(String),
+    #[error("Not running in TEE: {0}")]
+    NotInTEE(String),
+    #[error("IO error: {0}")]
+    IoError(String),
+    #[error("Policy violation: {0}")]
+    PolicyViolation(String),
+    #[error("Key release failed: {0}")]
+    KeyReleaseFailed(String),
+}
+```
+- **Impact**: All 6 variants interpolate internal strings into Display output. When propagated to Python middleware (A11-008, A11-022), detailed strings reach HTTP responses. ROOT CAUSE of the attestation error leakage chain. Cross-references SHIELD-A11-008, SHIELD-A11-022.
+- **Reproduction**: Already documented in A11-008 and A11-022.
+- **Fix Complexity**: MEDIUM
+- **Remediation**: Separate internal error messages (for logging) from external (for API responses). Display impl should return generic messages.
+
+### SHIELD-A11-029: Express console.error Logs Full Error Objects Including Stack Traces
+- **Tag**: VERIFIED
+- **Severity**: MEDIUM
+- **CWE**: CWE-532 (Information in Log Files)
+- **Location**: `javascript/integrations/express.js:70`, `browser/js/fetch-hook.ts:89`, `browser/js/index.ts:49,174`
+- **Evidence**:
+```javascript
+// express.js:70
+console.error('Shield encryption error:', err);
+
+// fetch-hook.ts:89
+console.error('Shield decryption error:', error);
+
+// index.ts:49
+onDecryptError: config.onDecryptError ?? ((err) => console.error('Shield decrypt error:', err)),
+
+// index.ts:174
+console.error('Shield auto-refresh failed:', error);
+```
+- **Impact**: Four `console.error` statements log full error objects. In Express (server-side), `err` includes stack traces with file paths, line numbers, and internal Shield error messages. In browser, errors are visible in DevTools. Error objects may contain internal file paths, crypto details (MAC failure, ciphertext size), and call hierarchies.
+- **Reproduction**: 1. Configure Express with Shield middleware. 2. Trigger encryption error. 3. Check server logs — full error object with stack trace.
+- **Fix Complexity**: LOW
+- **Remediation**: Replace with `console.error('Shield encryption error')` without error object. Or use structured logger with sanitization.
+
+### SHIELD-A11-030: Python CLI Catches Generic Exception and Prints Raw Error
+- **Tag**: VERIFIED
+- **Severity**: LOW
+- **CWE**: CWE-209
+- **Location**: `python/shield/cli.py:68-69`, `python/shield/cli.py:101-102`, `python/shield/cli.py:143-144`
+- **Evidence**:
+```python
+except Exception as e:
+    print(f"Error: {e}", file=sys.stderr)
+```
+- **Impact**: Raw exception messages printed to stderr. Could include file permission errors with full paths, Shield internal errors, or OS-level error strings. Lower severity because CLI is used by authenticated operators.
+- **Reproduction**: `python -m shield encrypt nonexistent.file -p test` → raw exception output.
+- **Fix Complexity**: LOW
+- **Remediation**: Use specific exception types. Generic fallback: `print("Error: Operation failed")`.
+
+### SHIELD-A11-031: Docker-Compose Uses uvicorn --reload Enabling Debug Error Pages
+- **Tag**: VERIFIED
+- **Severity**: MEDIUM
+- **CWE**: CWE-489 (Active Debug Code)
+- **Location**: `docker-compose.yml:71`
+- **Evidence**:
+```yaml
+command: >
+  bash -c "pip install -e /app/python && uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+```
+- **Impact**: `--reload` enables uvicorn auto-reload — a development-only feature. FastAPI in this mode returns detailed error pages with full tracebacks, file paths, variable values, and source code on 500 errors. If docker-compose.yml is used as a production template, debug pages go live. Cross-references SHIELD-A05-009 (reload flag in Docker). This finding documents the stack trace exposure dimension.
+- **Reproduction**: 1. `docker-compose up`. 2. Trigger 500 error. 3. Full Python traceback in HTTP response.
+- **Fix Complexity**: LOW
+- **Remediation**: Remove `--reload`. Add `ENVIRONMENT=production`. Cross-ref SHIELD-A05-009.
+
+### SHIELD-A11-032: Rust Core Crypto Structs Correctly Omit Debug Trait — POSITIVE
+- **Tag**: NON-VULN
+- **Severity**: INFO
+- **CWE**: N/A
+- **Location**: `shield-core/src/shield.rs:51-52`, `shield-core/src/ratchet.rs:23-24`, `shield-core/src/totp.rs:21-22`, `shield-core/src/signatures.rs:16-17`
+- **Evidence**:
+```rust
+#[derive(Zeroize, ZeroizeOnDrop)]  // NO Debug derive
+pub struct Shield { key: [u8; 32], ... }
+```
+- **Impact**: POSITIVE FINDING. All 4 core crypto structs holding key material (`Shield`, `RatchetSession`, `TOTP`, `SymmetricSignature`) derive `Zeroize` + `ZeroizeOnDrop` but NOT `Debug`. `{:?}` formatting will fail at compile time, preventing accidental key exposure. `GroupEncryption`, `StreamCipher`, `ShieldChannel`, `IdentityProvider`, `Fido2Manager` also correctly omit Debug.
+
+### SHIELD-A11-033: Fido2Error/PgVectorError Serialization Variants Leak serde_json Parse Details
+- **Tag**: VERIFIED
+- **Severity**: LOW
+- **CWE**: CWE-209
+- **Location**: `shield-core/src/fido2/error.rs:25-26`, `shield-core/src/pgvector/error.rs:22-23`
+- **Evidence**:
+```rust
+#[error("Serialization error: {0}")]
+Serialization(#[from] serde_json::Error),
+```
+- **Impact**: `serde_json::Error` Display includes byte position, expected token, and parse context. When propagated, reveals internal data format expectations. Both Fido2Error and PgVectorError have this pattern.
+- **Reproduction**: Pass malformed JSON to credential operations → error reveals expected JSON structure.
+- **Fix Complexity**: LOW
+- **Remediation**: Change to `#[error("Serialization error")]` without `{0}`.
+
+### SHIELD-A11-034: Thiserror String Interpolation Pattern Is Systemic Across All 4 Error Enums
+- **Tag**: VERIFIED
+- **Severity**: MEDIUM
+- **CWE**: CWE-209
+- **Location**: `shield-core/src/error.rs`, `shield-core/src/fido2/error.rs`, `shield-core/src/pgvector/error.rs`, `shield-core/src/confidential/base.rs`
+- **Evidence**: All 4 Rust error enums use thiserror `#[error("...{0}...")]` to interpolate values:
+  - `ShieldError`: 6 variants interpolate values
+  - `AttestationError`: 6 variants ALL interpolate
+  - `Fido2Error`: 4 variants interpolate, 1 chains serde_json::Error
+  - `PgVectorError`: 4 variants interpolate, 1 chains serde_json::Error
+  16 out of 20 error variants interpolate internal values.
+- **Impact**: SYSTEMIC ROOT CAUSE: thiserror encourages including diagnostic values in messages. These become HTTP response bodies via middleware (A11-005, A11-006, A11-008, A11-016, A11-017, A11-022).
+- **Fix Complexity**: MEDIUM
+- **Remediation**: Two-tier strategy: (1) Keep detailed messages in Debug (for logs). (2) Implement separate Display with generic messages (for API responses). Or add `pub fn external_message(&self) -> &str` method.
+
+### SHIELD-A11-035: Browser SDK console.warn Exposes Encryption Key State
+- **Tag**: VERIFIED
+- **Severity**: LOW
+- **CWE**: CWE-200
+- **Location**: `browser/js/fetch-hook.ts:26,31,72`, `browser/js/index.ts:78`
+- **Evidence**:
+```typescript
+console.warn('Shield: Key expired or not set, returning encrypted response');
+console.warn('ShieldBrowser already initialized, returning existing instance');
+console.warn('Shield fetch hook already installed');
+```
+- **Impact**: Warnings visible in browser DevTools reveal: (1) Whether Shield is installed, (2) Key expiration state, (3) SDK initialization status. Attacker can determine exact Shield state and target windows when encryption is non-functional.
+- **Reproduction**: Open DevTools console, reload page with Shield SDK, observe warnings.
+- **Fix Complexity**: LOW
+- **Remediation**: Remove or gate behind debug flag: `if (config.debug) console.warn(...)`.
+
+---
+
 ## Summary
 
 | Severity | Count | IDs |
 |----------|-------|-----|
 | HIGH | 5 | A11-005, A11-006, A11-015, A11-016, A11-025 |
-| MEDIUM | 14 | A11-001, A11-002, A11-003, A11-007, A11-008, A11-009, A11-010, A11-011, A11-017, A11-018, A11-019, A11-020, A11-021, A11-022, A11-023 |
-| LOW | 4 | A11-004, A11-012, A11-013, A11-024 |
-| INFO | 1 | A11-014 |
-| **Total** | **25** | |
+| MEDIUM | 18 | A11-001, A11-002, A11-003, A11-007, A11-008, A11-009, A11-010, A11-011, A11-017, A11-018, A11-019, A11-020, A11-021, A11-022, A11-023, A11-026, A11-029, A11-031, A11-034 |
+| LOW | 9 | A11-004, A11-012, A11-013, A11-024, A11-027, A11-028, A11-030, A11-033, A11-035 |
+| INFO | 2 | A11-014, A11-032 |
+| **Total** | **35** | |
 
 ## Cross-References
 
@@ -596,6 +791,12 @@ FastAPI ShieldMiddleware (line 119): No try/except — encrypt failure would cra
 | A11-021 | SHIELD-A11-019, SHIELD-A11-020 (same pattern across frameworks) |
 | A11-022 | SHIELD-A11-008, SHIELD-A11-009 |
 | A11-025 | SHIELD-A11-019, A11-020, A11-021, SHIELD-A06-002 |
+| A11-026 | CWE-532 — Debug trait on config with credentials |
+| A11-028 | SHIELD-A11-008, SHIELD-A11-022 (root cause of TEE error leakage) |
+| A11-029 | SHIELD-A11-006 (Express error logging) |
+| A11-031 | SHIELD-A05-009 (Docker --reload flag — stack trace dimension) |
+| A11-034 | SHIELD-A11-005, A11-006, A11-008, A11-016, A11-017, A11-022 (root cause of all interpolated error leaks) |
+| A11-035 | SHIELD-A09-015 (fail-open on expired key) |
 
 ## Positive Findings
 
